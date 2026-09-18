@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Certificates and keys — never commit these
+*.pfx
+*.p12
+*.key
+*.cer
+*.crt
+
+# Local scratch
+*.log
+*.part
