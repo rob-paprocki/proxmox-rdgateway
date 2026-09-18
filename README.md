@@ -7,6 +7,8 @@ the wizard twice and without guessing at the WMI calls.
 |---|---|---|
 | [`windows-rdgw-vm.sh`](windows-rdgw-vm.sh) | Proxmox host, as root | Interactive VM builder — q35 + OVMF, Secure Boot, TPM 2.0, VirtIO SCSI, both ISOs attached |
 | [`Setup-RDGateway.ps1`](Setup-RDGateway.ps1) | Inside the guest, elevated | Installs the RDS-Gateway role, binds a certificate, writes the CAP and RAP, opens the firewall |
+| [`vps-relay-setup.sh`](vps-relay-setup.sh) | A small public VPS | *Optional.* Layer 4 front door so nothing has to be open at home |
+| [`proxmox-relay-peer.sh`](proxmox-relay-peer.sh) | Proxmox host, as root | *Optional.* Home end of that relay — outbound WireGuard, forwarding, NAT |
 
 ```bash
 # on the Proxmox host
@@ -16,11 +18,25 @@ bash windows-rdgw-vm.sh             # actually build it
 
 ```powershell
 # inside the guest, in Windows PowerShell (not pwsh), elevated
-.\Setup-RDGateway.ps1 -ExternalFqdn rdg.yourdomain.tld -CertificateSource SelfSigned
+.\Setup-RDGateway.ps1 -ExternalFqdn rdg.yourdomain.tld `
+                      -CertificateSource SelfSigned `
+                      -TargetMachines 'DESKTOP-01','NAS01','192.168.1.60'
 ```
+
+One public hostname, many machines behind it — that's what `-TargetMachines` is for. The
+targets install nothing: they need Remote Desktop on, your account in their Remote Desktop
+Users group, and a name the gateway can resolve. Windows Pro is fine as a target; only the
+gateway itself has to be Server.
 
 Neither script installs Windows — there is no cloud image for it. The builder stops at a
 correctly configured VM shell with the boot order set; you run Setup from the console.
+
+**Cloudflare Tunnel cannot carry this.** RD Gateway's transport uses the custom HTTP methods
+`RDG_IN_DATA` and `RDG_OUT_DATA`, and Cloudflare's edge answers both with `501` before the
+request reaches your origin — so a proxied hostname breaks the gateway outright. Grey-cloud
+any DNS record pointing at it. [`RELAY.md`](RELAY.md) explains the failure, has the one-line
+test to confirm it, and sets up a VPS relay as the alternative for people who don't want an
+open port. Client devices install nothing either way.
 
 The rest of this file is the runbook: the decisions to make first, the manual install, the
 certificate, and the DNS and port-forwarding work that has to happen around the scripts.
@@ -37,7 +53,7 @@ A VM, not an LXC. The gateway has to be Windows, and a Proxmox container shares 
 
 ## Phase 0 — Decide two things before you touch anything
 
-**The hostname clients will type.** Something like `rdg.yourdomain.tld`. It has to resolve from the public internet to your WAN address, and the certificate has to match it. If your ISP gives you a dynamic address, point it at a DDNS record. Pick this name now; it gets baked into the certificate and into every client profile.
+**The hostname clients will type.** Something like `rdg.yourdomain.tld`. It has to resolve from the public internet to wherever you terminate — your WAN address if you forward a port, or a relay's address if you use the one in [`RELAY.md`](RELAY.md) — and the certificate has to match it. If your ISP gives you a dynamic address, point it at a DDNS record. Pick this name now; it gets baked into the certificate and into every client profile.
 
 **Where the certificate comes from.** This is the one decision that determines whether the thing is pleasant or annoying to use.
 
@@ -143,7 +159,19 @@ RD Gateway has two gates and a connection has to pass both.
 
 The **CAP** (connection authorization policy) answers *who may use this gateway at all*. The script creates one allowing the local `Administrators` and `Remote Desktop Users` groups, with password authentication.
 
-The **RAP** (resource authorization policy) answers *what they may reach through it*. This is the one that matters for security. By default the script scopes it to this server only — it builds a resource group containing the machine's own name, FQDN, `localhost` and its IP addresses. The alternative, `-ResourceScope AnyResource`, lets anyone who passes the CAP RDP to **any machine the gateway can reach**, which turns this box into a jump host into your whole LAN. That's sometimes exactly what you want, but it should be a decision rather than a default.
+The **RAP** (resource authorization policy) answers *what they may reach through it*. This is the one you care about, because it's what makes a gateway a gateway: **one public hostname, many machines behind it.**
+
+List the machines you want to reach and the script builds the policy around them:
+
+```powershell
+.\Setup-RDGateway.ps1 -ExternalFqdn rdg.yourdomain.tld `
+                      -CertificateSource Existing -Thumbprint A1B2C3... `
+                      -TargetMachines 'DESKTOP-01','NAS01','192.168.1.60'
+```
+
+The gateway box itself is always included, so you keep a way in even when the machine you were actually after is powered off. For each name you give it, the script also resolves and adds the FQDN and IP, because the RAP matches on the exact string the client asks for — and it warns you about anything that didn't resolve, since the gateway has to resolve the target again at connect time or you get event 301.
+
+Three scopes are available. `-TargetMachines` selects `Listed` automatically. `ThisServerOnly` is the default with no targets given. `AnyResource` skips the list entirely and permits anything the gateway can reach — convenient, but a leaked credential then opens your whole LAN rather than a chosen handful, so prefer the list.
 
 To restrict by user instead, create a dedicated local group and pass it in:
 
@@ -156,11 +184,28 @@ Add-LocalGroupMember -Group 'RDG Users' -Member 'rob'
 
 Note the `@` suffix convention: built-in groups are `Administrators@BUILTIN`, groups you create are `GroupName@COMPUTERNAME`, domain groups are `GroupName@DOMAIN`.
 
+### What the other machines need
+
+Nothing installed. No gateway role, no certificate, no agent. Each target needs only:
+
+- Remote Desktop enabled
+- your account in its local **Remote Desktop Users** group
+- its firewall permitting 3389 from the gateway
+- a name the gateway can resolve — a DHCP reservation, a DNS record, or just list it by IP
+
+Windows **Pro** editions work fine as targets; only the gateway itself has to be Server. Home editions can't accept RDP at all. In the client you change one field — **Computer** — to switch machines; the gateway name stays the same for all of them.
+
+To add a machine later, re-run the script with the full list. It removes and recreates its own CAP and RAP, so re-running is safe and the result is the same as if you'd listed them all the first time.
+
 The script uses the documented `Win32_TSGateway*` WMI classes rather than the `RDS:` PowerShell provider for the policies, because the WMI method signatures spell out what each flag means. The certificate binding is the exception — that goes through `RDS:\GatewayServer\SSLCertificate\Thumbprint`, which is the well-trodden path, with a WMI fallback and, failing both, instructions for doing it in `tsgateway.msc`.
 
 ---
 
-## Phase 6 — DNS and the router
+## Phase 6 — Getting to it from outside
+
+Two ways. Pick one.
+
+### Option A — forward the port
 
 On your router, forward to the VM's LAN address:
 
@@ -169,7 +214,44 @@ On your router, forward to the VM's LAN address:
 
 **Do not forward 3389.** The entire point of the gateway is that raw RDP never faces the internet.
 
-Then confirm `rdg.yourdomain.tld` resolves to your WAN address from outside your network. Test from cellular data, not from inside the LAN — a lot of consumer routers don't hairpin, so an inside test can fail while the outside one works fine.
+Point `rdg.yourdomain.tld` at your WAN address. If that name is on Cloudflare, it has to be **DNS only (grey cloud)** — see the note below.
+
+Costs nothing and works today. The trade is one open port, so spend ten minutes on the hardening below.
+
+#### Hardening the open port
+
+**Restrict the source.** The single most effective lever. In UniFi, scope the WAN-in rule for 443 to the countries or address ranges you actually connect from. Anything you cut here never reaches Windows at all.
+
+**Lock accounts out.** `secpol.msc` → Account Policies → Account Lockout Policy. Ten attempts per fifteen minutes is a reasonable floor.
+
+**Don't use obvious account names,** and give whatever you do use a long password. This is an authentication endpoint on the public internet; that's the whole threat model.
+
+**Watch for guessing.** Event 4625 in the Security log, and the gateway's own operational log:
+
+```powershell
+Get-WinEvent -LogName Microsoft-Windows-TerminalServices-Gateway/Operational -MaxEvents 30 |
+    Where-Object Id -in 200,300,301,302 | Format-Table TimeCreated, Id, Message -AutoSize
+```
+
+**Keep it patched.** RD Gateway has had pre-auth RCEs before (CVE-2020-0609/0610). Windows Update is not optional on this box.
+
+One thing *not* to bother with: moving the gateway off 443. It's possible — `HttpsPort` under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\TerminalServerGateway\Config\Core` — but it requires disabling the UDP transport, and clients need `RDGClientTransport` set in `HKCU\Software\Microsoft\Terminal Server Client` before they'll connect to a non-standard port. A registry edit on every device is exactly what a gateway is supposed to spare you.
+
+### Option B — a public relay, nothing open at home
+
+If you'd rather not have an open port, or you're behind CGNAT and can't forward one anyway, [`RELAY.md`](RELAY.md) sets up a small VPS as a layer 4 front door with a WireGuard link back to your Proxmox host. TLS still terminates on the Windows box, so the certificate work in Phase 4 is unchanged, and **client devices install nothing** — they see a normal hostname on 443.
+
+Two scripts: `vps-relay-setup.sh` on the VPS, then `proxmox-relay-peer.sh` on the Proxmox host.
+
+**This does not have to cost anything.** Oracle Cloud's Always Free tier includes two `VM.Standard.E2.1.Micro` instances, each with a public IPv4 and 50 Mbps, plus 10 TB/month of egress, and the resources don't expire. The relay scripts run on one unmodified. The catch, stated in Oracle's own documentation: idle Always Free instances get reclaimed when CPU *and* network sit below 20% across a seven-day window — and a relay you use a few times a week is idle by definition. Plenty of people run one anyway and just rebuild it if it disappears; decide whether that's a tolerable failure mode for the thing you use to get back into your house.
+
+### Cloudflare Tunnel is not an option here, and it's worth knowing why
+
+RD Gateway's transport uses two custom HTTP methods, `RDG_IN_DATA` and `RDG_OUT_DATA`. Cloudflare's edge runs a method allowlist and answers both with `501` before the request reaches your origin — so a proxied (orange-cloud) hostname breaks the gateway outright, whether the traffic arrives over a tunnel or a port-forward. Grey-cloud any DNS record pointing at this service. `RELAY.md` has the test you can run to confirm it for yourself.
+
+### Then test it properly
+
+Confirm the name resolves and connects **from cellular data, not from inside your LAN.** A lot of consumer routers don't hairpin, so an inside test can fail while the outside one works fine — and vice versa, which is worse, because it looks like success.
 
 ---
 
