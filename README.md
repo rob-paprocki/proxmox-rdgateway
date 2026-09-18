@@ -7,6 +7,8 @@ the wizard twice and without guessing at the WMI calls.
 |---|---|---|
 | [`windows-rdgw-vm.sh`](windows-rdgw-vm.sh) | Proxmox host, as root | Interactive VM builder — q35 + OVMF, Secure Boot, TPM 2.0, VirtIO SCSI, both ISOs attached |
 | [`Setup-RDGateway.ps1`](Setup-RDGateway.ps1) | Inside the guest, elevated | Installs the RDS-Gateway role, binds a certificate, writes the CAP and RAP, opens the firewall |
+| [`vps-relay-setup.sh`](vps-relay-setup.sh) | A small public VPS | *Optional.* Layer 4 front door so nothing has to be open at home |
+| [`proxmox-relay-peer.sh`](proxmox-relay-peer.sh) | Proxmox host, as root | *Optional.* Home end of that relay — outbound WireGuard, forwarding, NAT |
 
 ```bash
 # on the Proxmox host
@@ -21,6 +23,13 @@ bash windows-rdgw-vm.sh             # actually build it
 
 Neither script installs Windows — there is no cloud image for it. The builder stops at a
 correctly configured VM shell with the boot order set; you run Setup from the console.
+
+**Cloudflare Tunnel cannot carry this.** RD Gateway's transport uses the custom HTTP methods
+`RDG_IN_DATA` and `RDG_OUT_DATA`, and Cloudflare's edge answers both with `501` before the
+request reaches your origin — so a proxied hostname breaks the gateway outright. Grey-cloud
+any DNS record pointing at it. [`RELAY.md`](RELAY.md) explains the failure, has the one-line
+test to confirm it, and sets up a VPS relay as the alternative for people who don't want an
+open port. Client devices install nothing either way.
 
 The rest of this file is the runbook: the decisions to make first, the manual install, the
 certificate, and the DNS and port-forwarding work that has to happen around the scripts.
@@ -37,7 +46,7 @@ A VM, not an LXC. The gateway has to be Windows, and a Proxmox container shares 
 
 ## Phase 0 — Decide two things before you touch anything
 
-**The hostname clients will type.** Something like `rdg.yourdomain.tld`. It has to resolve from the public internet to your WAN address, and the certificate has to match it. If your ISP gives you a dynamic address, point it at a DDNS record. Pick this name now; it gets baked into the certificate and into every client profile.
+**The hostname clients will type.** Something like `rdg.yourdomain.tld`. It has to resolve from the public internet to wherever you terminate — your WAN address if you forward a port, or a relay's address if you use the one in [`RELAY.md`](RELAY.md) — and the certificate has to match it. If your ISP gives you a dynamic address, point it at a DDNS record. Pick this name now; it gets baked into the certificate and into every client profile.
 
 **Where the certificate comes from.** This is the one decision that determines whether the thing is pleasant or annoying to use.
 
@@ -160,7 +169,11 @@ The script uses the documented `Win32_TSGateway*` WMI classes rather than the `R
 
 ---
 
-## Phase 6 — DNS and the router
+## Phase 6 — Getting to it from outside
+
+Two ways. Pick one.
+
+### Option A — forward the port
 
 On your router, forward to the VM's LAN address:
 
@@ -169,7 +182,21 @@ On your router, forward to the VM's LAN address:
 
 **Do not forward 3389.** The entire point of the gateway is that raw RDP never faces the internet.
 
-Then confirm `rdg.yourdomain.tld` resolves to your WAN address from outside your network. Test from cellular data, not from inside the LAN — a lot of consumer routers don't hairpin, so an inside test can fail while the outside one works fine.
+Point `rdg.yourdomain.tld` at your WAN address. If that name is on Cloudflare, it has to be **DNS only (grey cloud)** — see the note below.
+
+### Option B — a public relay, nothing open at home
+
+If you'd rather not have an open port, or you're behind CGNAT and can't forward one anyway, [`RELAY.md`](RELAY.md) sets up a small VPS as a layer 4 front door with a WireGuard link back to your Proxmox host. TLS still terminates on the Windows box, so the certificate work in Phase 4 is unchanged, and **client devices install nothing** — they see a normal hostname on 443.
+
+Two scripts: `vps-relay-setup.sh` on the VPS, then `proxmox-relay-peer.sh` on the Proxmox host.
+
+### Cloudflare Tunnel is not an option here, and it's worth knowing why
+
+RD Gateway's transport uses two custom HTTP methods, `RDG_IN_DATA` and `RDG_OUT_DATA`. Cloudflare's edge runs a method allowlist and answers both with `501` before the request reaches your origin — so a proxied (orange-cloud) hostname breaks the gateway outright, whether the traffic arrives over a tunnel or a port-forward. Grey-cloud any DNS record pointing at this service. `RELAY.md` has the test you can run to confirm it for yourself.
+
+### Then test it properly
+
+Confirm the name resolves and connects **from cellular data, not from inside your LAN.** A lot of consumer routers don't hairpin, so an inside test can fail while the outside one works fine — and vice versa, which is worse, because it looks like success.
 
 ---
 
