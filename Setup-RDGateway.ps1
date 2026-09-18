@@ -34,13 +34,32 @@
     Built-in local groups use @BUILTIN. Groups you create yourself use
     @<COMPUTERNAME>. Defaults to the local Administrators and Remote Desktop Users.
 
+.PARAMETER TargetMachines
+    Other machines on your LAN you want to reach THROUGH this gateway. Give the
+    names or IPs you will type into the RD client's "Computer" box. Supplying
+    this switches -ResourceScope to Listed automatically.
+
+    Those machines need nothing installed. They only need Remote Desktop turned
+    on, your account in their local Remote Desktop Users group, and a name this
+    gateway can resolve. Windows Pro editions are fine as targets; only the
+    gateway itself has to be Server.
+
 .PARAMETER ResourceScope
-    ThisServerOnly - the gateway will only proxy connections to itself. Safer.
-    AnyResource    - the gateway will proxy to any machine on its network. This
-                     turns the box into a jump host into your whole LAN.
+    ThisServerOnly - the gateway only proxies connections to itself.
+    Listed         - this server plus everything in -TargetMachines. Recommended
+                     when you want several machines behind one public hostname.
+    AnyResource    - anything the gateway can reach. Convenient, but it means a
+                     leaked credential opens your whole LAN, not a chosen list.
 
 .EXAMPLE
     .\Setup-RDGateway.ps1 -ExternalFqdn rdg.example.com -CertificateSource SelfSigned
+
+.EXAMPLE
+    Several machines behind one public hostname - the usual reason to run a gateway:
+
+    .\Setup-RDGateway.ps1 -ExternalFqdn rdg.example.com `
+        -CertificateSource Existing -Thumbprint A1B2C3... `
+        -TargetMachines 'DESKTOP-01','NAS01','192.168.1.60'
 
 .EXAMPLE
     .\Setup-RDGateway.ps1 -ExternalFqdn rdg.example.com -CertificateSource Pfx `
@@ -77,7 +96,9 @@ param(
 
     [string[]] $AllowedGroups = @('Administrators@BUILTIN', 'Remote Desktop Users@BUILTIN'),
 
-    [ValidateSet('ThisServerOnly', 'AnyResource')]
+    [string[]] $TargetMachines = @(),
+
+    [ValidateSet('ThisServerOnly', 'Listed', 'AnyResource')]
     [string] $ResourceScope = 'ThisServerOnly',
 
     [string] $CapName = 'RDG_CAP_Default',
@@ -91,6 +112,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $script:TSNamespace = 'root/cimv2/TerminalServices'
+
+# Naming machines is an unambiguous statement of intent, so honour it without
+# making the caller also remember to set the scope.
+if ($TargetMachines.Count -gt 0 -and -not $PSBoundParameters.ContainsKey('ResourceScope')) {
+    $ResourceScope = 'Listed'
+}
 
 # ------------------------------------------------------------------------------
 # Output helpers
@@ -155,6 +182,25 @@ function Remove-TSGatewayInstance {
         } catch {
             throw "Could not remove the existing $Label. Delete it by hand in tsgateway.msc and re-run. ($($_.Exception.Message))"
         }
+    }
+}
+
+function Get-ResourceIdentity {
+    # Every name a client might plausibly hand the gateway for one machine: the
+    # name as given, its resolved FQDN, and its IPv4 addresses. Microsoft's RAP
+    # troubleshooting guidance is to list the short name and the FQDN separately,
+    # because the policy matches on the string the client asked for.
+    param([Parameter(Mandatory)] [string] $Machine)
+
+    $Machine
+    try {
+        $entry = [System.Net.Dns]::GetHostEntry($Machine)
+        if ($entry.HostName -and $entry.HostName -ne $Machine) { $entry.HostName }
+        $entry.AddressList |
+            Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+            ForEach-Object { $_.IPAddressToString }
+    } catch {
+        Write-Verbose "Could not resolve '$Machine' from this host."
     }
 }
 
@@ -440,17 +486,13 @@ if ($existingRap) {
 $resourceGroupType = 'ALL'
 $resourceGroup     = ''
 
-if ($ResourceScope -eq 'ThisServerOnly') {
-    # Every name a client might legitimately hand the gateway for this machine.
-    # Microsoft's own RAP troubleshooting advice is to list the NetBIOS name and
-    # the FQDN separately, so both are included, along with the IP addresses.
-    $names = New-Object System.Collections.Generic.List[string]
-    $names.Add($env:COMPUTERNAME)
-    $names.Add($ExternalFqdn)
+if ($ResourceScope -in @('ThisServerOnly', 'Listed')) {
 
-    # Best-effort: picks up the resolvable FQDN when DNS knows this host.
-    try   { $names.Add([System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName) }
-    catch { Write-Verbose "No DNS FQDN for $env:COMPUTERNAME; skipping." }
+    # The gateway box itself is always reachable - you will want a way in even
+    # when the machine you were actually after is off.
+    $names = New-Object System.Collections.Generic.List[string]
+    $names.Add($ExternalFqdn)
+    Get-ResourceIdentity -Machine $env:COMPUTERNAME | ForEach-Object { $names.Add($_) }
 
     if ($computerSystem.PartOfDomain -and $computerSystem.Domain) {
         $names.Add("$env:COMPUTERNAME.$($computerSystem.Domain)")
@@ -464,8 +506,24 @@ if ($ResourceScope -eq 'ThisServerOnly') {
         Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' } |
         ForEach-Object { $names.Add($_.IPAddress) }
 
+    # ...plus anything else you asked to reach through it.
+    $unresolved = @()
+    foreach ($machine in $TargetMachines) {
+        if ([string]::IsNullOrWhiteSpace($machine)) { continue }
+        $ids = @(Get-ResourceIdentity -Machine $machine)
+        $ids | ForEach-Object { $names.Add($_) }
+        if ($ids.Count -le 1) { $unresolved += $machine }
+    }
+
     $resourceList = ($names | Where-Object { $_ } | Sort-Object -Unique) -join ';'
     Write-Note "Resources: $resourceList"
+
+    if ($unresolved.Count -gt 0) {
+        Write-Warn "These did not resolve from this server: $($unresolved -join ', ')"
+        Write-Note "They are in the policy by name, but the gateway resolves the target at"
+        Write-Note "connect time - if it still cannot, you get event 301 and a refused connection."
+        Write-Note "Add them to DNS, to this machine's hosts file, or list them by IP instead."
+    }
 
     try {
         $existingRg = Get-TSGatewayInstance -ClassName 'Win32_TSGatewayResourceGroup' `
@@ -475,9 +533,14 @@ if ($ResourceScope -eq 'ThisServerOnly') {
         }
 
         # Win32_TSGatewayResourceGroup::Create(Name, Description, Resources)
+        $rgDescription = if ($ResourceScope -eq 'Listed') {
+            "This gateway plus $($TargetMachines.Count) listed machine(s)"
+        } else {
+            'This gateway server only'
+        }
         $rgArgs = [ordered]@{
             Name        = $ResourceGroupName
-            Description = 'This gateway server only'
+            Description = $rgDescription
             Resources   = $resourceList
         }
         Invoke-TSGatewayMethod -ClassName 'Win32_TSGatewayResourceGroup' `
@@ -497,7 +560,8 @@ if ($ResourceScope -eq 'ThisServerOnly') {
 }
 else {
     Write-Warn "ResourceScope is AnyResource. Anyone who passes the CAP can RDP to any"
-    Write-Note "machine this server can reach. That is a jump host. Make sure you meant it."
+    Write-Note "machine this server can reach. That is a jump host. If you only want a few"
+    Write-Note "machines, -TargetMachines gives you the same reach with a named list."
 }
 
 # Win32_TSGatewayResourceAuthorizationPolicy::Create(Name, Description, Enabled,
@@ -603,10 +667,22 @@ Write-Host @"
 
  3. Connect
     In the Remote Desktop client:
-      Computer        : $env:COMPUTERNAME
+      Computer        : $env:COMPUTERNAME   <- or any machine in the RAP above
       Gateway server  : $ExternalFqdn
       Bypass gateway for local addresses: off
     Tick "use my gateway credentials for the remote computer".
+
+    One gateway, many targets: change only the Computer field to reach a
+    different machine. The gateway name stays the same for all of them.
+
+ 3b. On each OTHER machine you listed
+    Nothing gets installed. Each one needs:
+      - Remote Desktop enabled  (Settings > System > Remote Desktop, or
+        Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' fDenyTSConnections 0)
+      - your account in its local Remote Desktop Users group
+      - its firewall allowing 3389 from this gateway
+      - a name this gateway can resolve
+    Windows Pro is fine. Home editions cannot accept RDP at all.
 
  4. Watch it work
     Get-WinEvent -LogName Microsoft-Windows-TerminalServices-Gateway/Operational -MaxEvents 20

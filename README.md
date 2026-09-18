@@ -18,8 +18,15 @@ bash windows-rdgw-vm.sh             # actually build it
 
 ```powershell
 # inside the guest, in Windows PowerShell (not pwsh), elevated
-.\Setup-RDGateway.ps1 -ExternalFqdn rdg.yourdomain.tld -CertificateSource SelfSigned
+.\Setup-RDGateway.ps1 -ExternalFqdn rdg.yourdomain.tld `
+                      -CertificateSource SelfSigned `
+                      -TargetMachines 'DESKTOP-01','NAS01','192.168.1.60'
 ```
+
+One public hostname, many machines behind it — that's what `-TargetMachines` is for. The
+targets install nothing: they need Remote Desktop on, your account in their Remote Desktop
+Users group, and a name the gateway can resolve. Windows Pro is fine as a target; only the
+gateway itself has to be Server.
 
 Neither script installs Windows — there is no cloud image for it. The builder stops at a
 correctly configured VM shell with the boot order set; you run Setup from the console.
@@ -152,7 +159,19 @@ RD Gateway has two gates and a connection has to pass both.
 
 The **CAP** (connection authorization policy) answers *who may use this gateway at all*. The script creates one allowing the local `Administrators` and `Remote Desktop Users` groups, with password authentication.
 
-The **RAP** (resource authorization policy) answers *what they may reach through it*. This is the one that matters for security. By default the script scopes it to this server only — it builds a resource group containing the machine's own name, FQDN, `localhost` and its IP addresses. The alternative, `-ResourceScope AnyResource`, lets anyone who passes the CAP RDP to **any machine the gateway can reach**, which turns this box into a jump host into your whole LAN. That's sometimes exactly what you want, but it should be a decision rather than a default.
+The **RAP** (resource authorization policy) answers *what they may reach through it*. This is the one you care about, because it's what makes a gateway a gateway: **one public hostname, many machines behind it.**
+
+List the machines you want to reach and the script builds the policy around them:
+
+```powershell
+.\Setup-RDGateway.ps1 -ExternalFqdn rdg.yourdomain.tld `
+                      -CertificateSource Existing -Thumbprint A1B2C3... `
+                      -TargetMachines 'DESKTOP-01','NAS01','192.168.1.60'
+```
+
+The gateway box itself is always included, so you keep a way in even when the machine you were actually after is powered off. For each name you give it, the script also resolves and adds the FQDN and IP, because the RAP matches on the exact string the client asks for — and it warns you about anything that didn't resolve, since the gateway has to resolve the target again at connect time or you get event 301.
+
+Three scopes are available. `-TargetMachines` selects `Listed` automatically. `ThisServerOnly` is the default with no targets given. `AnyResource` skips the list entirely and permits anything the gateway can reach — convenient, but a leaked credential then opens your whole LAN rather than a chosen handful, so prefer the list.
 
 To restrict by user instead, create a dedicated local group and pass it in:
 
@@ -164,6 +183,19 @@ Add-LocalGroupMember -Group 'RDG Users' -Member 'rob'
 ```
 
 Note the `@` suffix convention: built-in groups are `Administrators@BUILTIN`, groups you create are `GroupName@COMPUTERNAME`, domain groups are `GroupName@DOMAIN`.
+
+### What the other machines need
+
+Nothing installed. No gateway role, no certificate, no agent. Each target needs only:
+
+- Remote Desktop enabled
+- your account in its local **Remote Desktop Users** group
+- its firewall permitting 3389 from the gateway
+- a name the gateway can resolve — a DHCP reservation, a DNS record, or just list it by IP
+
+Windows **Pro** editions work fine as targets; only the gateway itself has to be Server. Home editions can't accept RDP at all. In the client you change one field — **Computer** — to switch machines; the gateway name stays the same for all of them.
+
+To add a machine later, re-run the script with the full list. It removes and recreates its own CAP and RAP, so re-running is safe and the result is the same as if you'd listed them all the first time.
 
 The script uses the documented `Win32_TSGateway*` WMI classes rather than the `RDS:` PowerShell provider for the policies, because the WMI method signatures spell out what each flag means. The certificate binding is the exception — that goes through `RDS:\GatewayServer\SSLCertificate\Thumbprint`, which is the well-trodden path, with a WMI fallback and, failing both, instructions for doing it in `tsgateway.msc`.
 
@@ -184,11 +216,34 @@ On your router, forward to the VM's LAN address:
 
 Point `rdg.yourdomain.tld` at your WAN address. If that name is on Cloudflare, it has to be **DNS only (grey cloud)** — see the note below.
 
+Costs nothing and works today. The trade is one open port, so spend ten minutes on the hardening below.
+
+#### Hardening the open port
+
+**Restrict the source.** The single most effective lever. In UniFi, scope the WAN-in rule for 443 to the countries or address ranges you actually connect from. Anything you cut here never reaches Windows at all.
+
+**Lock accounts out.** `secpol.msc` → Account Policies → Account Lockout Policy. Ten attempts per fifteen minutes is a reasonable floor.
+
+**Don't use obvious account names,** and give whatever you do use a long password. This is an authentication endpoint on the public internet; that's the whole threat model.
+
+**Watch for guessing.** Event 4625 in the Security log, and the gateway's own operational log:
+
+```powershell
+Get-WinEvent -LogName Microsoft-Windows-TerminalServices-Gateway/Operational -MaxEvents 30 |
+    Where-Object Id -in 200,300,301,302 | Format-Table TimeCreated, Id, Message -AutoSize
+```
+
+**Keep it patched.** RD Gateway has had pre-auth RCEs before (CVE-2020-0609/0610). Windows Update is not optional on this box.
+
+One thing *not* to bother with: moving the gateway off 443. It's possible — `HttpsPort` under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\TerminalServerGateway\Config\Core` — but it requires disabling the UDP transport, and clients need `RDGClientTransport` set in `HKCU\Software\Microsoft\Terminal Server Client` before they'll connect to a non-standard port. A registry edit on every device is exactly what a gateway is supposed to spare you.
+
 ### Option B — a public relay, nothing open at home
 
 If you'd rather not have an open port, or you're behind CGNAT and can't forward one anyway, [`RELAY.md`](RELAY.md) sets up a small VPS as a layer 4 front door with a WireGuard link back to your Proxmox host. TLS still terminates on the Windows box, so the certificate work in Phase 4 is unchanged, and **client devices install nothing** — they see a normal hostname on 443.
 
 Two scripts: `vps-relay-setup.sh` on the VPS, then `proxmox-relay-peer.sh` on the Proxmox host.
+
+**This does not have to cost anything.** Oracle Cloud's Always Free tier includes two `VM.Standard.E2.1.Micro` instances, each with a public IPv4 and 50 Mbps, plus 10 TB/month of egress, and the resources don't expire. The relay scripts run on one unmodified. The catch, stated in Oracle's own documentation: idle Always Free instances get reclaimed when CPU *and* network sit below 20% across a seven-day window — and a relay you use a few times a week is idle by definition. Plenty of people run one anyway and just rebuild it if it disappears; decide whether that's a tolerable failure mode for the thing you use to get back into your house.
 
 ### Cloudflare Tunnel is not an option here, and it's worth knowing why
 
