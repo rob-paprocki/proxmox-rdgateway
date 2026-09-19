@@ -222,9 +222,13 @@ Costs nothing and works today. The trade is one open port, so spend ten minutes 
 
 **Restrict the source.** The single most effective lever. In UniFi, scope the WAN-in rule for 443 to the countries or address ranges you actually connect from. Anything you cut here never reaches Windows at all.
 
+**Put the gateway on its own VLAN.** Restricting the source narrows who can reach the gateway; this narrows what the gateway can reach if it falls. It is by design a machine that accepts connections from the internet and then reaches into your LAN, so assume for a moment that someone is on it and ask what that buys them. In UniFi, give it its own network and write firewall rules that let it reach only 3389 on the specific machines you pass to `-TargetMachines` — not the NAS, not your other VMs, not the Proxmox management interface. This one applies whichever of the two options you pick, because it concerns the gateway itself rather than how traffic gets to it.
+
 **Lock accounts out.** `secpol.msc` → Account Policies → Account Lockout Policy. Ten attempts per fifteen minutes is a reasonable floor.
 
 **Don't use obvious account names,** and give whatever you do use a long password. This is an authentication endpoint on the public internet; that's the whole threat model.
+
+**Keep the hostname out of Certificate Transparency logs.** Every certificate a public CA issues is published to CT logs, permanently and publicly, so `rdg.yourdomain.tld` becomes a searchable fact the moment win-acme first runs — and people scrape those logs for exactly the names you would guess: `rdg.`, `vpn.`, `remote.`. Phase 4 already validates over DNS-01, so ask win-acme for a wildcard (`*.yourdomain.tld`) instead and the specific name never appears. Be clear about what this does and doesn't buy: it hides nothing from anyone sweeping IPv4 for an open 443, and it substitutes for none of the rest of this list. It only stops you being handed to people hunting gateways by name. It applies to the relay too, where what gets found is the VPS.
 
 **Watch for guessing.** Event 4625 in the Security log, and the gateway's own operational log:
 
@@ -244,6 +248,8 @@ If you'd rather not have an open port, or you're behind CGNAT and can't forward 
 Two scripts: `vps-relay-setup.sh` on the VPS, then `proxmox-relay-peer.sh` on the Proxmox host.
 
 **This does not have to cost anything.** Oracle Cloud's Always Free tier includes two `VM.Standard.E2.1.Micro` instances, each with a public IPv4 and 50 Mbps, plus 10 TB/month of egress, and the resources don't expire. The relay scripts run on one unmodified. The catch, stated in Oracle's own documentation: idle Always Free instances get reclaimed when CPU *and* network sit below 20% across a seven-day window — and a relay you use a few times a week is idle by definition. Plenty of people run one anyway and just rebuild it if it disappears; decide whether that's a tolerable failure mode for the thing you use to get back into your house.
+
+Most of the hardening under Option A still applies here. The relay changes which address is listed and narrows what faces the internet to a layer 4 proxy — it does not make the gateway any harder to authenticate against, so the lockout policy, the account naming, the patching and especially the VLAN isolation are all still yours to do. What you can drop is the WAN-in source restriction, since there is no longer a WAN rule to scope; the equivalent lives in the relay's own firewall.
 
 ### Cloudflare Tunnel is not an option here, and it's worth knowing why
 
