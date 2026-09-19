@@ -537,8 +537,7 @@ generate_answer_file() {
 
             <UserData>
                 <AcceptEula>true</AcceptEula>
-                <FullName>${ADMIN_USER}</FullName>
-                <Organization></Organization>${product_key_block}
+                <FullName>${ADMIN_USER}</FullName>${product_key_block}
             </UserData>
         </component>
     </settings>
@@ -583,7 +582,6 @@ generate_answer_file() {
                 <LocalAccounts>
                     <LocalAccount wcm:action="add">
                         <Name>${ADMIN_USER}</Name>
-                        <DisplayName>${ADMIN_USER}</DisplayName>
                         <Group>Administrators</Group>
                         <Password>
                             <Value>${ADMIN_PASS}</Value>

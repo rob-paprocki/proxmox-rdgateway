@@ -102,7 +102,6 @@
             <UserData>
                 <AcceptEula>true</AcceptEula>
                 <FullName>rdgadmin</FullName>
-                <Organization></Organization>
             <ProductKey>
                 <Key>TVRH6-WHNXV-R9WG3-9XRFY-MY832</Key>
                 <WillShowUI>Never</WillShowUI>
@@ -151,7 +150,6 @@
                 <LocalAccounts>
                     <LocalAccount wcm:action="add">
                         <Name>rdgadmin</Name>
-                        <DisplayName>rdgadmin</DisplayName>
                         <Group>Administrators</Group>
                         <Password>
                             <Value>EXAMPLE-not-a-real-password</Value>
