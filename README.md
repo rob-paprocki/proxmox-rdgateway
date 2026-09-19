@@ -5,19 +5,39 @@ the wizard twice and without guessing at the WMI calls.
 
 | File | Runs on | Does |
 |---|---|---|
-| [`windows-rdgw-vm.sh`](windows-rdgw-vm.sh) | Proxmox host, as root | Interactive VM builder — q35 + OVMF, Secure Boot, TPM 2.0, VirtIO SCSI, both ISOs attached |
+| [`windows-rdgw-vm.sh`](windows-rdgw-vm.sh) | Proxmox host, as root | Interactive VM builder — q35 + OVMF, Secure Boot, TPM 2.0, VirtIO SCSI. Optionally builds an unattend ISO so the whole thing installs itself |
 | [`Setup-RDGateway.ps1`](Setup-RDGateway.ps1) | Inside the guest, elevated | Installs the RDS-Gateway role, binds a certificate, writes the CAP and RAP, opens the firewall |
+| [`Configure-Guest.ps1`](Configure-Guest.ps1) | Inside the guest, as SYSTEM | Applies the security and housekeeping answers given during the build |
+| [`Invoke-GatewaySetup.ps1`](Invoke-GatewaySetup.ps1) | Inside the guest, as SYSTEM | First-boot orchestrator — survives the role-install reboot and runs the two above |
 | [`vps-relay-setup.sh`](vps-relay-setup.sh) | A small public VPS | *Optional.* Layer 4 front door so nothing has to be open at home |
 | [`proxmox-relay-peer.sh`](proxmox-relay-peer.sh) | Proxmox host, as root | *Optional.* Home end of that relay — outbound WireGuard, forwarding, NAT |
 
+On the Proxmox host, as root:
+
 ```bash
-# on the Proxmox host
-DRY_RUN=1 bash windows-rdgw-vm.sh   # show the qm commands, run nothing
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/main/windows-rdgw-vm.sh)"
+```
+
+Or from a checkout, which is the better way to read it first:
+
+```bash
+DRY_RUN=1 bash windows-rdgw-vm.sh   # print every command, write nothing
 bash windows-rdgw-vm.sh             # actually build it
 ```
 
+That one script asks whether you want an unattended build. Say yes and it answers a
+short set of questions — account name, password, lockout policy, external FQDN, which
+machines to reach — then writes a third CD holding an answer file, the VirtIO drivers and
+the setup scripts. Windows installs itself, a startup task installs the RD Gateway role and
+runs `Setup-RDGateway.ps1`, and you come back to a working gateway after two or three
+reboots and twenty to forty minutes.
+
+Say no and you get the original behaviour: a correctly configured VM shell with both ISOs
+attached, and you drive Setup yourself. That path is still documented below in full, and it
+is the one to fall back on when something in the automated build misbehaves.
+
 ```powershell
-# inside the guest, in Windows PowerShell (not pwsh), elevated
+# the manual path, inside the guest, in Windows PowerShell (not pwsh), elevated
 .\Setup-RDGateway.ps1 -ExternalFqdn rdg.yourdomain.tld `
                       -CertificateSource SelfSigned `
                       -TargetMachines 'DESKTOP-01','NAS01','192.168.1.60'
@@ -27,9 +47,6 @@ One public hostname, many machines behind it — that's what `-TargetMachines` i
 targets install nothing: they need Remote Desktop on, your account in their Remote Desktop
 Users group, and a name the gateway can resolve. Windows Pro is fine as a target; only the
 gateway itself has to be Server.
-
-Neither script installs Windows — there is no cloud image for it. The builder stops at a
-correctly configured VM shell with the boot order set; you run Setup from the console.
 
 **Cloudflare Tunnel cannot carry this.** RD Gateway's transport uses the custom HTTP methods
 `RDG_IN_DATA` and `RDG_OUT_DATA`, and Cloudflare's edge answers both with `501` before the
@@ -83,9 +100,97 @@ The defaults are 4 cores, 6 GiB RAM, 80 GiB disk, q35 + OVMF, Secure Boot with t
 
 Every command it runs is printed before it runs, so you can follow along or lift them out and do it by hand.
 
+### Running it from curl
+
+The one-liner at the top works for both paths:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/main/windows-rdgw-vm.sh)"
+```
+
+The unattended path needs three more files — `Setup-RDGateway.ps1`, `Configure-Guest.ps1` and `Invoke-GatewaySetup.ps1` — to put on the ISO it builds. Local copies always win. From a checkout nothing is downloaded and your edits are used. Only when they aren't sitting next to the script does it fetch them, and then it prints every URL before touching the network.
+
+Those three are copied to the unattend CD and run *inside the guest*. They are never executed on the Proxmox host.
+
+Pin a branch or tag if you don't want to track `main`:
+
+```bash
+REPO_REF=v1.0 bash -c "$(curl -fsSL https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/v1.0/windows-rdgw-vm.sh)"
+```
+
+`REPO_RAW` overrides the base URL outright, for a fork or an internal mirror.
+
+### The unattended questions
+
+Say yes to "unattended install" and it asks the following. Nothing here has a safe default it can guess for you, so it asks in both default and advanced mode.
+
+| Question | Default | Notes |
+|---|---|---|
+| Local administrator account name | `rdgadmin` | Deliberately not `admin`. Type whatever you want. |
+| Password | — | Asked twice. Leave it empty for a blank password; it will confirm that you meant it. |
+| External FQDN | `rdg.example.com` | Passed straight to `Setup-RDGateway.ps1 -ExternalFqdn`. |
+| Windows time zone ID | `Eastern Standard Time` | The Windows name, not the IANA one. `tzutil /l` lists them. |
+| Target machines | *(empty)* | Space separated. Empty scopes the RAP to this server only. |
+| Edition | Standard (Desktop Experience) | Picks the image name **and** the matching GVLK together so they can't drift apart. There are Evaluation entries, which correctly send no key at all. |
+| Lockout threshold | `10` | `0` disables lockout entirely. |
+| Lockout window | `15` minutes | Used for both the window and the duration. |
+| Disable UAC | no | |
+| Disable Defender | no | |
+| Disable Core Isolation | no | |
+| Require Ctrl+Alt+Del | no | The one that defaults to the *less* strict answer, because sending Ctrl+Alt+Del to a Proxmox console is a menu trip rather than a keystroke. |
+| Housekeeping settings | yes | 8.3 names off, fast startup off, long paths on, WPBT off, no Windows Update auto-reboot, system sounds off, NumLock on, and Explorer/taskbar/theme defaults suited to RDP. |
+
+The four security toggles all default to leaving Windows exactly as it ships. They exist because the operator asked for them; each prompt states what it costs, and then does what you picked without arguing further.
+
+**Check your media before you pick an edition.** The image name has to match the ISO exactly, and Evaluation media names its images differently:
+
+```bash
+# on any machine with the ISO mounted
+dism /Get-WimInfo /WimFile:<mount>\sources\install.wim
+```
+
+A retail or volume-licence ISO reports `Windows Server 2025 Standard (Desktop Experience)`. The free Evaluation ISO reports `Windows Server 2025 Standard Evaluation (Desktop Experience)`, and a GVLK cannot activate it — evaluation has to be converted with `DISM /online /Set-Edition` first. Pick the matching entry from the menu, or the "type the image name myself" option.
+
+### What lands on the unattend CD
+
+Four things, and `DRY_RUN=1` prints the generated answer file in full so you can read it before anything is written:
+
+- `autounattend.xml` — Windows Setup finds this by itself. It scans the root of every removable drive looking for exactly that filename, so no boot-order change is needed.
+- `$WinPEDriver$\` — `vioscsi`, `viostor` and `NetKVM` from `2k25\amd64`. Windows Server scans every drive letter from C upward for a directory with this name during the windowsPE pass and stages every INF underneath it. That is what removes the **Load driver** step.
+- `rdgw\*.ps1` — copied to `C:\Windows\Setup\Scripts` during the specialize pass.
+- `rdgw\rdgw-config.psd1` — every answer you gave, as plain data.
+
+[`sample-autounattend.xml`](sample-autounattend.xml) is a committed copy of what a default run produces, so the shape is reviewable without running anything.
+
+The CD is attached on `sata0` — q35 gives you only `ide0` and `ide2`, and both are already holding the Windows and VirtIO ISOs. It is written mode 600 because the answer file carries the account password in clear text. Base64 in an answer file is obfuscation, not encryption, so this doesn't pretend otherwise: delete the ISO once the build is done.
+
 ---
 
 ## Phase 2 — Install Windows
+
+### If you chose the unattended path
+
+Nothing to do. It is here so you know what is happening and where to look if it stalls.
+
+1. Windows Setup boots from the DVD, finds `autounattend.xml` on the unattend CD, and stages the VirtIO drivers from `$WinPEDriver$`.
+2. It wipes disk 0 — the only disk this VM has — and partitions it EFI 300 MiB, MSR 16 MiB, then NTFS for the rest. There is deliberately no explicit recovery partition: Windows creates the WinRE partition itself on an NTFS boot volume by shrinking the OS volume on first boot.
+3. It installs the edition you chose.
+4. The specialize pass copies the scripts to `C:\Windows\Setup\Scripts` and registers a startup task called `RDGW-FirstBoot`.
+5. That task applies your answers, installs the RD Gateway role, reboots if Windows asks for one, then runs `Setup-RDGateway.ps1` and checks that the `TSGateway` service came up.
+
+Expect two or three reboots and roughly twenty to forty minutes. Everything is timestamped in:
+
+```
+C:\Windows\Setup\Scripts\rdgw-setup.log
+```
+
+It's finished when that log ends with `First-boot setup finished.` Windows Setup's own log, for failures before any of the above runs, is `C:\Windows\Panther\setupact.log`.
+
+That role-install reboot is why `Invoke-GatewaySetup.ps1` exists. `Setup-RDGateway.ps1` stops and asks you to reboot and re-run with `-SkipRoleInstall` when `Install-WindowsFeature` reports `RestartNeeded`, and `SetupComplete.cmd` is not allowed to reboot and resume. So the work is split across boots and the task keeps the place in a small state file. It stops after five boots rather than looping, leaves itself registered, and writes why to the log — so a plain reboot retries.
+
+Then skip to Phase 4. Phase 3 lists what the automated path already did.
+
+### If you chose the shell-only path
 
 Open the console from the Proxmox web UI. Two things trip people up:
 
@@ -99,7 +204,16 @@ Pick a **(Desktop Experience)** edition unless you genuinely want to run this fr
 
 ## Phase 3 — Post-install housekeeping
 
-Inside Windows, before you configure anything:
+The unattended path has already done items 1, 3, 5 and 6 below, plus the housekeeping settings if you accepted them. What it cannot do for you is item 2 — pinning the address — and item 4, Windows Update. Do those, then go to Phase 4.
+
+One thing to check on an unattended build, because it is the likeliest thing in this repo to be wrong: the `UserGroupNames` readback. `Invoke-GatewaySetup.ps1` prints it into the log for exactly this reason, and `Administrators@BUILTIN` on a non-domain-joined gateway comes from a published workgroup example rather than from a run against real hardware.
+
+```powershell
+Get-CimInstance -Namespace root/cimv2/TerminalServices `
+  -ClassName Win32_TSGatewayConnectionAuthorizationPolicy | Select-Object UserGroupNames
+```
+
+On the shell-only path, inside Windows, before you configure anything:
 
 1. **Run `virtio-win-guest-tools.exe`** from the VirtIO CD. That installs the balloon driver, the QEMU guest agent, and the rest of the VirtIO stack in one go. Proxmox will start reporting the guest's IP once the agent is running.
 2. **Pin the IP.** Either a static address in Windows or a DHCP reservation in UniFi. A gateway whose address moves is a gateway you can't port-forward to.
@@ -107,7 +221,7 @@ Inside Windows, before you configure anything:
 4. **Windows Update** until it stops finding things.
 5. **Detach the ISOs** from the Proxmox host so it stops trying to boot the DVD:
    ```bash
-   qm set <VMID> --ide0 none --ide2 none --boot order=scsi0
+   qm set <VMID> --ide0 none --ide2 none --sata0 none --boot order=scsi0
    ```
 6. **Set a serious password** on whatever account you'll use. You are about to put an authentication endpoint on the public internet. Also worth setting a lockout policy: `secpol.msc` → Account Policies → Account Lockout Policy, 10 attempts / 15 minutes is a reasonable floor.
 
@@ -310,6 +424,13 @@ Event **200** means the client reached the gateway. **300** means the RAP author
 
 ```bash
 qm stop <VMID> && qm destroy <VMID> --destroy-unreferenced-disks 1 --purge
+```
+
+Destroying the VM does not remove the unattend ISO, which lives in ISO storage and holds the
+account password in clear text. Delete it separately:
+
+```bash
+rm /var/lib/vz/template/iso/unattend-<VMID>.iso
 ```
 
 ---
