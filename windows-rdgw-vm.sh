@@ -988,7 +988,7 @@ cat <<EOF
 ${BOLD}${GN}VM ${VMID} is built and will install itself.${CL}
 
 Nothing below needs you at the console. It is here so you know what is
-happening and where to look when it does not happen.
+happening and where to look if it stalls.
 
 ${BOLD}What runs, in order${CL}
    1. Windows Setup boots from the DVD, finds ${BL}autounattend.xml${CL} on the

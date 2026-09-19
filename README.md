@@ -25,12 +25,12 @@ DRY_RUN=1 bash windows-rdgw-vm.sh   # print every command, write nothing
 bash windows-rdgw-vm.sh             # actually build it
 ```
 
-That one script asks whether you want an **unattended** build. Say yes and it answers a
+That one script asks whether you want an unattended build. Say yes and it answers a
 short set of questions — account name, password, lockout policy, external FQDN, which
 machines to reach — then writes a third CD holding an answer file, the VirtIO drivers and
 the setup scripts. Windows installs itself, a startup task installs the RD Gateway role and
-runs `Setup-RDGateway.ps1`, and you come back to a working gateway. Two or three reboots,
-roughly twenty to forty minutes, nobody at the console.
+runs `Setup-RDGateway.ps1`, and you come back to a working gateway after two or three
+reboots and twenty to forty minutes.
 
 Say no and you get the original behaviour: a correctly configured VM shell with both ISOs
 attached, and you drive Setup yourself. That path is still documented below in full, and it
@@ -108,7 +108,7 @@ The one-liner at the top works for both paths:
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/main/windows-rdgw-vm.sh)"
 ```
 
-The unattended path needs three more files — `Setup-RDGateway.ps1`, `Configure-Guest.ps1` and `Invoke-GatewaySetup.ps1` — to put on the ISO it builds. **Local copies always win.** From a checkout nothing is downloaded and your edits are used. Only when they aren't sitting next to the script does it fetch them, and then it prints every URL before touching the network.
+The unattended path needs three more files — `Setup-RDGateway.ps1`, `Configure-Guest.ps1` and `Invoke-GatewaySetup.ps1` — to put on the ISO it builds. Local copies always win. From a checkout nothing is downloaded and your edits are used. Only when they aren't sitting next to the script does it fetch them, and then it prints every URL before touching the network.
 
 Those three are copied to the unattend CD and run *inside the guest*. They are never executed on the Proxmox host.
 
@@ -170,10 +170,10 @@ The CD is attached on `sata0` — q35 gives you only `ide0` and `ide2`, and both
 
 ### If you chose the unattended path
 
-Nothing to do. This section is here so you know what is happening and where to look when it doesn't.
+Nothing to do. It is here so you know what is happening and where to look if it stalls.
 
 1. Windows Setup boots from the DVD, finds `autounattend.xml` on the unattend CD, and stages the VirtIO drivers from `$WinPEDriver$`.
-2. It wipes **disk 0** — the only disk this VM has — and partitions it EFI 300 MiB, MSR 16 MiB, then NTFS for the rest. There is deliberately no explicit recovery partition: Windows creates the WinRE partition itself on an NTFS boot volume by shrinking the OS volume on first boot.
+2. It wipes disk 0 — the only disk this VM has — and partitions it EFI 300 MiB, MSR 16 MiB, then NTFS for the rest. There is deliberately no explicit recovery partition: Windows creates the WinRE partition itself on an NTFS boot volume by shrinking the OS volume on first boot.
 3. It installs the edition you chose.
 4. The specialize pass copies the scripts to `C:\Windows\Setup\Scripts` and registers a startup task called `RDGW-FirstBoot`.
 5. That task applies your answers, installs the RD Gateway role, reboots if Windows asks for one, then runs `Setup-RDGateway.ps1` and checks that the `TSGateway` service came up.
@@ -186,7 +186,7 @@ C:\Windows\Setup\Scripts\rdgw-setup.log
 
 It's finished when that log ends with `First-boot setup finished.` Windows Setup's own log, for failures before any of the above runs, is `C:\Windows\Panther\setupact.log`.
 
-**That role-install reboot is the reason `Invoke-GatewaySetup.ps1` exists.** `Setup-RDGateway.ps1` stops and asks you to reboot and re-run with `-SkipRoleInstall` when `Install-WindowsFeature` reports `RestartNeeded`, and `SetupComplete.cmd` is not allowed to reboot and resume. So the work is split across boots and the task keeps the place in a small state file. It stops after five boots rather than looping, leaves itself registered, and writes why to the log — so a plain reboot retries.
+That role-install reboot is why `Invoke-GatewaySetup.ps1` exists. `Setup-RDGateway.ps1` stops and asks you to reboot and re-run with `-SkipRoleInstall` when `Install-WindowsFeature` reports `RestartNeeded`, and `SetupComplete.cmd` is not allowed to reboot and resume. So the work is split across boots and the task keeps the place in a small state file. It stops after five boots rather than looping, leaves itself registered, and writes why to the log — so a plain reboot retries.
 
 Then skip to Phase 4. Phase 3 lists what the automated path already did.
 
@@ -204,7 +204,7 @@ Pick a **(Desktop Experience)** edition unless you genuinely want to run this fr
 
 ## Phase 3 — Post-install housekeeping
 
-**The unattended path has already done items 1, 3, 5 and 6 below**, plus the housekeeping settings if you accepted them. What it cannot do for you is item 2 — pinning the address — and item 4, Windows Update. Do those, then go to Phase 4.
+The unattended path has already done items 1, 3, 5 and 6 below, plus the housekeeping settings if you accepted them. What it cannot do for you is item 2 — pinning the address — and item 4, Windows Update. Do those, then go to Phase 4.
 
 One thing to check on an unattended build, because it is the likeliest thing in this repo to be wrong: the `UserGroupNames` readback. `Invoke-GatewaySetup.ps1` prints it into the log for exactly this reason, and `Administrators@BUILTIN` on a non-domain-joined gateway comes from a published workgroup example rather than from a run against real hardware.
 

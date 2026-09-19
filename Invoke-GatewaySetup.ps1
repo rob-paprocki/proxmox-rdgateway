@@ -6,11 +6,10 @@
     Runs as SYSTEM from a scheduled task that fires at startup, and survives the
     reboot that installing the RD Gateway role demands.
 
-    That reboot is the whole reason this file exists. Setup-RDGateway.ps1 stops
-    and asks you to reboot and re-run with -SkipRoleInstall when
-    Install-WindowsFeature reports RestartNeeded, and SetupComplete.cmd is not
-    allowed to reboot and resume. So the work is split across boots and this
-    script keeps the place:
+    That reboot is why this file exists. Setup-RDGateway.ps1 stops and asks you
+    to reboot and re-run with -SkipRoleInstall when Install-WindowsFeature
+    reports RestartNeeded, and SetupComplete.cmd is not allowed to reboot and
+    resume. So the work is split across boots and this script keeps the place:
 
         boot 1   apply Configure-Guest.ps1, install the RDS-Gateway role,
                  reboot if Windows asks for one

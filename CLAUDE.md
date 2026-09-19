@@ -152,8 +152,8 @@ bug will surface.
 - Every element of the generated answer file was checked against the Unattended Windows Setup
   Reference on Microsoft Learn: component names, valid configuration passes, child elements.
   The load-bearing one is `Microsoft-Windows-Deployment\RunSynchronous\RunSynchronousCommand`
-  (`Order`, `Description`, `Path`) in **specialize**, which the docs confirm runs in the
-  **system** context - that is what copies the scripts off the CD and registers the task. Also
+  (`Order`, `Description`, `Path`) in `specialize`, which the docs confirm runs in the
+  system context - that is what copies the scripts off the CD and registers the task. Also
   confirmed: `Primary` / `EFI` / `MSR` are valid `CreatePartition` types and an MSR partition
   correctly takes no `Format`; `WillWipeDisk` is what Microsoft recommends to avoid ending up
   with two ESPs; `HideLocalAccountScreen` is Server-only and is what stops OOBE asking for an
