@@ -21,6 +21,17 @@ No amount of `cloudflared` configuration reaches this. `disableChunkedEncoding` 
 
 This relay solves it by not speaking HTTP at all.
 
+**And it still gives you a public hostname — that is the part that gets missed.** The VPS has
+a public IPv4 of its own, so `rdg.yourdomain.tld` is an ordinary A record pointing at it,
+grey-clouded, DNS only (step 4 below). Your stock RD client types that name and connects. You
+do not need `cloudflared` to publish it, and you cannot use `cloudflared` to publish it: a
+tunnel or an orange cloud re-inserts the HTTP edge at the *front* of the path, upstream of
+this relay, so the relay never sees the request and cannot rescue it. Cloudflare's own RDP
+documentation lists three methods — browser-rendered, Cloudflare One Client, and client-side
+`cloudflared` — and every one of them puts software on the client device. Cloudflare stays in
+this design for DNS and for DNS-01 certificate validation. It never touches a byte of the
+session.
+
 ---
 
 ## The shape of it
@@ -46,7 +57,9 @@ The WireGuard link is dialled **outbound** from your Proxmox host, so your route
 
 ## What it costs
 
-A VPS with a public IPv4, which is about $4–5/month anywhere reasonable. Pick a region near you — you're adding a hop, and RDP notices latency more than bandwidth. The bandwidth itself is modest; an RDP session is typically single-digit Mbps, against the 1–2 TB/month these plans include.
+It does not have to cost anything. Oracle Cloud's Always Free tier includes two `VM.Standard.E2.1.Micro` instances, each with a public IPv4 and 50 Mbps, plus 10 TB/month of egress, and the resources do not expire. The scripts here run on one unmodified. The catch is stated in Oracle's own documentation: idle Always Free instances get reclaimed when CPU *and* network sit below 20% across a seven-day window, and a relay you use a few times a week is idle by definition. Plenty of people run one anyway and rebuild it if it disappears — decide whether that is a tolerable failure mode for the thing you use to get back into your house.
+
+If you would rather pay for something that stays put, any VPS with a public IPv4 runs about $4–5/month. Either way, pick a region near you — you are adding a hop, and RDP notices latency more than bandwidth. The bandwidth itself is modest; an RDP session is typically single-digit Mbps, well inside what any of these plans include.
 
 ---
 

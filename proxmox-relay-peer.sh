@@ -149,12 +149,19 @@ write_file "/etc/wireguard/${WG_IF}.conf" 600 <<EOF
 # Outbound only: we dial the relay, so nothing is opened on the WAN.
 # The PostUp rules forward relayed traffic to the gateway VM and masquerade it
 # so the VM's replies come back through this host instead of out the router.
+#
+# Rule order is deliberate. The DROP goes in first, so the three ACCEPTs inserted
+# after it land above it in the chain. Net effect: traffic arriving off the tunnel
+# reaches the gateway VM on the two allowed ports and nothing else on the LAN,
+# whatever this host's default FORWARD policy happens to be. Without the DROP,
+# containment would depend on that policy, which is ACCEPT on a stock host.
 
 [Interface]
 Address    = ${WG_HOME_IP}/24
 PrivateKey = ${WG_HOME_PRIVKEY}
 
 PostUp   = sysctl -q -w net.ipv4.ip_forward=1
+PostUp   = iptables -I FORWARD 1 -i %i -j DROP
 PostUp   = iptables -I FORWARD 1 -i %i -d ${RDGW_LAN_IP} -p tcp --dport ${RDGW_PORT} -j ACCEPT
 PostUp   = iptables -I FORWARD 1 -i %i -d ${RDGW_LAN_IP} -p udp --dport ${UDP_PORT} -j ACCEPT
 PostUp   = iptables -I FORWARD 1 -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
@@ -163,11 +170,14 @@ PostUp   = iptables -t nat -I POSTROUTING 1 -s ${WG_VPS_IP}/32 -d ${RDGW_LAN_IP}
 PostDown = iptables -D FORWARD -i %i -d ${RDGW_LAN_IP} -p tcp --dport ${RDGW_PORT} -j ACCEPT
 PostDown = iptables -D FORWARD -i %i -d ${RDGW_LAN_IP} -p udp --dport ${UDP_PORT} -j ACCEPT
 PostDown = iptables -D FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = iptables -D FORWARD -i %i -j DROP
 PostDown = iptables -t nat -D POSTROUTING -s ${WG_VPS_IP}/32 -d ${RDGW_LAN_IP}/32 -j MASQUERADE
 
 [Peer]
 # The relay. AllowedIPs is deliberately just its tunnel address — this does NOT
-# route your traffic through the VPS, it only accepts traffic from it.
+# route your traffic through the VPS, it only accepts traffic from it. It governs
+# the source address WireGuard will accept, not the destination — what confines the
+# relay to the gateway VM is the FORWARD DROP above, not this line.
 PublicKey           = ${WG_VPS_PUBKEY}
 Endpoint            = ${WG_VPS_ENDPOINT}
 AllowedIPs          = ${WG_VPS_IP}/32
