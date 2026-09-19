@@ -36,10 +36,11 @@ These are hard. Solutions that violate them have already been rejected in conver
 
 ## Ruled out, with evidence — do not re-propose
 
-**Cloudflare Tunnel / Workers / any orange-clouded hostname.** RD Gateway's HTTP transport
-uses the custom methods `RDG_IN_DATA` and `RDG_OUT_DATA` (MS-TSGU). Cloudflare's edge runs an
-HTTP method allowlist and returns `501` for both, generated at the edge — the request never
-reaches the origin, and never reaches a Worker. Verified empirically:
+**Cloudflare Tunnel *public hostname* routing, Workers, any orange-clouded hostname.**
+RD Gateway's HTTP transport uses the custom methods `RDG_IN_DATA` and `RDG_OUT_DATA`
+(MS-TSGU). Cloudflare's edge runs an HTTP method allowlist and returns `501` for both,
+generated at the edge — the request never reaches the origin, and never reaches a Worker.
+Verified empirically, and re-verified 2026-09-18:
 
 ```bash
 # 501 on three zones with three different origins, and on four live workers.dev endpoints
@@ -54,6 +55,34 @@ survives the network path intact. No tunnel setting reaches this — `disableChu
 and the body-buffering controls are real and genuinely needed by RD Gateway behind a reverse
 proxy, but they all sit downstream of where the request already died. Cloudflare Tunnel also
 carries no UDP on public hostnames, so port 3391 was never going to work either.
+
+**Cloudflare Tunnel *private network* routing (CIDR routes, now branded Cloudflare Mesh).**
+Different thing, different reason, and the one most likely to look like a solution on a fresh
+read of the docs — because technically it *is* one. Private network routing never touches the
+HTTP edge, and carries arbitrary TCP, UDP and ICMP, so RDP rides it happily. The blocker is
+the client side. Cloudflare's own wording: every enrolled device receives a private Mesh IP
+and can reach any other participant over TCP, UDP or ICMP, where "client devices are laptops
+and phones running the Cloudflare One Client" — the product previously called WARP. That is
+an agent on every device, which is the constraint that rules it out. Keep this reason
+separate from the `501` above: one is a technical impossibility, this one is a constraint
+violation, and collapsing them into a single "Cloudflare doesn't work" line is what sends the
+next reader back to the documentation to correctly discover that it does.
+
+**Workers VPC.** Points the wrong way. It gives a Worker outbound reach *into* a private
+network (HTTP via `fetch()`, raw TCP via `connect()`); it does not give external clients
+inbound reach to a private service. The client still has to arrive at the Worker over
+ordinary HTTP, which is the leg that already fails — `RDG_IN_DATA` is refused at the edge
+before any Worker code runs. It is also the wrong shape: RD Gateway holds two long-lived
+bidirectional streams open for the life of a session, and Workers are request/response with
+duration limits.
+
+**Fronting the relay with `cloudflared`.** The relay already publishes a public hostname on
+its own — the VPS has a public IPv4, and a grey-clouded A record points at it. Adding
+`cloudflared` or an orange cloud re-inserts the HTTP edge at the *front* of the path, which
+is upstream of the relay; the relay therefore never sees the request and cannot rescue it.
+Cloudflare's RDP documentation lists exactly three methods — browser-rendered, Cloudflare One
+Client, and client-side `cloudflared` — and each one either puts software on the client or is
+the browser path already rejected. There is no stock-client entry.
 
 **Cloudflare Spectrum.** The only Cloudflare product that proxies arbitrary TCP. Business
 plan and up, roughly $200/month.
@@ -95,7 +124,7 @@ bug will surface.
 
 **Verified in this session:**
 
-- All four shell scripts: `bash -n` and `shellcheck -S warning` clean; exercised end to end
+- All three shell scripts: `bash -n` and `shellcheck -S warning` clean; exercised end to end
   with `DRY_RUN=1` against stubbed `qm` / `pvesm` / `pvesh` / `whiptail`, covering the default
   path, the advanced path, and the virtio-download path.
 - The generated nginx stream config passes `nginx -t` against a real nginx with the stream
