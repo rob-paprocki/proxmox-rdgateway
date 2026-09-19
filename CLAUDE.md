@@ -149,6 +149,24 @@ bug will surface.
   round-trips through `Import-PowerShellDataFile` with the right types (`Boolean` for the
   toggles, `Int32` for the lockout numbers, `Object[]` for `TargetMachines`) both empty and
   populated.
+- Every element of the generated answer file was checked against the Unattended Windows Setup
+  Reference on Microsoft Learn: component names, valid configuration passes, child elements.
+  The load-bearing one is `Microsoft-Windows-Deployment\RunSynchronous\RunSynchronousCommand`
+  (`Order`, `Description`, `Path`) in **specialize**, which the docs confirm runs in the
+  **system** context - that is what copies the scripts off the CD and registers the task. Also
+  confirmed: `Primary` / `EFI` / `MSR` are valid `CreatePartition` types and an MSR partition
+  correctly takes no `Format`; `WillWipeDisk` is what Microsoft recommends to avoid ending up
+  with two ESPs; `HideLocalAccountScreen` is Server-only and is what stops OOBE asking for an
+  Administrator password; `Administrators` is the correct language-neutral `Group` name.
+
+**Checked and deliberately NOT added to the answer file** - don't re-derive these:
+
+- `OOBE\NetworkLocation` - deprecated in Windows 10, documented for reference only.
+- `OOBE\VMModeOptimizations` - requires `sysprep /mode:vm`, which this flow never runs, so
+  the settings would be inert.
+- Anything enabling Remote Desktop. `Setup-RDGateway.ps1` already sets `fDenyTSConnections=0`
+  and `UserAuthentication=1` (NLA) and opens the firewall group at lines 259-267.
+  `Configure-Guest.ps1` must not duplicate it.
 - The three WMI `Create` signatures were checked against Microsoft's documentation and match
   in both count and order: CAP takes **18** parameters (an earlier 13-parameter version was a
   real bug — the trailing `IdleTimeout`, `SessionTimeout`, `SessionTimeoutAction`,
@@ -178,7 +196,8 @@ bug will surface.
   `$WinPEDriver$` scan is documented for Windows Server but has not been watched working
   here; and the `RDGW-FirstBoot` scheduled task's reboot handoff is reasoned about rather
   than observed. Each failure is visible and recoverable — Setup stops at a readable error,
-  and the task logs every step to `C:\Windows\Setup\Scriptsdgw-setup.log` and stays
+  and the task logs every step to `C:\Windows\Setup\Scripts
+dgw-setup.log` and stays
   registered so a reboot retries — but none of it has met a real disk.
 - `DiskID 0` in the answer file assumes the VirtIO SCSI disk is the only disk. True for a VM
   this script builds; add a second disk before install and it stops being true.
