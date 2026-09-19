@@ -12,8 +12,15 @@ the wizard twice and without guessing at the WMI calls.
 | [`vps-relay-setup.sh`](vps-relay-setup.sh) | A small public VPS | *Optional.* Layer 4 front door so nothing has to be open at home |
 | [`proxmox-relay-peer.sh`](proxmox-relay-peer.sh) | Proxmox host, as root | *Optional.* Home end of that relay — outbound WireGuard, forwarding, NAT |
 
+On the Proxmox host, as root:
+
 ```bash
-# on the Proxmox host, from a checkout of this repo
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/main/windows-rdgw-vm.sh)"
+```
+
+Or from a checkout, which is the better way to read it first:
+
+```bash
 DRY_RUN=1 bash windows-rdgw-vm.sh   # print every command, write nothing
 bash windows-rdgw-vm.sh             # actually build it
 ```
@@ -93,7 +100,25 @@ The defaults are 4 cores, 6 GiB RAM, 80 GiB disk, q35 + OVMF, Secure Boot with t
 
 Every command it runs is printed before it runs, so you can follow along or lift them out and do it by hand.
 
-Run it from a **checkout** of this repo rather than curling the one file. The unattended path copies `Setup-RDGateway.ps1`, `Configure-Guest.ps1` and `Invoke-GatewaySetup.ps1` onto the ISO it builds, and stops with an error if they aren't sitting next to it.
+### Running it from curl
+
+The one-liner at the top works for both paths:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/main/windows-rdgw-vm.sh)"
+```
+
+The unattended path needs three more files — `Setup-RDGateway.ps1`, `Configure-Guest.ps1` and `Invoke-GatewaySetup.ps1` — to put on the ISO it builds. **Local copies always win.** From a checkout nothing is downloaded and your edits are used. Only when they aren't sitting next to the script does it fetch them, and then it prints every URL before touching the network.
+
+Those three are copied to the unattend CD and run *inside the guest*. They are never executed on the Proxmox host.
+
+Pin a branch or tag if you don't want to track `main`:
+
+```bash
+REPO_REF=v1.0 bash -c "$(curl -fsSL https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/v1.0/windows-rdgw-vm.sh)"
+```
+
+`REPO_RAW` overrides the base URL outright, for a fork or an internal mirror.
 
 ### The unattended questions
 

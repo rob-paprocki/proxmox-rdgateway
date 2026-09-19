@@ -3,10 +3,7 @@
 #  windows-rdgw-vm.sh
 #
 #  Builds a Proxmox VE virtual machine sized and configured for a Windows Server
-#  2025 RD Gateway host. Styled after the community-scripts/ProxmoxVE VM scripts,
-#  but fully self-contained: it sources nothing from the network except the
-#  optional VirtIO driver ISO download, so you can read every line before you
-#  run it.
+#  2025 RD Gateway host. Styled after the community-scripts/ProxmoxVE VM scripts.
 #
 #  It can do one of two things, and asks which one you want:
 #
@@ -18,13 +15,25 @@
 #                  ISOs attached and the boot order set. You run Windows Setup
 #                  from the console and Setup-RDGateway.ps1 inside the guest.
 #
-#  The unattended path needs the sibling scripts from this repo, so run it from
-#  a checkout rather than curling this one file.
+#  Usage, on the Proxmox host as root:
 #
-#  Usage:
-#      bash windows-rdgw-vm.sh
+#      bash -c "$(curl -fsSL https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/main/windows-rdgw-vm.sh)"
+#
+#      bash windows-rdgw-vm.sh               # from a checkout
 #      DRY_RUN=1 bash windows-rdgw-vm.sh     # print every command, run nothing
 #                                            # and echo the generated answer file
+#
+#  What it touches on the network:
+#
+#    - the VirtIO driver ISO, only if you have none and ask it to download one
+#    - Setup-RDGateway.ps1, Configure-Guest.ps1 and Invoke-GatewaySetup.ps1,
+#      only on the unattended path and only when they are not already sitting
+#      next to this script. Local copies always win, so from a checkout nothing
+#      is fetched. Those three are copied to the unattend ISO and run inside
+#      the guest — they are never executed on the Proxmox host. Every URL is
+#      printed before it is fetched, and REPO_REF pins the branch or tag.
+#
+#  Nothing else leaves the machine. Read every line before you run it.
 #
 #  License: MIT
 # ------------------------------------------------------------------------------
@@ -42,15 +51,32 @@ APP="Windows Server 2025 — RD Gateway"
 VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
 DRY_RUN="${DRY_RUN:-0}"
 
-# Where the sibling scripts live. The unattend ISO needs Setup-RDGateway.ps1,
-# Configure-Guest.ps1 and Invoke-GatewaySetup.ps1, so this has to be a real
-# checkout rather than a lone curl of this one file.
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# Where this script is running from. When it is piped straight into bash — the
+# one-liner in the usage block above — there is no BASH_SOURCE to work from, so
+# fall back to the working directory.
+_src="${BASH_SOURCE[0]:-}"
+if [[ -n "$_src" && -f "$_src" ]]; then
+  SCRIPT_DIR="$(cd -- "$(dirname -- "$_src")" && pwd)"
+else
+  SCRIPT_DIR="$PWD"
+fi
+unset _src
+
+# The unattend ISO carries three PowerShell files. Running from a checkout they
+# are already next to this script; running from the one-liner they have to be
+# fetched. Pin a different ref or point somewhere else entirely with:
+#   REPO_REF=some-branch bash -c "$(curl -fsSL .../windows-rdgw-vm.sh)"
+REPO_REF="${REPO_REF:-main}"
+REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/${REPO_REF}}"
+SUPPORT_FILES=(Setup-RDGateway.ps1 Configure-Guest.ps1 Invoke-GatewaySetup.ps1)
+SUPPORT_DIR=""
 
 # Set while an unattend ISO is being built, so the exit trap can clean up a
-# loop mount or a staging directory if something fails midway.
+# loop mount, a staging directory or a download directory if something fails
+# midway.
 UNATTEND_MOUNT=""
 UNATTEND_STAGE=""
+UNATTEND_SUPPORT=""
 
 header_info() {
   clear
@@ -84,6 +110,7 @@ cleanup_handler() {
     rmdir "$UNATTEND_MOUNT" 2>/dev/null || true
   fi
   [[ -n "$UNATTEND_STAGE" ]] && rm -rf "$UNATTEND_STAGE"
+  [[ -n "$UNATTEND_SUPPORT" ]] && rm -rf "$UNATTEND_SUPPORT"
   return 0
 }
 trap cleanup_handler EXIT
@@ -381,6 +408,48 @@ unattend_settings() {
     --yesno "Apply the housekeeping settings?\n\n8.3 names off, fast startup off, long paths on, WPBT off, no Windows Update auto-reboot, system sounds off, NumLock on, and Explorer/taskbar/theme defaults suited to RDP.\n\nNone of these are security relevant." 15 72 || APPLY_TWEAKS="false"
 }
 
+# Find the three PowerShell files the unattend ISO needs, or fetch them.
+#
+# Local copies always win, so a checkout — or a directory where you have edited
+# them — behaves exactly as before and nothing is downloaded. Only the one-liner
+# path reaches the network, and it prints every URL before fetching it.
+resolve_support_files() {
+  local f missing=0
+
+  for f in "${SUPPORT_FILES[@]}"; do
+    [[ -f "${SCRIPT_DIR}/${f}" ]] || missing=1
+  done
+
+  if [[ "$missing" -eq 0 ]]; then
+    SUPPORT_DIR="$SCRIPT_DIR"
+    msg_ok "PowerShell files found locally (${BL}${SCRIPT_DIR}${CL})"
+    return
+  fi
+
+  msg_warn "The PowerShell files are not next to this script — fetching them"
+  printf "     from ${BL}%s${CL}\n" "$REPO_RAW"
+  printf "     %sThese are copied to the unattend ISO and run inside the guest, not here.%s\n" "$DIM" "$CL"
+
+  SUPPORT_DIR="$(mktemp -d)"
+  UNATTEND_SUPPORT="$SUPPORT_DIR"
+
+  for f in "${SUPPORT_FILES[@]}"; do
+    printf "   ${DIM}\$ curl -fsSL -o %s %s${CL}\n" "${SUPPORT_DIR}/${f}" "${REPO_RAW}/${f}"
+    [[ "$DRY_RUN" == "1" ]] && continue
+    if ! curl -fsSL -o "${SUPPORT_DIR}/${f}" "${REPO_RAW}/${f}"; then
+      msg_error "Could not download ${f}"
+      printf "     Tried: %s\n" "${REPO_RAW}/${f}"
+      printf "     Check REPO_REF (currently '%s'), or clone the repo and run from there.\n" "$REPO_REF"
+      exit 1
+    fi
+    if [[ ! -s "${SUPPORT_DIR}/${f}" ]]; then
+      msg_error "Downloaded ${f} is empty."
+      exit 1
+    fi
+  done
+  msg_ok "Fetched ${#SUPPORT_FILES[@]} PowerShell files (ref ${BL}${REPO_REF}${CL})"
+}
+
 require_iso_tool() {
   if command -v xorriso >/dev/null 2>&1; then
     ISO_TOOL="xorriso"
@@ -670,13 +739,13 @@ build_unattend_iso() {
 
   msg_info "Staging the first-boot scripts"
   local f
-  for f in Configure-Guest.ps1 Invoke-GatewaySetup.ps1 Setup-RDGateway.ps1; do
-    if [[ ! -f "${SCRIPT_DIR}/${f}" ]]; then
-      msg_error "Missing ${SCRIPT_DIR}/${f}. Run this from a full checkout of the repo."
+  for f in "${SUPPORT_FILES[@]}"; do
+    if [[ "$DRY_RUN" != "1" && ! -f "${SUPPORT_DIR}/${f}" ]]; then
+      msg_error "Missing ${SUPPORT_DIR}/${f}."
       exit 1
     fi
     run mkdir -p "${stage}/rdgw"
-    run cp "${SCRIPT_DIR}/${f}" "${stage}/rdgw/${f}"
+    run cp "${SUPPORT_DIR}/${f}" "${stage}/rdgw/${f}"
   done
   msg_ok "Scripts staged"
 
@@ -845,6 +914,7 @@ UNATTEND="no"
 if whiptail --backtitle "$APP" --title "Unattended install" \
     --yesno "Install Windows and configure the RD Gateway role without anyone at the console?\n\nThis builds a third CD holding an answer file, the VirtIO drivers and the setup scripts. Windows Setup wipes disk 0, installs, then a startup task installs the RD Gateway role and runs Setup-RDGateway.ps1.\n\nSaying no builds the VM shell only, and you install Windows by hand." 17 76; then
   UNATTEND="yes"
+  resolve_support_files
   require_iso_tool
   select_storage iso "Unattend ISO"
   UNATTEND_STORAGE="$STORAGE_RESULT"

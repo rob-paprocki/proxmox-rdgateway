@@ -230,6 +230,13 @@ dgw-setup.log` and stays
 
 - Shell scripts print every command before running it and honour `DRY_RUN=1`. Keep that —
   the operator explicitly wants to follow along rather than be handed a black box.
+- `windows-rdgw-vm.sh` must keep working when piped into bash, community-scripts style:
+  `bash -c "$(curl -fsSL .../windows-rdgw-vm.sh)"`. That means **never** dereference
+  `${BASH_SOURCE[0]}` unguarded — under `set -u` it is unbound in that form and the script
+  dies on line one. It falls back to `$PWD`. The three PowerShell files are resolved by
+  `resolve_support_files`: local copies always win, and only the piped form reaches the
+  network. Print every URL before fetching, and keep `REPO_REF` / `REPO_RAW` overridable so
+  a branch, tag or fork can be pinned.
 - Generated config files are echoed in dry-run mode too, including the whole
   `autounattend.xml`. That is what `write_file` is for; it is duplicated in
   `windows-rdgw-vm.sh` and `vps-relay-setup.sh` on purpose, because each script has to stay
