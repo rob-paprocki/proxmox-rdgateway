@@ -14,12 +14,22 @@ behind one public hostname, using stock RD clients.
 |---|---|---|
 | `windows-rdgw-vm.sh` | Proxmox host, root | Written, dry-run verified, **never run for real** |
 | `Setup-RDGateway.ps1` | The Windows guest, elevated | Written, parse/lint verified, **never run for real** |
+| `Configure-Guest.ps1` | The Windows guest, SYSTEM | Written, parse/lint verified, **never run for real** |
+| `Invoke-GatewaySetup.ps1` | The Windows guest, SYSTEM | Written, parse/lint verified, **never run for real** |
+| `sample-autounattend.xml` | — | Committed sample of generated output. Not read by anything |
 | `vps-relay-setup.sh` | A public VPS | Optional path. Written, dry-run verified, **never run for real** |
 | `proxmox-relay-peer.sh` | Proxmox host, root | Optional path. Written, dry-run verified, **never run for real** |
 | `README.md` | — | Repo intro plus the full runbook |
 | `RELAY.md` | — | The optional relay: architecture, steps, caveats |
 
 Nothing has been deployed. No VM exists yet.
+
+`windows-rdgw-vm.sh` offers two paths. The **shell-only** path is the original behaviour: a
+configured VM with both ISOs attached, Windows installed by hand. The **unattended** path
+additionally builds a third CD (`autounattend.xml`, `$WinPEDriver$` with the 2k25 VirtIO
+drivers, and the three PowerShell files) and attaches it on `sata0`, so the box installs
+itself and configures the gateway with nobody at the console. Both are supported; the
+shell-only path is the documented fallback when the automated one misbehaves.
 
 ## The operator's constraints
 
@@ -125,14 +135,20 @@ bug will surface.
 **Verified in this session:**
 
 - All three shell scripts: `bash -n` and `shellcheck -S warning` clean; exercised end to end
-  with `DRY_RUN=1` against stubbed `qm` / `pvesm` / `pvesh` / `whiptail`, covering the default
-  path, the advanced path, and the virtio-download path.
+  with `DRY_RUN=1` against stubbed `qm` / `pvesm` / `pvesh` / `whiptail` / `mount` / `xorriso`,
+  covering the default path, the advanced path, the virtio-download path, and both the
+  unattended and shell-only branches.
 - The generated nginx stream config passes `nginx -t` against a real nginx with the stream
   module loaded.
 - Every `iptables` rule parses under `iptables-translate`.
-- `Setup-RDGateway.ps1` parses; PSScriptAnalyzer reports nothing beyond `Write-Host` and
-  `ShouldProcess` style notes; the file is deliberately **pure ASCII** because Windows
-  PowerShell 5.1 reads a BOM-less file as Windows-1252 and would mangle anything else.
+- `Setup-RDGateway.ps1`, `Configure-Guest.ps1` and `Invoke-GatewaySetup.ps1` all parse;
+  PSScriptAnalyzer reports nothing beyond `Write-Host` and `ShouldProcess` style notes; all
+  three are deliberately **pure ASCII** because Windows PowerShell 5.1 reads a BOM-less file
+  as Windows-1252 and would mangle anything else.
+- The generated `autounattend.xml` is well-formed XML, and the generated `rdgw-config.psd1`
+  round-trips through `Import-PowerShellDataFile` with the right types (`Boolean` for the
+  toggles, `Int32` for the lockout numbers, `Object[]` for `TargetMachines`) both empty and
+  populated.
 - The three WMI `Create` signatures were checked against Microsoft's documentation and match
   in both count and order: CAP takes **18** parameters (an earlier 13-parameter version was a
   real bug — the trailing `IdleTimeout`, `SessionTimeout`, `SessionTimeoutAction`,
@@ -157,6 +173,15 @@ bug will surface.
   `ImportRDGateway.ps1` does, but hasn't been run here. There's a WMI fallback
   (`SetCertificate` then `Configure`, both instance methods on the singleton) and, failing
   both, the script tells the operator to do it in `tsgateway.msc`.
+- **Nothing about the unattended path has been executed.** The riskiest parts, in order:
+  the `/IMAGE/NAME` value must match the media exactly and differs on Evaluation ISOs; the
+  `$WinPEDriver$` scan is documented for Windows Server but has not been watched working
+  here; and the `RDGW-FirstBoot` scheduled task's reboot handoff is reasoned about rather
+  than observed. Each failure is visible and recoverable — Setup stops at a readable error,
+  and the task logs every step to `C:\Windows\Setup\Scriptsdgw-setup.log` and stays
+  registered so a reboot retries — but none of it has met a real disk.
+- `DiskID 0` in the answer file assumes the VirtIO SCSI disk is the only disk. True for a VM
+  this script builds; add a second disk before install and it stops being true.
 - **RDP-over-UDP through nginx stream is the least certain thing in the repo.** Note that
   `proxy_responses 0` was removed from that block deliberately: `nginx -t` accepts it silently
   but it caps how many datagrams come back and would break the session at runtime. If UDP
@@ -165,12 +190,20 @@ bug will surface.
 ## Next steps
 
 1. Settle the CGNAT question. It decides everything downstream.
-2. Run `windows-rdgw-vm.sh` on the Proxmox host. Start with `DRY_RUN=1`.
-3. Install Windows from the console — Setup shows **no disks** until `vioscsi\2k25\amd64` is
-   loaded from the second CD. That's expected, not a failure.
-4. Run `Setup-RDGateway.ps1` with `-TargetMachines` listing every machine he wants to reach.
-   Check the `UserGroupNames` readback.
-5. Each target machine needs only: RDP enabled, his account in its local Remote Desktop Users
+2. Check the Windows media before building:
+   `dism /Get-WimInfo /WimFile:<mount>\sources\install.wim`. The edition menu's image names
+   are for retail/VL media; Evaluation ISOs name their images differently and cannot be
+   activated with a GVLK.
+3. Run `windows-rdgw-vm.sh` on the Proxmox host. Start with `DRY_RUN=1`, which prints the
+   whole generated answer file.
+4. Unattended path: watch `C:\Windows\Setup\Scripts\rdgw-setup.log` and check the
+   `UserGroupNames` readback it prints. Shell-only path: install Windows from the console
+   (Setup shows **no disks** until `vioscsi\2k25\amd64` is loaded from the second CD, which
+   is expected), then run `Setup-RDGateway.ps1` with `-TargetMachines` listing every machine
+   he wants to reach and check the same readback.
+5. Delete the unattend ISO from Proxmox storage afterwards. It holds the account password in
+   clear text, and `qm destroy` does not remove it.
+6. Each target machine needs only: RDP enabled, his account in its local Remote Desktop Users
    group, firewall allowing 3389 from the gateway, and a name the gateway can resolve.
    Windows Pro is fine as a target; only the gateway has to be Server.
 
@@ -178,7 +211,14 @@ bug will surface.
 
 - Shell scripts print every command before running it and honour `DRY_RUN=1`. Keep that —
   the operator explicitly wants to follow along rather than be handed a black box.
-- Generated config files are echoed in dry-run mode too.
+- Generated config files are echoed in dry-run mode too, including the whole
+  `autounattend.xml`. That is what `write_file` is for; it is duplicated in
+  `windows-rdgw-vm.sh` and `vps-relay-setup.sh` on purpose, because each script has to stay
+  runnable on its own.
+- The security toggles in the unattended path (UAC, Defender, Core Isolation, lockout, blank
+  passwords, Ctrl+Alt+Del) all default to leaving Windows as it ships. They exist because the
+  operator explicitly asked to be able to loosen them. State the consequence once in the
+  prompt, then do what was picked — do not re-litigate it in the docs or the scripts.
 - `Setup-RDGateway.ps1` must stay **pure ASCII** and must run under **Windows PowerShell 5.1**
   (`powershell.exe`, not `pwsh` — the WMI fallback uses `[wmiclass]`, removed in PS 7).
 - The RD authorization policies go through the documented `Win32_TSGateway*` WMI classes
