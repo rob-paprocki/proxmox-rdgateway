@@ -109,9 +109,9 @@ The one-liner at the top works for both paths:
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/main/windows-rdgw-vm.sh)"
 ```
 
-The unattended path needs four more files — `Setup-RDGateway.ps1`, `Configure-Guest.ps1`, `Invoke-GatewaySetup.ps1` and `Invoke-CustomScripts.ps1` — to put on the ISO it builds. Local copies always win. From a checkout nothing is downloaded and your edits are used. Only when they aren't sitting next to the script does it fetch them, and then it prints every URL before touching the network.
+The unattended path needs four more files — `Setup-RDGateway.ps1`, `Configure-Guest.ps1`, `Invoke-GatewaySetup.ps1` and `Invoke-CustomScripts.ps1` — to put on the ISO it builds. Each is resolved on its own: a local copy always wins, and only the ones actually missing are fetched. From a checkout nothing is downloaded and your edits are used. Every URL is printed before it is touched.
 
-Those three are copied to the unattend CD and run *inside the guest*. They are never executed on the Proxmox host.
+Those four are copied to the unattend CD and run *inside the guest*. They are never executed on the Proxmox host, and neither is anything you add through the custom-scripts menu.
 
 Pin a branch or tag if you don't want to track `main`:
 
@@ -166,7 +166,7 @@ Custom scripts (2 so far)
   done     Finished
 ```
 
-**write** asks two questions and then opens an editor. First *when* it should run, then *what kind* it is:
+`write` asks two questions and then opens an editor. First *when* it should run, then *what kind* it is:
 
 | Phase | When it runs | As whom |
 |---|---|---|
@@ -181,7 +181,9 @@ Custom scripts (2 so far)
 | Batch | `.cmd` | `cmd.exe /c` |
 | Registry | `.reg` | `reg.exe import` |
 
-It suggests a filename numbered in tens (`10-script.ps1`, then `20-`, then `30-`) so there is room to slot something in between later, and opens `$VISUAL`, `$EDITOR`, `nano`, `vim` or `vi` — whichever it finds first — on a file already seeded with a header saying where the script will run and what will run it:
+It suggests a filename numbered in tens: `010-script.ps1`, then `020-`, then `030-`, leaving room to slot something in between later. The number comes from the highest one already in that phase rather than a count, so removing a script does not hand you a name that is still in use, and it is zero padded because the guest sorts on that number. Spaces become hyphens on the way in.
+
+Then it opens `$VISUAL`, `$EDITOR`, `nano`, `vim` or `vi` — whichever it finds first — on a file already seeded with a header saying where the script will run and what will run it:
 
 ```powershell
 # FirstLogon script for this RD Gateway build.
@@ -196,7 +198,7 @@ It suggests a filename numbered in tens (`10-script.ps1`, then `20-`, then `30-`
 
 Save with nothing added and it tells you so and throws the file away. If the box has no editor at all it falls back to reading the script off the terminal until you type `EOF` on a line by itself.
 
-**import** takes a file or a whole directory. A single file asks which phase it belongs to. A directory is read from subdirectories named for the phases, and if it has scripts but none of those subdirectories, it offers to treat them all as `System` scripts:
+`import` takes a file or a whole directory. A single file asks which phase it belongs to. A directory is read from subdirectories named for the phases, and anything sitting loose at the top level is offered separately as `System` scripts:
 
 ```
 /root/rdgw-scripts/
@@ -206,17 +208,17 @@ Save with nothing added and it tells you so and throws the file away. If the box
   UserOnce/10-map-drives.ps1
 ```
 
-**review** lists everything staged so far and lets you drop one.
+`review` lists everything staged so far and lets you drop one.
 
-Both routes end in the same place, so you can write one script by hand, import a directory of others, and ship them together. Within a phase they run in filename order. `.ps1`, `.cmd`, `.bat` and `.reg` are recognised; anything else is ignored.
+Both routes end in the same place, so you can write one script by hand, import a directory of others, and ship them together. Within a phase they run in order of that leading number, so `020-` follows `010-` and `100-` comes last; anything unnumbered runs after everything that is numbered. `.ps1`, `.cmd`, `.bat` and `.reg` are recognised; anything else is ignored.
 
 `System` runs before the gateway role is installed, so a script there can put something in place that the gateway then uses — importing a real certificate into `LocalMachine\My`, for instance, which saves you the self-signed one. A script that fails, or that runs longer than fifteen minutes, is logged and skipped rather than stopping the build; everything lands in the same `rdgw-setup.log`, prefixed `custom/<category>`.
 
-A `.reg` file in `DefaultUser` is rewritten before import: `HKEY_CURRENT_USER` becomes the mounted hive, because there is no current user at that point. Write it as though you were the logged-on user and it will land in every profile created afterwards.
+A `.reg` file in `DefaultUser` is rewritten before import: the bracketed key headers naming `HKEY_CURRENT_USER` are retargeted at the mounted hive, because there is no current user at that point. Write it as though you were the logged-on user and it will land in every profile created afterwards.
 
-One timing detail worth knowing. The answer file logs the new account on automatically, exactly once, and that profile is created from the Default User hive at roughly the same moment `Configure-Guest.ps1` is writing to it. `FirstLogon` catches that first automatic logon reliably because the answer file registers it during the specialize pass, ahead of any logon. `UserOnce` is registered in the Default User hive and may not reach that very first profile, so put anything the first account must have in `FirstLogon`.
+A `.ps1` or `.cmd` in `DefaultUser` gets no such rewrite, and it matters more than it sounds: with nobody logged on, `HKCU:` is SYSTEM's own profile, so a write there succeeds, logs `ok`, and reaches nothing. The mounted hive is in `$env:RDGW_HIVE_PATH`, and the seeded header says so.
 
-Nothing you add is run on the Proxmox host. It is copied to the unattend CD and runs inside the guest.
+The answer file logs the new account on automatically, exactly once, and that profile is created from the Default User hive at roughly the same moment `Configure-Guest.ps1` is writing to it. `FirstLogon` catches that first automatic logon reliably because the answer file registers it during the specialize pass, ahead of any logon. `UserOnce` is registered in the Default User hive and may not reach that very first profile, so put anything the first account must have in `FirstLogon`.
 
 ### What lands on the unattend CD
 
@@ -240,7 +242,7 @@ The CD is attached on `sata0` — q35 gives you only `ide0` and `ide2`, and both
 
 Nothing to do. It is here so you know what is happening and where to look if it stalls.
 
-1. The script answers the DVD's "Press any key to boot from CD or DVD" prompt from the host with `qm sendkey`, repeatedly for the first minute after `qm start`. See [the boot prompt](#the-boot-prompt) for why it is done this way and not by rebuilding the ISO.
+1. The script answers the DVD's "Press any key to boot from CD or DVD" prompt from the host with `qm sendkey`, repeatedly for the first minute after `qm start`. See [the boot prompt](#the-boot-prompt) for why the prompt is answered rather than removed.
 2. Windows Setup finds `autounattend.xml` on the unattend CD and stages the VirtIO drivers from `$WinPEDriver$`.
 3. It wipes disk 0 — the only disk this VM has — and partitions it EFI 300 MiB, MSR 16 MiB, then NTFS for the rest. There is deliberately no explicit recovery partition: Windows creates the WinRE partition itself on an NTFS boot volume by shrinking the OS volume on first boot.
 4. It installs the edition you chose.
@@ -273,11 +275,13 @@ qm sendkey 9000 ret
 
 The script sends that every two seconds for the first sixty, which covers OVMF's startup plus the prompt's own window without having to guess when it appears. Enter is not bound to anything in the OVMF splash, and Setup is driven by the answer file, so a key that arrives early or late does nothing. Set `BOOT_KEY_SECONDS` to change how long it keeps trying.
 
+This happens on the unattended path only. Without an answer file, Windows Setup is a live wizard within that same minute, and Enter every two seconds would click through the language screen, **Install now**, the edition list and the EULA before you had looked at the console. So the shell-only path leaves the prompt to you.
+
 ### If you chose the shell-only path
 
 Open the console from the Proxmox web UI. Two things trip people up:
 
-**The boot prompt is already answered.** If you let the script start the VM, it has been pressing Enter for you. If you started it yourself and missed the five second window, you land in the UEFI shell: type `exit`, choose Boot Manager, pick the DVD drive.
+**Press a key for the boot prompt.** You have about five seconds. Miss it and you land in the UEFI shell: type `exit`, choose Boot Manager, pick the DVD drive. The unattended path answers this prompt from the host; this one deliberately does not, because with no answer file driving Setup a keystroke every two seconds would walk through the screens you came here to drive.
 
 **Windows Setup will show you no disks.** That is expected, not a failure. Windows has no idea what a VirtIO SCSI controller is. Click **Load driver** → **Browse** → the second CD drive → `vioscsi\2k25\amd64` → Next. Your 80 GiB disk appears. While you're in there, load `NetKVM\2k25\amd64` too so the NIC works on first boot.
 

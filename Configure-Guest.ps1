@@ -160,6 +160,101 @@ if ($cfg.DisableCad) {
     Write-Good "Ctrl+Alt+Del required to log on (Proxmox console: the toolbar sends it)"
 }
 
+# ------------------------------------------------------------------------------
+# 7. Shell settings for every account created from here on
+#
+#    These live in HKCU, so they are written into the Default User hive before
+#    anyone logs on for the first time and new profiles inherit them. An account
+#    that already has a profile keeps whatever it has - which is why this script
+#    is scheduled at startup, ahead of the first interactive logon.
+# ------------------------------------------------------------------------------
+Write-Step "Shell settings (Default User hive)"
+
+$defaultHive = 'C:\Users\Default\NTUSER.DAT'
+$mountPoint = 'HKU\rdgwDefault'
+$loaded = $false
+
+if (Test-Path -LiteralPath $defaultHive) {
+    & reg.exe load $mountPoint $defaultHive 2>&1 | Out-Null
+    $loaded = ($LASTEXITCODE -eq 0)
+}
+
+if (-not $loaded) {
+    Write-Skip "Could not load the Default User hive - shell settings skipped, everything above still applied"
+} else {
+    $u = 'Registry::HKEY_USERS\rdgwDefault'
+
+    # The shell defaults below are cosmetic and belong to the housekeeping
+    # answer. Everything after them does not: your DefaultUser scripts and the
+    # UserOnce registration have nothing to do with taskbar layout, so they run
+    # either way.
+    if ($cfg.ApplyTweaks) {
+        $adv = "$u\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+
+        # Explorer: show file extensions, open to This PC, classic right-click menu.
+        Set-Reg $adv 'HideFileExt' 0
+        Set-Reg $adv 'LaunchTo' 1
+        Set-Reg "$u\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32" '(Default)' '' 'String'
+
+        # Taskbar: left aligned, no search box, no Task View, no widgets.
+        Set-Reg $adv 'TaskbarAl' 0
+        Set-Reg $adv 'ShowTaskViewButton' 0
+        Set-Reg $adv 'TaskbarDa' 0
+        Set-Reg "$u\Software\Microsoft\Windows\CurrentVersion\Search" 'SearchboxTaskbarMode' 0
+
+        # No web results in the Start menu search box.
+        Set-Reg "$u\Software\Policies\Microsoft\Windows\Explorer" 'DisableSearchBoxSuggestions' 1
+
+        # Adjust for best performance. Animations over RDP are wasted bandwidth.
+        Set-Reg "$u\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" 'VisualFXSetting' 2
+
+        # Dark theme.
+        Set-Reg "$u\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" 'AppsUseLightTheme' 0
+        Set-Reg "$u\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" 'SystemUsesLightTheme' 0
+
+        # Desktop icons: This PC, Recycle Bin and the user folder visible.
+        $iconKey = "$u\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel"
+        Set-Reg $iconKey '{20D04FE0-3AEA-1069-A2D8-08002B30309D}' 0
+        Set-Reg $iconKey '{645FF040-5081-101B-9F08-00AA002F954E}' 0
+        Set-Reg $iconKey '{59031a47-3f72-44a7-89c5-5595fe6b30ee}' 0
+
+    } else {
+        Write-Skip "Shell defaults skipped - housekeeping was not requested"
+    }
+    # Anything you supplied for the DefaultUser category runs here, while the
+    # hive is still mounted, so what it writes is inherited by every profile
+    # created afterwards. The UserOnce registration goes in for the same
+    # reason: a RunOnce value in this hive is inherited by each new profile and
+    # fires at that user's first logon, then deletes itself.
+    $runner = Join-Path $PSScriptRoot 'Invoke-CustomScripts.ps1'
+    if (Test-Path -LiteralPath $runner) {
+        try {
+            & $runner -Category DefaultUser -HiveRoot $mountPoint
+        } catch {
+            Write-Bad "Custom DefaultUser scripts failed: $($_.Exception.Message)"
+        }
+
+        $userOnceDir = Join-Path $PSScriptRoot 'custom\UserOnce'
+        $userOnceCount = 0
+        if (Test-Path -LiteralPath $userOnceDir) {
+            $userOnceCount = @(Get-ChildItem -LiteralPath $userOnceDir -File -ErrorAction SilentlyContinue).Count
+        }
+        if ($userOnceCount -gt 0) {
+            $cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Category UserOnce' -f $runner
+            Set-Reg "$u\Software\Microsoft\Windows\CurrentVersion\RunOnce" 'RDGWUserOnce' $cmd 'String'
+            Write-Good "UserOnce scripts ($userOnceCount) registered for every new profile"
+        }
+    }
+
+    [gc]::Collect()
+    & reg.exe unload $mountPoint 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Good "Default User hive written and unloaded"
+    } else {
+        Write-Bad "Default User hive written but would not unload - a reboot clears this"
+    }
+}
+
 if (-not $cfg.ApplyTweaks) {
     Write-Step "Server housekeeping"
     Write-Skip "Skipped - not requested at build time"
@@ -168,7 +263,7 @@ if (-not $cfg.ApplyTweaks) {
 }
 
 # ------------------------------------------------------------------------------
-# 7. Filesystem and system behaviour
+# 8. Filesystem and system behaviour
 #
 #    None of this is security-relevant.
 # ------------------------------------------------------------------------------
@@ -235,92 +330,6 @@ if (Test-Path -LiteralPath 'C:\Windows.old') {
     }
 } else {
     Write-Skip "No C:\Windows.old to remove"
-}
-
-# ------------------------------------------------------------------------------
-# 8. Shell settings for every account created from here on
-#
-#    These live in HKCU, so they are written into the Default User hive before
-#    anyone logs on for the first time and new profiles inherit them. An account
-#    that already has a profile keeps whatever it has - which is why this script
-#    is scheduled at startup, ahead of the first interactive logon.
-# ------------------------------------------------------------------------------
-Write-Step "Shell settings (Default User hive)"
-
-$defaultHive = 'C:\Users\Default\NTUSER.DAT'
-$mountPoint = 'HKU\rdgwDefault'
-$loaded = $false
-
-if (Test-Path -LiteralPath $defaultHive) {
-    & reg.exe load $mountPoint $defaultHive 2>&1 | Out-Null
-    $loaded = ($LASTEXITCODE -eq 0)
-}
-
-if (-not $loaded) {
-    Write-Skip "Could not load the Default User hive - shell settings skipped, everything above still applied"
-} else {
-    $u = 'Registry::HKEY_USERS\rdgwDefault'
-    $adv = "$u\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-
-    # Explorer: show file extensions, open to This PC, classic right-click menu.
-    Set-Reg $adv 'HideFileExt' 0
-    Set-Reg $adv 'LaunchTo' 1
-    Set-Reg "$u\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32" '(Default)' '' 'String'
-
-    # Taskbar: left aligned, no search box, no Task View, no widgets.
-    Set-Reg $adv 'TaskbarAl' 0
-    Set-Reg $adv 'ShowTaskViewButton' 0
-    Set-Reg $adv 'TaskbarDa' 0
-    Set-Reg "$u\Software\Microsoft\Windows\CurrentVersion\Search" 'SearchboxTaskbarMode' 0
-
-    # No web results in the Start menu search box.
-    Set-Reg "$u\Software\Policies\Microsoft\Windows\Explorer" 'DisableSearchBoxSuggestions' 1
-
-    # Adjust for best performance. Animations over RDP are wasted bandwidth.
-    Set-Reg "$u\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" 'VisualFXSetting' 2
-
-    # Dark theme.
-    Set-Reg "$u\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" 'AppsUseLightTheme' 0
-    Set-Reg "$u\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" 'SystemUsesLightTheme' 0
-
-    # Desktop icons: This PC, Recycle Bin and the user folder visible.
-    $iconKey = "$u\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel"
-    Set-Reg $iconKey '{20D04FE0-3AEA-1069-A2D8-08002B30309D}' 0
-    Set-Reg $iconKey '{645FF040-5081-101B-9F08-00AA002F954E}' 0
-    Set-Reg $iconKey '{59031a47-3f72-44a7-89c5-5595fe6b30ee}' 0
-
-    # Anything you supplied for the DefaultUser category runs here, while the
-    # hive is still mounted, so what it writes is inherited by every profile
-    # created afterwards. The UserOnce registration goes in for the same
-    # reason: a RunOnce value in this hive is inherited by each new profile and
-    # fires at that user's first logon, then deletes itself.
-    $runner = Join-Path $PSScriptRoot 'Invoke-CustomScripts.ps1'
-    if (Test-Path -LiteralPath $runner) {
-        try {
-            & $runner -Category DefaultUser -HiveRoot $mountPoint
-        } catch {
-            Write-Bad "Custom DefaultUser scripts failed: $($_.Exception.Message)"
-        }
-
-        $userOnceDir = Join-Path $PSScriptRoot 'custom\UserOnce'
-        $userOnceCount = 0
-        if (Test-Path -LiteralPath $userOnceDir) {
-            $userOnceCount = @(Get-ChildItem -LiteralPath $userOnceDir -File -ErrorAction SilentlyContinue).Count
-        }
-        if ($userOnceCount -gt 0) {
-            $cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Category UserOnce' -f $runner
-            Set-Reg "$u\Software\Microsoft\Windows\CurrentVersion\RunOnce" 'RDGWUserOnce' $cmd 'String'
-            Write-Good "UserOnce scripts ($userOnceCount) registered for every new profile"
-        }
-    }
-
-    [gc]::Collect()
-    & reg.exe unload $mountPoint 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Good "Default User hive written and unloaded"
-    } else {
-        Write-Bad "Default User hive written but would not unload - a reboot clears this"
-    }
 }
 
 Write-Step "Done"

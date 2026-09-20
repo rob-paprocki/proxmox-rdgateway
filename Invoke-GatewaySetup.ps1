@@ -167,7 +167,13 @@ if ($state.Boots -gt $MaxBoots) {
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
     Stop-Here "Missing $ConfigPath. The unattend ISO did not copy cleanly."
 }
-$cfg = Import-PowerShellDataFile -LiteralPath $ConfigPath
+try {
+    $cfg = Import-PowerShellDataFile -LiteralPath $ConfigPath -ErrorAction Stop
+} catch {
+    # Without this the task dies on a raw parse exception and the log says
+    # nothing at all, which is the opposite of what this file exists for.
+    Stop-Here "$ConfigPath could not be parsed: $($_.Exception.Message)"
+}
 
 # --- 1. Guest settings -------------------------------------------------------
 if (-not $state.GuestConfigured) {
@@ -203,9 +209,15 @@ if (-not $state.SystemScriptsRun) {
         } catch {
             Write-Line "Custom System scripts failed: $($_.Exception.Message)" 'warn'
         }
+        $state.SystemScriptsRun = $true
+        Save-State $state
+    } else {
+        # Do not latch. The runner is one of the four files the CD carries as a
+        # unit, so a missing one means the copy was incomplete - say so, and let
+        # the next boot try again rather than silently never running the
+        # operator's scripts.
+        Write-Line "Invoke-CustomScripts.ps1 is missing from $ScriptRoot - System scripts skipped, will retry next boot" 'warn'
     }
-    $state.SystemScriptsRun = $true
-    Save-State $state
 }
 
 # --- 3. The RD Gateway role --------------------------------------------------

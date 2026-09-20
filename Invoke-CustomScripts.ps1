@@ -104,14 +104,39 @@ function Write-Line {
     }
 }
 
+# Echo whatever the child wrote. Called on the normal path and on the timeout
+# path, because the last thing a script printed before it hung is usually the
+# line that explains the hang.
+function Write-ChildOutput {
+    param([string] $OutFile, [string] $ErrFile)
+    foreach ($f in @($OutFile, $ErrFile)) {
+        if (-not (Test-Path -LiteralPath $f)) { continue }
+        if ((Get-Item -LiteralPath $f).Length -le 0) { continue }
+        Get-Content -LiteralPath $f | ForEach-Object {
+            if ($_ -ne '') { Write-Host "        $_" }
+        }
+    }
+}
+
 # Run one child process and wait, but not forever.
 function Invoke-Child {
     param([string] $FilePath, [string[]] $ArgumentList, [string] $Label, [int] $Timeout)
 
     $outFile = [System.IO.Path]::GetTempFileName()
     $errFile = [System.IO.Path]::GetTempFileName()
+
+    # Start-Process joins ArgumentList with plain spaces and quotes nothing, so
+    # a script at "C:\Windows\Setup\Scripts\custom\System\install cert.ps1"
+    # reaches powershell.exe as -File C:\Windows\...\install and dies with
+    # "does not have a '.ps1' extension". Quote what needs quoting first.
+    $quoted = @()
+    foreach ($a in $ArgumentList) {
+        if ($a -match '\s' -and $a -notmatch '^".*"$') { $quoted += '"' + $a + '"' }
+        else { $quoted += $a }
+    }
+
     try {
-        $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList `
+        $proc = Start-Process -FilePath $FilePath -ArgumentList $quoted `
             -NoNewWindow -PassThru `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
             -ErrorAction Stop
@@ -123,6 +148,12 @@ function Invoke-Child {
         $null = $proc.Handle
 
         if (-not $proc.WaitForExit($Timeout * 1000)) {
+            # Kill() on .NET Framework takes down this process only, not what it
+            # started, and it returns before the OS has finished. Both matter: a
+            # DefaultUser script killed while it still holds the mounted hive
+            # would make Configure-Guest.ps1's reg unload fail and leave
+            # NTUSER.DAT locked for the rest of setup.
+            & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null
             try {
                 $proc.Kill()
             } catch {
@@ -130,7 +161,9 @@ function Invoke-Child {
                 # call. Nothing left to kill.
                 Write-Verbose $_.Exception.Message
             }
+            $null = $proc.WaitForExit(5000)
             Write-Line "$Label ran past $Timeout seconds and was killed" 'warn'
+            Write-ChildOutput $outFile $errFile
             return
         }
 
@@ -138,13 +171,7 @@ function Invoke-Child {
         # streams have finished being written. The one that does not settles it.
         $proc.WaitForExit()
 
-        foreach ($f in @($outFile, $errFile)) {
-            if ((Get-Item -LiteralPath $f).Length -gt 0) {
-                Get-Content -LiteralPath $f | ForEach-Object {
-                    if ($_ -ne '') { Write-Host "        $_" }
-                }
-            }
-        }
+        Write-ChildOutput $outFile $errFile
 
         if ($proc.ExitCode -eq 0) {
             Write-Line "$Label ok"
@@ -180,7 +207,11 @@ function Import-RegFile {
             $target = $HiveRoot -replace '^HKU\\', 'HKEY_USERS\'
             try {
                 $body = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
-                $rewritten = $body -replace 'HKEY_CURRENT_USER', $target
+                # Only the bracketed key headers, including the [-HKEY...] form
+                # that deletes a key. A blanket text replace would also rewrite
+                # the literal string inside quoted REG_SZ data, where $target's
+                # single backslashes are not the escaping .reg expects.
+                $rewritten = $body -replace '(?m)^(\[-?)HKEY_CURRENT_USER', ('$1' + $target)
                 $temp = Join-Path $env:TEMP ("rdgw-" + $File.BaseName + ".reg")
                 Set-Content -LiteralPath $temp -Value $rewritten -Encoding Unicode -ErrorAction Stop
                 Write-Line "$label rewritten for $target"
@@ -208,12 +239,27 @@ if (-not (Test-Path -LiteralPath $dir)) {
     exit 0
 }
 
+# Sort on the leading number, not the text. Sort-Object Name puts 100- before
+# 20-, which contradicts the filename-order promise as soon as a category holds
+# more than nine scripts. Anything unnumbered sorts last, by name.
 $files = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
     Where-Object { $_.Extension -in @('.ps1', '.cmd', '.bat', '.reg') } |
-    Sort-Object Name)
+    Sort-Object `
+        @{ Expression = { if ($_.Name -match '^(\d+)') { [int]$Matches[1] } else { [int]::MaxValue } } }, `
+        @{ Expression = { $_.Name } })
 
 if ($files.Count -eq 0) {
     exit 0
+}
+
+# A DefaultUser .ps1 or .cmd runs as SYSTEM with nobody logged on, so HKCU:
+# resolves to SYSTEM's own profile - the write succeeds, the log says ok, and
+# nothing reaches any real profile. Only .reg files get rewritten for the hive,
+# so tell the others where it is. Children inherit the environment.
+if ($Category -eq 'DefaultUser' -and -not [string]::IsNullOrWhiteSpace($HiveRoot)) {
+    $env:RDGW_HIVE_ROOT = $HiveRoot
+    $env:RDGW_HIVE_PATH = 'Registry::' + ($HiveRoot -replace '^HKU\\', 'HKEY_USERS\')
+    Write-Line "Default User hive is at $env:RDGW_HIVE_PATH - write there, not HKCU:"
 }
 
 Write-Line "running $($files.Count) script(s) from $dir"

@@ -110,9 +110,8 @@ breaks the install. Windows Setup reboots two or three times before it finishes,
 DVD is still first in the boot order each time, and the prompt timing out is exactly
 what lets those reboots fall through to the disk instead of starting the install
 over. Remove the prompt and you get an endless reinstall loop unless something also
-changes the boot order mid-install, which nothing does. The prompt is load-bearing.
-`press_a_key` answers it once from the host instead and leaves the timeout behaviour
-intact for every later boot.
+changes the boot order mid-install, which nothing does. `press_a_key` answers it once
+from the host instead, which leaves the timeout behaviour intact for every later boot.
 
 **WARP / Cloudflare One client, Tailscale, any client-side agent.** Violates the
 no-install-on-clients constraint.
@@ -183,6 +182,20 @@ bug will surface.
   `RG`, `CG`, `ALL` - and gives `ALL` as "All resources". What `ResourceGroupName`
   should be alongside `ALL` is *not* documented; the empty string is convention.
 - `qm sendkey <vmid> <key>` is confirmed against the `qm` manual page.
+- **An adversarial review pass ran over this branch** (six independent finders, one
+  triage, two refuters per finding, opus tiebreak on disagreement). It produced 22 raw
+  findings, 20 unique, all 20 read back against the source and confirmed. Every one is
+  fixed. The three worth remembering, because they were all invisible to the dry-run
+  suite: the missing XML escaping, the six bare msgboxes, and `Start-Process` dropping
+  everything after a space. The suite passed throughout, which is the point - it stubs
+  whiptail, so it never pressed Esc, and it never typed an ampersand.
+- Fixes verified empirically rather than by argument: `Start-Process` quoting and the
+  numeric sort were reproduced and then re-run green with spaces in both the directory
+  and the filename; the anchored `.reg` rewrite was proved to retarget a key header
+  while leaving the literal string `HKEY_CURRENT_USER` inside quoted value data intact;
+  `xml_escape` and `psd1_quote` were driven with `Tr0ub4dor&3<evil>` and `R&D O'Brien`
+  end to end, producing an `autounattend.xml` that parses and a `rdgw-config.psd1` whose
+  `AccountName` round-trips byte-identical through `Import-PowerShellDataFile`.
 - The custom-script TUI is dry-run covered in six scenarios: importing a directory laid
   out by category, importing a directory of loose files, writing a `.ps1` and a `.reg`
   through a stubbed editor, writing a `FirstLogon` script and confirming the extra
@@ -307,6 +320,39 @@ dgw-setup.log` and stays
   decision to register `FirstLogon`, the ISO staging, the closing summary - reads that
   tree rather than asking where a file came from. Keep it that way; it is what let the
   editor route be added without touching any of them.
+- **Anything that came from a prompt and lands in a generated file goes through
+  `xml_escape` or `psd1_quote` first.** Both files are built by string interpolation
+  and neither format forgives a stray character: `Tr0ub4dor&3` is an ordinary Windows
+  password that makes `autounattend.xml` malformed, and an account named `O'Brien`
+  makes `rdgw-config.psd1` throw before `Invoke-GatewaySetup.ps1` can log why. If you
+  add a new prompt whose answer reaches either file, escape it at the interpolation
+  site. There is an `xmllint --noout` check after generation as a backstop.
+- **The backslashes in `xml_escape` are load-bearing.** bash 5.2 turned on
+  `patsub_replacement`, which makes an unquoted `&` in a `${var//pat/repl}` replacement
+  mean "the text that matched" - so `${s//</&lt;}` produces `<lt;` on a Proxmox VE 8
+  host, and the escaping silently does nothing useful. `\&` is correct on 5.1 too,
+  where quote removal just drops the backslash. This was caught by a smoke test, not
+  by reading, and it would have made the fix above worthless.
+- **`press_a_key` runs on the unattended path only.** It is gated on
+  `UNATTEND == yes`, not just `START_VM == yes`. With no answer file driving Setup,
+  Windows is a live wizard within that first minute and Enter every two seconds walks
+  through the language screen, Install now, the edition list and the EULA - the exact
+  screens the shell-only path exists to let the operator drive.
+- **A bare `whiptail --msgbox` aborts the script.** Under `set -Eeuo pipefail`,
+  whiptail returns non-zero when a box is dismissed with Esc, the `ERR` trap fires, and
+  every answer already typed is gone. Every informational box ends `|| true`. Every box
+  whose answer matters ends `|| exit_script` or `|| return`.
+- **`Invoke-Child` must quote its `ArgumentList`.** `Start-Process` joins the array
+  with plain spaces and quotes nothing, so a script at `...\install cert.ps1` reaches
+  `powershell.exe` as `-File ...\install` and dies with "does not have a '.ps1'
+  extension" (reproduced: exit `-196608`). `custom_safe_name` also turns spaces into
+  hyphens on the way in, so both ends are covered.
+- **In `Configure-Guest.ps1`, the Default User hive block stays above the
+  `ApplyTweaks` gate.** That gate is answered by a prompt that calls itself cosmetic and
+  not security relevant, and it ends in `exit 0`. The hive block runs the operator's
+  `DefaultUser` scripts and registers `UserOnce`, which have nothing to do with taskbar
+  layout, so only the cosmetic writes inside it are conditional. Moving it back below
+  the gate silently disables a feature.
 - Two traps in that code, both found by the dry-run suite rather than by reading:
   `custom_stage_dir` **sets** `CUSTOM_STAGE` and prints nothing, because calling it as
   `stage="$(custom_stage_dir)"` runs the assignment in a subshell and the global comes

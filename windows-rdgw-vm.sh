@@ -157,6 +157,39 @@ shell_quote() {
   printf '%s' "${out% }"
 }
 
+# Everything the wizard asks for comes back from whiptail with no character
+# restriction, and both generated files have their own quoting rules. Tr0ub4dor&3
+# is a perfectly ordinary Windows password and a bare & is not well-formed XML:
+# without these, Setup rejects the answer file twenty minutes into a build the
+# script already called ready.
+xml_escape() {
+  local s="$1"
+  # Do not drop the backslashes. bash 5.2 turned on patsub_replacement, which
+  # makes an unquoted & in the replacement mean "the text that matched", so
+  # ${s//</&lt;} yields <lt; on a Proxmox VE 8 host and the escaping quietly
+  # achieves nothing. Escaping the & is correct on 5.1 too, where quote removal
+  # simply drops the backslash.
+  s="${s//&/\&amp;}"
+  s="${s//</\&lt;}"
+  s="${s//>/\&gt;}"
+  printf '%s' "$s"
+}
+
+# An XML comment additionally cannot contain a double hyphen.
+xml_comment() {
+  local s
+  s="$(xml_escape "$1")"
+  printf '%s' "${s//--/- -}"
+}
+
+# PowerShell wants a literal ' inside a single-quoted string doubled. Without
+# this an account named O'Brien produces a data file that throws before any of
+# Invoke-GatewaySetup.ps1's own diagnostics can run.
+psd1_quote() {
+  local s="${1//\'/\'\'}"
+  printf "'%s'" "$s"
+}
+
 run() {
   printf "   ${DIM}\$ %s${CL}\n" "$(shell_quote "$@")"
   if [[ "$DRY_RUN" != "1" ]]; then
@@ -370,7 +403,7 @@ ask_password() {
     second="$(whiptail --backtitle "$APP" --title "Administrator password" \
       --passwordbox "Type it again." 10 70 3>&1 1>&2 2>&3)" || exit_script
     if [[ "$first" != "$second" ]]; then
-      whiptail --backtitle "$APP" --title "Mismatch" --msgbox "Those did not match. Try again." 8 50
+      whiptail --backtitle "$APP" --title "Mismatch" --msgbox "Those did not match. Try again." 8 50 || true
       continue
     fi
     if [[ -z "$first" ]]; then
@@ -402,7 +435,7 @@ pick_resource_scope() {
     any)
       RESOURCE_SCOPE="AnyResource"
       whiptail --backtitle "$APP" --title "Any machine" --msgbox \
-        "Anything this server can route to is reachable through it.\n\nThat is a jump host: a credential that passes the connection policy reaches your whole LAN rather than a chosen list. Windows Firewall on each target is still in the way, and each target still controls its own Remote Desktop Users group." 14 72
+        "Anything this server can route to is reachable through it.\n\nThat is a jump host: a credential that passes the connection policy reaches your whole LAN rather than a chosen list. Windows Firewall on each target is still in the way, and each target still controls its own Remote Desktop Users group." 14 72 || true
       ;;
     listed)
       RESOURCE_SCOPE="Listed"
@@ -547,6 +580,36 @@ SEEDEOF
       printf '\n' >>"$path"
       ;;
   esac
+
+  # Only .reg files get rewritten for the mounted hive. A .ps1 or .cmd in this
+  # category runs as SYSTEM with nobody logged on, so HKCU points at SYSTEM's
+  # own profile and a write there reaches no real user. Say where the hive is.
+  if [[ "$cat" == "DefaultUser" && "$ext" != "reg" ]]; then
+    case "$ext" in
+      ps1)
+        cat >>"$path" <<'HIVEEOF'
+# Nobody is logged on yet, so HKCU: here is SYSTEM's own profile, not the one
+# new accounts inherit. The Default User hive is mounted for you:
+#
+#   $env:RDGW_HIVE_PATH    Registry::HKEY_USERS\rdgwDefault
+#
+#   New-Item -Path "$env:RDGW_HIVE_PATH\Software\Example" -Force
+#   New-ItemProperty -Path "$env:RDGW_HIVE_PATH\Software\Example" `
+#       -Name Sample -Value 1 -PropertyType DWord -Force
+
+HIVEEOF
+        ;;
+      cmd)
+        cat >>"$path" <<'HIVEEOF'
+:: Nobody is logged on yet, so HKCU here is SYSTEM's own profile. The Default
+:: User hive is mounted at %RDGW_HIVE_ROOT% (HKU\rdgwDefault) - write there:
+::
+::   reg add "%RDGW_HIVE_ROOT%\Software\Example" /v Sample /t REG_DWORD /d 1 /f
+
+HIVEEOF
+        ;;
+    esac
+  fi
 }
 
 # Can we actually reach the terminal by name? [[ -r /dev/tty ]] is not enough:
@@ -597,6 +660,43 @@ custom_has_content() {
   return 1
 }
 
+# Turn whatever was typed into something every later stage can actually see.
+#
+# Three things bite here. A name ending in "/" leaves ${x##*/} empty, so the
+# file becomes ".ps1" - a dotfile, which bash globs skip without dotglob, so it
+# is staged and then invisible to every count, listing and copy. A name with a
+# space survives all the way to the guest and then breaks Start-Process, which
+# joins its argument array without quoting. And a name that is only an
+# extension leaves nothing to sort on.
+custom_safe_name() {
+  local raw="$1" ext="$2" fallback="$3" name
+  name="${raw##*/}"
+  name="${name//[[:space:]]/-}"
+  [[ "$name" == *".${ext}" ]] || name="${name}.${ext}"
+  case "$name" in
+    .*) name="$fallback" ;;
+  esac
+  [[ -n "${name%.*}" ]] || name="$fallback"
+  printf '%s' "$name"
+}
+
+# Copy one script into the staging tree, refusing anything a Windows
+# interpreter cannot be handed. Returns non-zero and says why if it cannot.
+custom_copy_in() {
+  local src="$1" cat="$2" dst
+  case "$src" in
+    *.ps1|*.cmd|*.bat|*.reg|*.PS1|*.CMD|*.BAT|*.REG) ;;
+    *)
+      whiptail --backtitle "$APP" --title "Not a script" --msgbox \
+        "$(basename -- "$src")\n\nOnly .ps1, .cmd, .bat and .reg can be run on the other end." 10 68 || true
+      return 1 ;;
+  esac
+  dst="${CUSTOM_STAGE}/${cat}"
+  mkdir -p "$dst" || { msg_error "Could not create ${dst}"; return 1; }
+  cp -- "$src" "${dst}/" || { msg_error "Could not copy ${src}"; return 1; }
+  return 0
+}
+
 custom_write_script() {
   local stage cat ext name path editor next
   local -a ed
@@ -610,12 +710,22 @@ custom_write_script() {
   stage="$CUSTOM_STAGE"
   mkdir -p "${stage}/${cat}"
 
-  # Numbered in tens so there is room to slot something in between later.
-  next=$(( ($(count_scripts "${stage}/${cat}") + 1) * 10 ))
+  # Numbered in tens so there is room to slot something in between, and taken
+  # from the highest prefix already present rather than the count - after a
+  # removal the count would hand back a number that is still in use. Zero
+  # padded because the runner sorts these as text, where 100 sorts before 20.
+  next="$(ls -1 "${stage}/${cat}" 2>/dev/null | sed -n 's/^0*\([0-9]\{1,\}\)-.*/\1/p' | sort -n | tail -1)"
+  next=$(( (${next:-0} / 10 + 1) * 10 ))
+  next="$(printf '%03d' "$next")"
+
   ask "File name (scripts run in filename order)" "${next}-script.${ext}"
-  name="${ASK_RESULT##*/}"
-  [[ "$name" == *".${ext}" ]] || name="${name}.${ext}"
+  name="$(custom_safe_name "$ASK_RESULT" "$ext" "${next}-script.${ext}")"
   path="${stage}/${cat}/${name}"
+
+  if [[ -e "$path" ]]; then
+    whiptail --backtitle "$APP" --title "Already there" --yesno \
+      "${cat}/${name} already exists.\n\nOverwrite it? Saying no takes you back to the menu." 10 68 --defaultno || return 0
+  fi
 
   custom_seed_file "$path" "$cat" "$ext"
 
@@ -630,6 +740,18 @@ custom_write_script() {
     else
       "${ed[@]}" "$path" || true
     fi
+    # code, subl, gedit and friends fork and return immediately, so without
+    # this the content check below runs against a file nobody has typed into
+    # yet and deletes it out from under the open window.
+    case "${ed[0]##*/}" in
+      code|code-insiders|codium|subl|sublime_text|gedit|atom|kate|gnome-text-editor)
+        msg_warn "${ed[0]##*/} returns straight away - it does not wait for you to close it"
+        if custom_have_tty; then
+          printf "   Press Enter once you have saved and closed it. "
+          read -r _ </dev/tty || true
+          printf "\n"
+        fi ;;
+    esac
   else
     msg_warn "No editor found - tried \$VISUAL, \$EDITOR, nano, vim, vi"
     custom_paste_into "$path"
@@ -640,12 +762,12 @@ custom_write_script() {
   else
     rm -f "$path"
     whiptail --backtitle "$APP" --title "Nothing saved" --msgbox \
-      "${name} had nothing in it beyond the header, so it was discarded." 9 68
+      "${name} had nothing in it beyond the header, so it was discarded." 9 68 || true
   fi
 }
 
 custom_import_path() {
-  local src stage cat f added=0 loose base
+  local src cat f added=0 loose base
 
   ask "File or directory to import" "/root/rdgw-scripts"
   src="${ASK_RESULT%/}"
@@ -654,51 +776,45 @@ custom_import_path() {
   if [[ -f "$src" ]]; then
     pick_custom_category || return 0
     custom_stage_dir
-    stage="$CUSTOM_STAGE"
-    base="$(basename "$src")"
-    mkdir -p "${stage}/${CUSTOM_CATEGORY}"
-    cp "$src" "${stage}/${CUSTOM_CATEGORY}/"
+    base="$(basename -- "$src")"
+    custom_copy_in "$src" "$CUSTOM_CATEGORY" || return 0
     msg_ok "Added ${BL}${CUSTOM_CATEGORY}/${base}${CL}"
     return 0
   fi
 
   if [[ ! -d "$src" ]]; then
     whiptail --backtitle "$APP" --title "Not found" --msgbox \
-      "${src} is not a file or a directory." 8 66
+      "${src} is not a file or a directory." 8 66 || true
     return 0
   fi
 
   custom_stage_dir
-  stage="$CUSTOM_STAGE"
   for cat in "${CUSTOM_CATEGORIES[@]}"; do
     [[ -d "${src}/${cat}" ]] || continue
     for f in "${src}/${cat}"/*.ps1 "${src}/${cat}"/*.cmd "${src}/${cat}"/*.bat "${src}/${cat}"/*.reg; do
       [[ -f "$f" ]] || continue
-      mkdir -p "${stage}/${cat}"
-      cp "$f" "${stage}/${cat}/"
-      added=$((added + 1))
+      custom_copy_in "$f" "$cat" && added=$((added + 1))
     done
   done
 
-  # A directory of scripts with no category subdirectory at all almost always
-  # means "just run these", so offer the obvious reading rather than reporting
-  # nothing found.
-  if [[ "$added" -eq 0 ]]; then
-    loose="$(count_scripts "$src")"
-    if [[ "$loose" -gt 0 ]] && whiptail --backtitle "$APP" --title "No category subdirectories" --yesno \
-        "${src} holds ${loose} script(s) but none of the ${CUSTOM_CATEGORIES[*]} subdirectories.\n\nTreat them all as System scripts?" 12 72; then
-      mkdir -p "${stage}/System"
+  # Scripts sitting loose at the top level are offered whether or not a
+  # category subdirectory also matched. Gating this on "nothing else matched"
+  # meant a mixed directory imported the subdirectories and dropped the loose
+  # files without saying so.
+  loose="$(count_scripts "$src")"
+  if [[ "$loose" -gt 0 ]]; then
+    if whiptail --backtitle "$APP" --title "Loose scripts" --yesno \
+        "${src} also holds ${loose} script(s) directly, outside the ${CUSTOM_CATEGORIES[*]} subdirectories.\n\nTreat those as System scripts?" 13 72; then
       for f in "$src"/*.ps1 "$src"/*.cmd "$src"/*.bat "$src"/*.reg; do
         [[ -f "$f" ]] || continue
-        cp "$f" "${stage}/System/"
-        added=$((added + 1))
+        custom_copy_in "$f" System && added=$((added + 1))
       done
     fi
   fi
 
   if [[ "$added" -eq 0 ]]; then
     whiptail --backtitle "$APP" --title "Nothing to import" --msgbox \
-      "No .ps1, .cmd, .bat or .reg files under ${src}." 9 70
+      "No .ps1, .cmd, .bat or .reg files under ${src}." 9 70 || true
   else
     msg_ok "Imported ${added} script(s) from ${BL}${src}${CL}"
   fi
@@ -710,9 +826,10 @@ custom_review() {
 
   if [[ -n "$CUSTOM_STAGE" ]]; then
     for cat in "${CUSTOM_CATEGORIES[@]}"; do
-      for f in "${CUSTOM_STAGE}/${cat}"/*; do
+      for f in "${CUSTOM_STAGE}/${cat}"/*.ps1 "${CUSTOM_STAGE}/${cat}"/*.cmd \
+               "${CUSTOM_STAGE}/${cat}"/*.bat "${CUSTOM_STAGE}/${cat}"/*.reg; do
         [[ -f "$f" ]] || continue
-        rel="${cat}/$(basename "$f")"
+        rel="${cat}/$(basename -- "$f")"
         rows+=("$rel" "$(custom_when_text "$cat")" "OFF")
       done
     done
@@ -720,7 +837,7 @@ custom_review() {
 
   if [[ "${#rows[@]}" -eq 0 ]]; then
     whiptail --backtitle "$APP" --title "Custom scripts" --msgbox \
-      "Nothing added yet." 8 50
+      "Nothing added yet." 8 50 || true
     return 0
   fi
 
@@ -843,32 +960,41 @@ unattend_settings() {
 # them — behaves exactly as before and nothing is downloaded. Only the one-liner
 # path reaches the network, and it prints every URL before fetching it.
 resolve_support_files() {
-  local f missing=0
+  local f fetched=0 local_count=0
 
-  for f in "${SUPPORT_FILES[@]}"; do
-    [[ -f "${SCRIPT_DIR}/${f}" ]] || missing=1
-  done
-
-  if [[ "$missing" -eq 0 ]]; then
-    SUPPORT_DIR="$SCRIPT_DIR"
-    msg_ok "PowerShell files found locally (${BL}${SCRIPT_DIR}${CL})"
-    return
-  fi
-
-  msg_warn "The PowerShell files are not next to this script — fetching them"
-  printf "     from ${BL}%s${CL}\n" "$REPO_RAW"
-  printf "     %sThese are copied to the unattend ISO and run inside the guest, not here.%s\n" "$DIM" "$CL"
-
+  # Resolved one at a time. The old all-or-nothing form meant a single absent
+  # file sent every other one to a download too, so three hand-edited local
+  # copies were quietly excluded from the build in favour of upstream - the
+  # opposite of what "local copies always win" is supposed to mean.
   SUPPORT_DIR="$(mktemp -d)"
   UNATTEND_SUPPORT="$SUPPORT_DIR"
 
   for f in "${SUPPORT_FILES[@]}"; do
-    printf "   ${DIM}\$ curl -fsSL -o %s %s${CL}\n" "${SUPPORT_DIR}/${f}" "${REPO_RAW}/${f}"
+    if [[ -f "${SCRIPT_DIR}/${f}" ]]; then
+      cp -- "${SCRIPT_DIR}/${f}" "${SUPPORT_DIR}/${f}" || {
+        msg_error "Could not read ${SCRIPT_DIR}/${f}"
+        exit 1
+      }
+      local_count=$((local_count + 1))
+      continue
+    fi
+
+    if [[ "$fetched" -eq 0 ]]; then
+      msg_warn "Not every PowerShell file is next to this script — fetching what is missing"
+      printf "     %sThey are copied to the unattend ISO and run inside the guest, not here.%s
+" "$DIM" "$CL"
+    fi
+    fetched=$((fetched + 1))
+
+    printf "   ${DIM}\$ curl -fsSL -o %s %s${CL}
+" "${SUPPORT_DIR}/${f}" "${REPO_RAW}/${f}"
     [[ "$DRY_RUN" == "1" ]] && continue
     if ! curl -fsSL -o "${SUPPORT_DIR}/${f}" "${REPO_RAW}/${f}"; then
       msg_error "Could not download ${f}"
-      printf "     Tried: %s\n" "${REPO_RAW}/${f}"
-      printf "     Check REPO_REF (currently '%s'), or clone the repo and run from there.\n" "$REPO_REF"
+      printf "     Tried: %s
+" "${REPO_RAW}/${f}"
+      printf "     Check REPO_REF (currently '%s'), or clone the repo and run from there.
+" "$REPO_REF"
       exit 1
     fi
     if [[ ! -s "${SUPPORT_DIR}/${f}" ]]; then
@@ -876,7 +1002,12 @@ resolve_support_files() {
       exit 1
     fi
   done
-  msg_ok "Fetched ${#SUPPORT_FILES[@]} PowerShell files (ref ${BL}${REPO_REF}${CL})"
+
+  if [[ "$fetched" -eq 0 ]]; then
+    msg_ok "All ${local_count} PowerShell files found locally (${BL}${SCRIPT_DIR}${CL})"
+  else
+    msg_ok "${local_count} local, ${fetched} fetched from ${BL}${REPO_REF}${CL}"
+  fi
 }
 
 require_iso_tool() {
@@ -929,11 +1060,20 @@ stage_drivers() {
 
 generate_answer_file() {
   local stage="$1" product_key_block="" firstlogon_block=""
+  local x_user x_pass x_hn x_tz x_img x_key c_hn
+
+  x_user="$(xml_escape "$ADMIN_USER")"
+  x_pass="$(xml_escape "$ADMIN_PASS")"
+  x_hn="$(xml_escape "$HN")"
+  x_tz="$(xml_escape "$WIN_TIMEZONE")"
+  x_img="$(xml_escape "$IMAGE_NAME")"
+  x_key="$(xml_escape "$GVLK")"
+  c_hn="$(xml_comment "$HN")"
 
   if [[ -n "$GVLK" ]]; then
     product_key_block="
             <ProductKey>
-                <Key>${GVLK}</Key>
+                <Key>${x_key}</Key>
                 <WillShowUI>Never</WillShowUI>
             </ProductKey>"
   fi
@@ -954,7 +1094,7 @@ generate_answer_file() {
   write_file "${stage}/autounattend.xml" 644 <<XMLEOF
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Generated by windows-rdgw-vm.sh for VM ${VMID} (${HN}).
+    Generated by windows-rdgw-vm.sh for VM ${VMID} (${c_hn}).
 
     Read this before you boot it. It wipes disk 0 without asking.
 
@@ -1035,7 +1175,7 @@ generate_answer_file() {
                     <InstallFrom>
                         <MetaData wcm:action="add">
                             <Key>/IMAGE/NAME</Key>
-                            <Value>${IMAGE_NAME}</Value>
+                            <Value>${x_img}</Value>
                         </MetaData>
                     </InstallFrom>
                     <InstallTo>
@@ -1048,15 +1188,15 @@ generate_answer_file() {
 
             <UserData>
                 <AcceptEula>true</AcceptEula>
-                <FullName>${ADMIN_USER}</FullName>${product_key_block}
+                <FullName>${x_user}</FullName>${product_key_block}
             </UserData>
         </component>
     </settings>
 
     <settings pass="specialize">
         <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-            <ComputerName>${HN}</ComputerName>
-            <TimeZone>${WIN_TIMEZONE}</TimeZone>
+            <ComputerName>${x_hn}</ComputerName>
+            <TimeZone>${x_tz}</TimeZone>
         </component>
 
         <!--
@@ -1092,10 +1232,10 @@ generate_answer_file() {
             <UserAccounts>
                 <LocalAccounts>
                     <LocalAccount wcm:action="add">
-                        <Name>${ADMIN_USER}</Name>
+                        <Name>${x_user}</Name>
                         <Group>Administrators</Group>
                         <Password>
-                            <Value>${ADMIN_PASS}</Value>
+                            <Value>${x_pass}</Value>
                             <PlainText>true</PlainText>
                         </Password>
                     </LocalAccount>
@@ -1109,11 +1249,11 @@ generate_answer_file() {
                 from a startup task as SYSTEM whether anyone logs on or not.
             -->
             <AutoLogon>
-                <Username>${ADMIN_USER}</Username>
+                <Username>${x_user}</Username>
                 <Enabled>true</Enabled>
                 <LogonCount>1</LogonCount>
                 <Password>
-                    <Value>${ADMIN_PASS}</Value>
+                    <Value>${x_pass}</Value>
                     <PlainText>true</PlainText>
                 </Password>
             </AutoLogon>
@@ -1134,7 +1274,7 @@ XMLEOF
 generate_config_psd1() {
   local stage="$1" targets="" m
   for m in $TARGET_MACHINES; do
-    targets+="'${m}', "
+    targets+="$(psd1_quote "$m"), "
   done
   targets="${targets%, }"
 
@@ -1147,9 +1287,9 @@ generate_config_psd1() {
 # is in autounattend.xml.
 #
 @{
-    ComputerName         = '${HN}'
-    AccountName          = '${ADMIN_USER}'
-    ExternalFqdn         = '${EXTERNAL_FQDN}'
+    ComputerName         = $(psd1_quote "$HN")
+    AccountName          = $(psd1_quote "$ADMIN_USER")
+    ExternalFqdn         = $(psd1_quote "$EXTERNAL_FQDN")
     TargetMachines       = @(${targets})
     ResourceScope        = '${RESOURCE_SCOPE}'
     CertificateSource    = 'SelfSigned'
@@ -1178,7 +1318,21 @@ build_unattend_iso() {
   msg_info "Generating the answer file"
   generate_answer_file "$stage"
   generate_config_psd1 "$stage"
-  msg_ok "Answer file written"
+
+  # Belt and braces over xml_escape. Windows Setup rejecting the answer file
+  # looks identical to Setup ignoring it, twenty minutes in, at a screen with no
+  # useful error. Catch it here instead.
+  if [[ "$DRY_RUN" != "1" ]] && command -v xmllint >/dev/null 2>&1; then
+    if ! xmllint --noout "${stage}/autounattend.xml" 2>/dev/null; then
+      msg_error "The generated autounattend.xml is not well-formed XML."
+      msg_error "Re-run with DRY_RUN=1 to read it. Suspect whatever you typed into"
+      msg_error "the account name, password, hostname or time zone."
+      exit 1
+    fi
+    msg_ok "Answer file written and well-formed"
+  else
+    msg_ok "Answer file written"
+  fi
 
   msg_info "Staging the first-boot scripts"
   local f
@@ -1454,7 +1608,12 @@ if [[ "$START_VM" == "yes" ]]; then
   msg_info "Starting the VM"
   run qm start "$VMID"
   msg_ok "Started"
-  press_a_key
+  # Only on the unattended path. With no answer file driving it, Windows Setup
+  # is a live wizard within the first minute, and Enter every two seconds would
+  # walk through the language screen, Install now, the edition list and the EULA
+  # before anyone had looked at the console. The shell-only path exists to let
+  # the operator drive those.
+  [[ "$UNATTEND" == "yes" ]] && press_a_key
 fi
 
 # ------------------------------------------------------------------------------
@@ -1546,10 +1705,13 @@ cat <<EOF
 ${BOLD}${GN}VM ${VMID} is built.${CL} Windows is not installed yet — do that next.
 
 ${BOLD}1. Open the console${CL}
-   Proxmox web UI -> VM ${VMID} -> Console. The "Press any key to boot from
-   CD" prompt has already been answered for you from the host. If you started
-   this VM yourself instead, and missed the window, you land in the UEFI
-   shell: type ${BL}exit${CL}, pick Boot Manager, and choose the DVD.
+   Proxmox web UI -> VM ${VMID} -> Console. Press a key when it offers to
+   boot from the DVD; you have about five seconds. Miss it and you land in the
+   UEFI shell: type ${BL}exit${CL}, pick Boot Manager, and choose the DVD.
+
+   ${DIM}The unattended path answers that prompt from the host. This one leaves
+   it to you on purpose - with no answer file driving Setup, a keystroke every
+   two seconds would walk through the very screens you are here to drive.${CL}
 
 ${BOLD}2. Load the storage driver${CL}
    Windows Setup will show ${YW}no disks${CL}. That is expected.
