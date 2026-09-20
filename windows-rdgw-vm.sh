@@ -1084,7 +1084,7 @@ stage_drivers() {
 }
 
 generate_answer_file() {
-  local stage="$1" product_key_block="" firstlogon_block=""
+  local stage="$1" product_key_block="" firstlogon_block="" shell_block=""
   local x_user x_pass x_hn x_tz x_img x_key c_hn
 
   x_user="$(xml_escape "$ADMIN_USER")"
@@ -1103,6 +1103,25 @@ generate_answer_file() {
             </ProductKey>"
   fi
 
+  # The cosmetic shell settings get applied twice, and the second time is this
+  # one. Configure-Guest.ps1 writes them into the Default User hive so later
+  # profiles inherit them, but the AutoLogon account's profile is copied out of
+  # that hive at about the moment the hive is being written, and on a real build
+  # the profile won: the operator asked for a left taskbar and dark theme and
+  # got neither. So the same settings are re-applied per user at the first
+  # interactive logon, against the real HKCU, and Explorer is restarted.
+  # cschneegans/unattend-generator does exactly this in its UserOnce phase.
+  #
+  # Registered unconditionally: Configure-Guest.ps1 reads ApplyTweaks from the
+  # config itself and writes a "skipped" line if it was not asked for, which is
+  # one more piece of evidence in the log than silence would be.
+  shell_block="
+                <RunSynchronousCommand wcm:action=\"add\">
+                    <Order>3</Order>
+                    <Description>Re-apply the shell settings for the first account</Description>
+                    <Path>reg.exe add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce /v RDGWShell /t REG_SZ /d \"powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Windows\\Setup\\Scripts\\Configure-Guest.ps1 -ShellForCurrentUser -ConfigPath C:\\Windows\\Setup\\Scripts\\rdgw-config.psd1\" /f</Path>
+                </RunSynchronousCommand>"
+
   # FirstLogon scripts have to beat the single automatic logon below, so they
   # are registered here in specialize rather than by the startup task, which
   # races it. RunOnce under HKLM fires at the first interactive logon and the
@@ -1110,9 +1129,9 @@ generate_answer_file() {
   if [[ -n "$CUSTOM_STAGE" && "$(count_scripts "${CUSTOM_STAGE}/FirstLogon")" -gt 0 ]]; then
     firstlogon_block="
                 <RunSynchronousCommand wcm:action=\"add\">
-                    <Order>3</Order>
+                    <Order>4</Order>
                     <Description>Register the first-logon custom scripts</Description>
-                    <Path>reg.exe add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce /v RDGWFirstLogon /t REG_SZ /d \"powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Windows\\Setup\\Scripts\\Invoke-CustomScripts.ps1 -Category FirstLogon\" /f</Path>
+                    <Path>reg.exe add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce /v RDGWFirstLogon /t REG_SZ /d \"powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Windows\\Setup\\Scripts\\Invoke-CustomScripts.ps1 -Category FirstLogon -ScriptRoot C:\\Windows\\Setup\\Scripts\" /f</Path>
                 </RunSynchronousCommand>"
   fi
 
@@ -1249,7 +1268,7 @@ generate_answer_file() {
                       nothing depends on that variable being populated.
                     -->
                     <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Setup\Scripts\Invoke-GatewaySetup.ps1 -Register -ScriptRoot C:\Windows\Setup\Scripts</Path>
-                </RunSynchronousCommand>${firstlogon_block}
+                </RunSynchronousCommand>${shell_block}${firstlogon_block}
             </RunSynchronous>
         </component>
     </settings>

@@ -320,18 +320,50 @@ bug will surface.
   therefore remains the one part of this repo never observed working end to end. When it
   fails it stays visible and recoverable: the task logs every step to
   `C:\Windows\Setup\Scripts\rdgw-setup.log` and stays registered so a reboot retries.
+- **Patterns borrowed from [cschneegans/unattend-generator](https://github.com/cschneegans/unattend-generator),
+  which had already solved things this repo learned the hard way.** The operator pointed at
+  it early and was right to. Four of its decisions are now ours, and the reasons are worth
+  keeping because each one maps to a bug that cost a real build:
+  1. **Absolute paths, always.** `const string folder = @"C:\Windows\Setup\Scripts"`, and
+     every invocation is `-File "C:\Windows\Setup\Scripts\unattend-NN.ps1"`. `$PSScriptRoot`
+     appears **zero times** in his entire repository. The bug that cost three builds here is
+     structurally impossible there.
+  2. **No parameters passed to scripts.** He bakes configuration into the generated script
+     text, so parameter binding cannot fail. Ours died *during* parameter binding.
+  3. **Hive load, run, unload as three separate answer-file commands**, so a script that
+     throws cannot skip the unload. We run inside one script, so `try/finally` buys the same
+     guarantee - and it is not optional: `reg.exe` holds `NTUSER.DAT` open while loaded, and
+     a locked Default User profile poisons every profile created afterwards.
+  4. **Per-user settings go in twice, and Explorer gets restarted.** See the Default User
+     hive entry below. His `RestartExplorer.ps1` kills only the current session's Explorer,
+     which is what `Restart-ExplorerHere` does here.
+
+  Not adopted: the generator itself. It is a C#/.NET application, so using it on a Proxmox
+  host means installing .NET or calling the hosted form at schneegans.de - and the answer
+  file carries the Administrator password in clear text, so the hosted route would hand
+  that to a third party. It also only produces `autounattend.xml`; it does not build the VM,
+  assemble the ISO with the VirtIO drivers, or know anything about RD Gateway. A
+  bring-your-own-answer-file path, where the operator generates the XML themselves and this
+  script injects only `rdgw/` and `$WinPEDriver$`, is a reasonable future option and has
+  been discussed but not built.
 - **Edge's first-run experience is not suppressed anywhere.** The operator expected it to
   be; nothing in any script has ever touched Edge. If it is wanted, the machine-wide
   policy `HKLM\SOFTWARE\Policies\Microsoft\Edge\HideFirstRunExperience = 1` is the right
   place, precisely because it does not depend on the Default User hive and so cannot lose
   the race described below.
-- **The Default User hive cannot reach the auto-logon account.** Everything under
-  `ApplyTweaks` - taskbar left, dark theme, Explorer defaults, desktop icons - is written
-  into `C:\Users\Default\NTUSER.DAT` so that new profiles inherit it. `AutoLogon` creates
-  the first profile from that hive at roughly the same moment, and on the observed build
-  the profile won: `rdgadmin` came up with a centred taskbar and the light theme. So even
-  once the first-boot chain runs, expect these to miss the first account unless the
-  settings are also written into profiles that already exist.
+- **The Default User hive cannot reach the auto-logon account, so the shell settings go in
+  twice.** Everything under `ApplyTweaks` - taskbar left, dark theme, Explorer defaults,
+  desktop icons - is written into `C:\Users\Default\NTUSER.DAT` so new profiles inherit it.
+  `AutoLogon` creates the first profile from that hive at roughly the same moment, and on
+  the observed build the profile won: `rdgadmin` came up with a centred taskbar and the
+  light theme, having been asked for neither. `Set-ShellSetting` therefore takes a registry
+  root and is called twice - once against the mounted hive, once against `HKCU:` by
+  `Configure-Guest.ps1 -ShellForCurrentUser`, which the answer file registers in **HKLM**
+  `RunOnce` (Order 3) so it fires at the first interactive logon whoever that is. Neither
+  call is redundant: the hive reaches future profiles, the HKCU pass reaches the account
+  the operator is actually looking at. Explorer is restarted afterwards, because it reads
+  these once at startup and a logged-on user sees nothing until it does. Do not "simplify"
+  this back to one call.
 - `DiskID 0` in the answer file assumes the VirtIO SCSI disk is the only disk. True for a VM
   this script builds; add a second disk before install and it stops being true.
 - **RDP-over-UDP through nginx stream is the least certain thing in the repo.** Note that
