@@ -452,6 +452,17 @@ Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' 'LongPathsEnabled' 1
 # QEMU guest needs it.
 Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'DisableWpbtExecution' 1
 
+# Edge's first-run experience: the full-screen "welcome, let's get you set up"
+# takeover on first launch. Machine-wide policy, which is the whole point -
+# unlike the shell settings it does not live in HKCU, so it cannot lose the
+# race against the profile AutoLogon creates and needs no per-user second pass.
+# The same three keys cschneegans/unattend-generator writes in its specialize
+# phase. StartupBoost and BackgroundMode keep Edge out of memory on a box whose
+# job is to be a gateway.
+Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' 'HideFirstRunExperience' 1
+Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\Recommended' 'StartupBoostEnabled' 0
+Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\Recommended' 'BackgroundModeEnabled' 0
+
 # Do not reboot out from under a logged-on administrator. A gateway that
 # reboots mid-session during Windows Update is a gateway nobody trusts.
 Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'NoAutoRebootWithLoggedOnUsers' 1

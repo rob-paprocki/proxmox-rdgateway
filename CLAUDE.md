@@ -346,11 +346,14 @@ bug will surface.
   bring-your-own-answer-file path, where the operator generates the XML themselves and this
   script injects only `rdgw/` and `$WinPEDriver$`, is a reasonable future option and has
   been discussed but not built.
-- **Edge's first-run experience is not suppressed anywhere.** The operator expected it to
-  be; nothing in any script has ever touched Edge. If it is wanted, the machine-wide
-  policy `HKLM\SOFTWARE\Policies\Microsoft\Edge\HideFirstRunExperience = 1` is the right
-  place, precisely because it does not depend on the Default User hive and so cannot lose
-  the race described below.
+- **Edge first-run is suppressed by machine-wide policy, deliberately.**
+  `HKLM\SOFTWARE\Policies\Microsoft\Edge\HideFirstRunExperience = 1`, plus
+  `StartupBoostEnabled` and `BackgroundModeEnabled` off under `...\Edge\Recommended`, all
+  in `Configure-Guest.ps1`'s housekeeping section. Machine-wide is the point: unlike the
+  shell settings these do not live in HKCU, so they cannot lose the race against the
+  profile `AutoLogon` creates and need no per-user second pass. Same three keys
+  cschneegans/unattend-generator writes in its specialize phase. Do not "consolidate" them
+  into the Default User hive.
 - **The Default User hive cannot reach the auto-logon account, so the shell settings go in
   twice.** Everything under `ApplyTweaks` - taskbar left, dark theme, Explorer defaults,
   desktop icons - is written into `C:\Users\Default\NTUSER.DAT` so new profiles inherit it.
