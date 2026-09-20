@@ -31,6 +31,9 @@
 #                         boot" prompt; it stops as soon as the DVD starts
 #                         streaming (default 180)
 #      BOOT_KEY           the key to send for that prompt (default ret)
+#      BOOT_KEY_STREAM_MB how far the DVD counter must climb above where it
+#                         settled before Setup counts as streaming (default 64)
+#      BOOT_KEY_MAX       hard cap on keypresses (default 10)
 #
 #  What it touches on the network:
 #
@@ -91,7 +94,19 @@ SUPPORT_DIR=""
 BOOT_KEY_SECONDS="${BOOT_KEY_SECONDS:-180}"
 BOOT_KEY_BLIND_SECONDS="${BOOT_KEY_BLIND_SECONDS:-30}"
 BOOT_KEY="${BOOT_KEY:-ret}"
-BOOT_KEY_STOP_MB="${BOOT_KEY_STOP_MB:-24}"
+# How far the DVD counter must climb ABOVE where it first settled before we
+# believe Setup is really streaming. Measured on the operator's host: a keyless
+# boot reads ~3 MiB and stops, and the UEFI Boot Manager's own device
+# enumeration reaches ~26 MiB all by itself - so any absolute total near that is
+# a false positive waiting to happen, and an earlier version reported success
+# while the VM sat on a menu. boot.wim is hundreds of MiB, so growth is the
+# honest signal and 64 clears the firmware's noise by a wide margin.
+BOOT_KEY_STREAM_MB="${BOOT_KEY_STREAM_MB:-64}"
+# Hard cap on keypresses. The prompt lasts about five seconds and each poll
+# costs a second or two, so a handful is all that can possibly land; beyond
+# that we are pressing into a menu, and a bounded number of keys cannot walk
+# through one.
+BOOT_KEY_MAX="${BOOT_KEY_MAX:-10}"
 
 # Scripts of your own, in the four categories the schneegans.de generator uses.
 # CUSTOM_STAGE is a mktemp tree laid out as <category>/<filename>, created only
@@ -1629,7 +1644,7 @@ qm_bytes_read() {
 # So the keys have to stop as soon as the prompt has been answered, and the VM
 # will tell us: before the keypress the DVD has given up only a boot sector and
 # a loader, and after it Setup streams boot.wim off the same disc. A read count
-# past BOOT_KEY_STOP_MB means we are through and can stop pressing.
+# climbing hard means we are through and can stop pressing.
 #
 # The second version got the other half wrong. It kept the stop condition but
 # still pressed on a schedule, inside a fixed twenty-second window opening the
@@ -1642,24 +1657,45 @@ qm_bytes_read() {
 # the counter through qm monitor, which hangs on piped input. See qm_bytes_read
 # above. Watching that happen on the real host is what produced this version.
 #
-# Both halves are the same question - is the prompt on screen right now - and
-# the byte counter answers it. Zero means the firmware has not opened the disc
-# yet, so there is nothing to answer. A number that has stopped moving means the
-# firmware opened the disc, read a loader, and is now waiting on somebody: that
-# is the prompt, and that is when to press. A number still climbing means
-# something is streaming and no key of ours is wanted. Since keys now go out
-# only in that middle state, the clock can afford to be patient.
+# The fourth version read the counter fine and drew two wrong conclusions from
+# it, both found by tracing a real boot second by second. Measured on the
+# operator's host, with no keys sent at all:
 #
-# It can only afford that while the counter is readable. When the monitor will
-# not answer we are back to pressing on faith, which is the thing that hammered
-# Cancel, so that path stays on a short leash and says so.
+#     t=1  ide0=0          t=4  ide0=1169408     t=7  ide0=3084288
+#     t=3  ide0=59392      t=5  ide0=1536000     t=9  ide0=3005824  <- flat
+#                                                     ...and flat for the
+#                                                     remaining 54 samples
+#
+# So the DVD gives up about 3 MiB and stops. Two lessons.
+#
+# First, "stop when the total passes 24 MiB" was a false positive. The UEFI
+# Boot Manager's own device enumeration reads ~26 MiB - more than that
+# threshold - so once the prompt had been missed and the firmware fell through
+# to its menu, this function announced "Setup is streaming the DVD" at a VM
+# parked on "Please select boot device". The honest measure is growth above
+# where the counter first settled, because boot.wim is hundreds of MiB and
+# firmware noise is tens.
+#
+# Second, "press only while the counter is exactly flat" was too narrow. Each
+# poll costs a second or two because qm status is not instant, and the prompt
+# lasts about five seconds, so the flat state can be entered and left between
+# two samples. Keys now go out from the moment the firmware has touched the
+# disc at all, which is harmless - the OVMF splash ignores Enter, and Setup's
+# Cancel button only exists once the counter is climbing hard, which is the
+# branch that exits. BOOT_KEY_MAX caps the total so a missed prompt cannot turn
+# into a walk through the boot menu.
+#
+# All of this only holds while the counter is readable. When it is not we are
+# back to pressing on faith, which is what hammered Cancel, so that path stays
+# on a short leash and says so.
 press_a_key() {
-  local deadline bytes last="" sent=0 stop_at tries=0
+  local deadline bytes floor="" sent=0 grow_at tries=0
 
-  stop_at=$(( BOOT_KEY_STOP_MB * 1024 * 1024 ))
+  grow_at=$(( BOOT_KEY_STREAM_MB * 1024 * 1024 ))
 
   msg_info "Answering the \"press any key to boot\" prompt"
-  printf "   ${DIM}\$ qm sendkey %s %s${CL}   (only while the DVD is open and quiet)\n" "$VMID" "$BOOT_KEY"
+  printf "   ${DIM}\$ qm sendkey %s %s${CL}   (up to %s, stopping the moment Setup streams)\n" \
+    "$VMID" "$BOOT_KEY" "$BOOT_KEY_MAX"
   if [[ "$DRY_RUN" == "1" ]]; then
     msg_ok "Skipped — DRY_RUN"
     return 0
@@ -1689,16 +1725,28 @@ press_a_key() {
 
   deadline=$((SECONDS + BOOT_KEY_SECONDS))
   while (( SECONDS < deadline )); do
-    if [[ "$bytes" =~ ^[0-9]+$ ]]; then
-      if (( bytes > stop_at )); then
-        msg_ok "Setup is streaming the DVD - stopped after ${sent} keypress(es)"
+    if [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes > 0 )); then
+      # Where the counter first settled, which is the baseline everything is
+      # measured against. A drop means the VM restarted and the counter reset,
+      # so re-baseline rather than go negative.
+      if [[ -z "$floor" ]] || (( bytes < floor )); then floor="$bytes"; fi
+
+      if (( bytes - floor > grow_at )); then
+        msg_ok "Setup is streaming the DVD (+$(( (bytes - floor) / 1048576 )) MiB) - stopped after ${sent} keypress(es)"
         return 0
       fi
-      if (( bytes > 0 )) && [[ "$bytes" == "$last" ]]; then
+
+      # Press from the moment the firmware has touched the disc, not only when
+      # the counter is exactly flat. Polling costs a second or two, so "flat"
+      # was too narrow a target to hit a five-second prompt reliably - it was
+      # missed on a real build. Keys before the prompt are harmless: the OVMF
+      # splash ignores Enter, and Setup's Cancel button - the thing this whole
+      # function exists to avoid - only appears once the counter is climbing
+      # hard, which is the branch above.
+      if (( sent < BOOT_KEY_MAX )); then
         qm sendkey "$VMID" "$BOOT_KEY" >/dev/null 2>&1 || true
         sent=$((sent + 1))
       fi
-      last="$bytes"
     fi
     sleep 1
     bytes="$(qm_bytes_read ide0)"
