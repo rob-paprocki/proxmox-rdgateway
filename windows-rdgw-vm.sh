@@ -87,10 +87,12 @@ SUPPORT_DIR=""
 BOOT_KEY_SECONDS="${BOOT_KEY_SECONDS:-60}"
 
 # Scripts of your own, in the four categories the schneegans.de generator uses.
-# Empty unless pick_custom_scripts finds some.
+# CUSTOM_STAGE is a mktemp tree laid out as <category>/<filename>, created only
+# if you actually add something. The exit trap removes it.
 CUSTOM_CATEGORIES=(System DefaultUser FirstLogon UserOnce)
-CUSTOM_SCRIPT_DIR=""
-CUSTOM_LOOSE_AS_SYSTEM="no"
+CUSTOM_STAGE=""
+CUSTOM_CATEGORY=""
+CUSTOM_EXT=""
 
 # Answered by pick_resource_scope. Initialised here so the most restrictive
 # setting is the one a future reordering would fall back to, never the widest.
@@ -137,6 +139,7 @@ cleanup_handler() {
   fi
   [[ -n "$UNATTEND_STAGE" ]] && rm -rf "$UNATTEND_STAGE"
   [[ -n "$UNATTEND_SUPPORT" ]] && rm -rf "$UNATTEND_SUPPORT"
+  [[ -n "$CUSTOM_STAGE" ]] && rm -rf "$CUSTOM_STAGE"
   return 0
 }
 trap cleanup_handler EXIT
@@ -424,9 +427,12 @@ count_scripts() {
   printf "%s" "$n"
 }
 
-# Scripts of your own, run on the new machine at four different moments. The
-# names and the timing come from the schneegans.de unattend generator, because
-# that is the vocabulary most people arrive with:
+# ------------------------------------------------------------------------------
+# Scripts of your own
+#
+# Four categories, run on the new machine at four different moments. The names
+# and the timing come from the schneegans.de unattend generator, because that
+# is the vocabulary most people arrive with:
 #
 #   System       as SYSTEM on the first boot, before anyone logs on
 #   DefaultUser  as SYSTEM with C:\Users\Default\NTUSER.DAT mounted, so what
@@ -434,79 +440,335 @@ count_scripts() {
 #   FirstLogon   at the first interactive logon, elevated
 #   UserOnce     at each new user's first logon, in that user's own context
 #
-# They are read from subdirectories of one directory on this host, which keeps
-# whiptail out of the business of editing script bodies and works the same way
-# whether this script came from a checkout or from the one-liner.
+# You can write one here or import files you already have. Either way it ends
+# up in one staging tree laid out as <category>/<filename>, which
+# build_unattend_iso copies onto the CD. That tree is a mktemp directory the
+# exit trap removes, so the helpers below write to it directly instead of
+# through run(): there is nothing here for DRY_RUN to protect you from, and the
+# answer file needs the real counts to decide what to register.
+# ------------------------------------------------------------------------------
+
+# Sets CUSTOM_STAGE. Deliberately not a function that prints the path: calling
+# it as "$(custom_stage_dir)" would run the assignment in a subshell and the
+# global would come back empty on the other side.
+custom_stage_dir() {
+  [[ -n "$CUSTOM_STAGE" ]] || CUSTOM_STAGE="$(mktemp -d)"
+}
+
+custom_total() {
+  local cat total=0
+  if [[ -n "$CUSTOM_STAGE" ]]; then
+    for cat in "${CUSTOM_CATEGORIES[@]}"; do
+      total=$((total + $(count_scripts "${CUSTOM_STAGE}/${cat}")))
+    done
+  fi
+  printf '%s' "$total"
+}
+
+custom_when_text() {
+  case "$1" in
+    System)      printf 'before anyone logs on, as SYSTEM' ;;
+    DefaultUser) printf 'Default User hive mounted, as SYSTEM' ;;
+    FirstLogon)  printf 'the first interactive logon, elevated' ;;
+    UserOnce)    printf "each new user's first logon, as them" ;;
+  esac
+}
+
+# Cancel on these two goes back to the menu rather than out of the script, so
+# they return non-zero instead of calling exit_script the way the others do.
+pick_custom_category() {
+  CUSTOM_CATEGORY="$(whiptail --backtitle "$APP" --title "When should it run?" --radiolist \
+    "Pick the phase. These are the schneegans.de category names." 15 74 4 \
+    "System"      "$(custom_when_text System)"      ON  \
+    "DefaultUser" "$(custom_when_text DefaultUser)" OFF \
+    "FirstLogon"  "$(custom_when_text FirstLogon)"  OFF \
+    "UserOnce"    "$(custom_when_text UserOnce)"    OFF 3>&1 1>&2 2>&3)" || return 1
+  [[ -n "$CUSTOM_CATEGORY" ]]
+}
+
+pick_custom_kind() {
+  CUSTOM_EXT="$(whiptail --backtitle "$APP" --title "What kind of script?" --radiolist \
+    "The extension is what picks the interpreter on the other end." 13 74 3 \
+    "ps1" "PowerShell   run with powershell.exe" ON  \
+    "cmd" "Batch        run with cmd.exe /c"     OFF \
+    "reg" "Registry     imported with reg.exe"   OFF 3>&1 1>&2 2>&3)" || return 1
+  [[ -n "$CUSTOM_EXT" ]]
+}
+
+# Open the editor on something rather than a blank page, so the context is in
+# front of you while you write and still there if the file is read later.
+custom_seed_file() {
+  local path="$1" cat="$2" ext="$3" when
+  when="$(custom_when_text "$cat")"
+
+  case "$ext" in
+    ps1)
+      cat >"$path" <<SEEDEOF
+# ${cat} script for this RD Gateway build.
+#
+# Runs at:     ${when}
+# Started as:  powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+#
+# Output and the exit code go to C:\\Windows\\Setup\\Scripts\\rdgw-setup.log.
+# A non-zero exit is logged and skipped rather than stopping the build, and
+# anything still running after fifteen minutes is killed.
+
+SEEDEOF
+      ;;
+    cmd)
+      cat >"$path" <<SEEDEOF
+@echo off
+:: ${cat} script for this RD Gateway build.
+::
+:: Runs at:     ${when}
+:: Started as:  cmd.exe /c
+::
+:: Output and the exit code go to C:\\Windows\\Setup\\Scripts\\rdgw-setup.log.
+
+SEEDEOF
+      ;;
+    reg)
+      cat >"$path" <<SEEDEOF
+Windows Registry Editor Version 5.00
+
+; ${cat} script for this RD Gateway build.
+;
+; Runs at:     ${when}
+; Imported by: reg.exe import
+SEEDEOF
+      if [[ "$cat" == "DefaultUser" ]]; then
+        cat >>"$path" <<SEEDEOF
+;
+; Write HKEY_CURRENT_USER as though you were the logged-on user. It is
+; rewritten to point at the mounted Default User hive before it is imported,
+; so what you set here is inherited by every profile created afterwards.
+SEEDEOF
+      fi
+      printf '\n' >>"$path"
+      ;;
+  esac
+}
+
+# Can we actually reach the terminal by name? [[ -r /dev/tty ]] is not enough:
+# the node can exist and still refuse to open when there is no controlling
+# terminal. Try it for real rather than asking about it.
+custom_have_tty() {
+  { true </dev/tty >/dev/tty; } 2>/dev/null
+}
+
+# $VISUAL and $EDITOR first, then what Proxmox actually ships.
+custom_find_editor() {
+  local e
+  for e in "${VISUAL:-}" "${EDITOR:-}" nano vim vi; do
+    [[ -n "$e" ]] || continue
+    if command -v "${e%% *}" >/dev/null 2>&1; then
+      printf '%s' "$e"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# No editor on the box. Take the body off the terminal instead. /dev/tty and
+# not stdin, because in the one-liner form stdin has already been spent on the
+# script itself.
+custom_paste_into() {
+  local path="$1" line
+  printf "\n   Paste the script, then a line containing only ${BL}EOF${CL}\n\n"
+  while IFS= read -r line; do
+    [[ "$line" == "EOF" ]] && break
+    printf '%s\n' "$line" >>"$path"
+  done < <(if custom_have_tty; then cat /dev/tty; else cat; fi)
+  printf "\n"
+}
+
+# Did anything survive besides the header we seeded and blank lines?
+custom_has_content() {
+  local path="$1" line trimmed
+  while IFS= read -r line; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$trimmed" ]] && continue
+    case "$trimmed" in
+      "#"*|"::"*|";"*|"@echo off"|"Windows Registry Editor"*) continue ;;
+      [Rr][Ee][Mm][[:space:]]*) continue ;;
+    esac
+    return 0
+  done <"$path"
+  return 1
+}
+
+custom_write_script() {
+  local stage cat ext name path editor next
+  local -a ed
+
+  pick_custom_category || return 0
+  cat="$CUSTOM_CATEGORY"
+  pick_custom_kind || return 0
+  ext="$CUSTOM_EXT"
+
+  custom_stage_dir
+  stage="$CUSTOM_STAGE"
+  mkdir -p "${stage}/${cat}"
+
+  # Numbered in tens so there is room to slot something in between later.
+  next=$(( ($(count_scripts "${stage}/${cat}") + 1) * 10 ))
+  ask "File name (scripts run in filename order)" "${next}-script.${ext}"
+  name="${ASK_RESULT##*/}"
+  [[ "$name" == *".${ext}" ]] || name="${name}.${ext}"
+  path="${stage}/${cat}/${name}"
+
+  custom_seed_file "$path" "$cat" "$ext"
+
+  if editor="$(custom_find_editor)"; then
+    read -r -a ed <<<"$editor"
+    msg_info "Opening ${BL}${cat}/${name}${CL} in ${BL}${ed[0]}${CL}"
+    # whiptail has been drawing on the terminal, so hand it over properly. In
+    # the one-liner form stdin is not the terminal, hence asking for it by
+    # name - but only when it is actually there to ask for.
+    if custom_have_tty; then
+      "${ed[@]}" "$path" </dev/tty >/dev/tty 2>&1 || true
+    else
+      "${ed[@]}" "$path" || true
+    fi
+  else
+    msg_warn "No editor found - tried \$VISUAL, \$EDITOR, nano, vim, vi"
+    custom_paste_into "$path"
+  fi
+
+  if custom_has_content "$path"; then
+    msg_ok "Added ${BL}${cat}/${name}${CL}"
+  else
+    rm -f "$path"
+    whiptail --backtitle "$APP" --title "Nothing saved" --msgbox \
+      "${name} had nothing in it beyond the header, so it was discarded." 9 68
+  fi
+}
+
+custom_import_path() {
+  local src stage cat f added=0 loose base
+
+  ask "File or directory to import" "/root/rdgw-scripts"
+  src="${ASK_RESULT%/}"
+  [[ -n "$src" ]] || return 0
+
+  if [[ -f "$src" ]]; then
+    pick_custom_category || return 0
+    custom_stage_dir
+    stage="$CUSTOM_STAGE"
+    base="$(basename "$src")"
+    mkdir -p "${stage}/${CUSTOM_CATEGORY}"
+    cp "$src" "${stage}/${CUSTOM_CATEGORY}/"
+    msg_ok "Added ${BL}${CUSTOM_CATEGORY}/${base}${CL}"
+    return 0
+  fi
+
+  if [[ ! -d "$src" ]]; then
+    whiptail --backtitle "$APP" --title "Not found" --msgbox \
+      "${src} is not a file or a directory." 8 66
+    return 0
+  fi
+
+  custom_stage_dir
+  stage="$CUSTOM_STAGE"
+  for cat in "${CUSTOM_CATEGORIES[@]}"; do
+    [[ -d "${src}/${cat}" ]] || continue
+    for f in "${src}/${cat}"/*.ps1 "${src}/${cat}"/*.cmd "${src}/${cat}"/*.bat "${src}/${cat}"/*.reg; do
+      [[ -f "$f" ]] || continue
+      mkdir -p "${stage}/${cat}"
+      cp "$f" "${stage}/${cat}/"
+      added=$((added + 1))
+    done
+  done
+
+  # A directory of scripts with no category subdirectory at all almost always
+  # means "just run these", so offer the obvious reading rather than reporting
+  # nothing found.
+  if [[ "$added" -eq 0 ]]; then
+    loose="$(count_scripts "$src")"
+    if [[ "$loose" -gt 0 ]] && whiptail --backtitle "$APP" --title "No category subdirectories" --yesno \
+        "${src} holds ${loose} script(s) but none of the ${CUSTOM_CATEGORIES[*]} subdirectories.\n\nTreat them all as System scripts?" 12 72; then
+      mkdir -p "${stage}/System"
+      for f in "$src"/*.ps1 "$src"/*.cmd "$src"/*.bat "$src"/*.reg; do
+        [[ -f "$f" ]] || continue
+        cp "$f" "${stage}/System/"
+        added=$((added + 1))
+      done
+    fi
+  fi
+
+  if [[ "$added" -eq 0 ]]; then
+    whiptail --backtitle "$APP" --title "Nothing to import" --msgbox \
+      "No .ps1, .cmd, .bat or .reg files under ${src}." 9 70
+  else
+    msg_ok "Imported ${added} script(s) from ${BL}${src}${CL}"
+  fi
+}
+
+custom_review() {
+  local cat f rel choice
+  local -a rows=()
+
+  if [[ -n "$CUSTOM_STAGE" ]]; then
+    for cat in "${CUSTOM_CATEGORIES[@]}"; do
+      for f in "${CUSTOM_STAGE}/${cat}"/*; do
+        [[ -f "$f" ]] || continue
+        rel="${cat}/$(basename "$f")"
+        rows+=("$rel" "$(custom_when_text "$cat")" "OFF")
+      done
+    done
+  fi
+
+  if [[ "${#rows[@]}" -eq 0 ]]; then
+    whiptail --backtitle "$APP" --title "Custom scripts" --msgbox \
+      "Nothing added yet." 8 50
+    return 0
+  fi
+
+  choice="$(whiptail --backtitle "$APP" --title "What will be included" --radiolist \
+    "All of these go on the CD, in filename order within each category.\n\nPick one to remove it, or leave it on 'keep everything'." 20 78 9 \
+    "keep everything" "" ON "${rows[@]}" 3>&1 1>&2 2>&3)" || return 0
+
+  if [[ -n "$choice" && "$choice" != "keep everything" ]]; then
+    rm -f "${CUSTOM_STAGE}/${choice}"
+    msg_ok "Removed ${BL}${choice}${CL}"
+  fi
+}
+
 pick_custom_scripts() {
-  local dir cat n total loose found
+  local choice total
 
   whiptail --backtitle "$APP" --title "Custom scripts" --yesno \
-    "Run scripts of your own on the new machine?\n\nThey are read from subdirectories of a directory on this host:\n\n  System/       as SYSTEM, before anyone logs on\n  DefaultUser/  as SYSTEM, Default User hive mounted\n  FirstLogon/   first interactive logon, elevated\n  UserOnce/     each new user's first logon\n\n.ps1, .cmd, .bat and .reg are recognised." 20 74 --defaultno || return 0
+    "Run scripts of your own on the new machine?\n\nWrite them here, or import files already sitting on this host. Each one is tagged with when it should run:\n\n  System        before anyone logs on, as SYSTEM\n  DefaultUser   with the Default User hive mounted\n  FirstLogon    the first interactive logon, elevated\n  UserOnce      each new user's first logon\n\nPowerShell, batch and .reg files are all supported." 21 76 --defaultno || return 0
 
   while true; do
-    ask "Directory holding those subdirectories" "/root/rdgw-scripts"
-    dir="${ASK_RESULT%/}"
+    total="$(custom_total)"
+    choice="$(whiptail --backtitle "$APP" --title "Custom scripts (${total} so far)" --menu \
+      "" 14 76 4 \
+      "write"  "Write a new script here" \
+      "import" "Import a file or a directory from this host" \
+      "review" "Review what will be included, or remove one" \
+      "done"   "Finished" 3>&1 1>&2 2>&3)" || return 0
 
-    if [[ ! -d "$dir" ]]; then
-      whiptail --backtitle "$APP" --title "Not found" --yesno \
-        "${dir} is not a directory.\n\nTry a different path?" 10 66 && continue
-      return 0
-    fi
-
-    found=""
-    total=0
-    for cat in "${CUSTOM_CATEGORIES[@]}"; do
-      n="$(count_scripts "${dir}/${cat}")"
-      if [[ "$n" -gt 0 ]]; then
-        found+="  ${cat}: ${n}\n"
-        total=$((total + n))
-      fi
-    done
-
-    # Scripts sitting loose in the directory with no category subdirectory at
-    # all almost always mean "just run these", so offer the obvious reading
-    # rather than reporting nothing found.
-    if [[ "$total" -eq 0 ]]; then
-      loose="$(count_scripts "$dir")"
-      if [[ "$loose" -gt 0 ]]; then
-        if whiptail --backtitle "$APP" --title "No category subdirectories" --yesno \
-            "${dir} holds ${loose} script(s) but none of the ${CUSTOM_CATEGORIES[*]} subdirectories.\n\nTreat them as System scripts?" 12 72; then
-          CUSTOM_LOOSE_AS_SYSTEM="yes"
-          found="  System: ${loose}\n"
-          total="$loose"
-        fi
-      fi
-    fi
-
-    if [[ "$total" -eq 0 ]]; then
-      whiptail --backtitle "$APP" --title "Nothing to run" --yesno \
-        "No .ps1, .cmd, .bat or .reg files under ${dir}.\n\nTry a different path?" 10 70 && continue
-      return 0
-    fi
-
-    CUSTOM_SCRIPT_DIR="$dir"
-    whiptail --backtitle "$APP" --title "Custom scripts" --msgbox \
-      "Found ${total} script(s):\n\n$(printf "%b" "$found")\nWithin a category they run in filename order, so 10-first.ps1 runs before 20-second.ps1.\n\nA script that fails is logged and the build carries on." 16 72
-    return 0
+    case "$choice" in
+      write)  custom_write_script ;;
+      import) custom_import_path ;;
+      review) custom_review ;;
+      *)      return 0 ;;
+    esac
   done
 }
 
-# Copy the chosen scripts into the staging tree. They go under rdgw/ so the
-# existing specialize xcopy carries them across with everything else; no extra
-# answer-file command is needed to place them.
+# Copy what you added onto the CD. It goes under rdgw/ so the existing
+# specialize xcopy carries it across with everything else; no extra answer-file
+# command is needed to place it.
 stage_custom_scripts() {
   local stage="$1" cat src dst f staged=0
 
-  [[ -n "$CUSTOM_SCRIPT_DIR" ]] || return 0
+  [[ -n "$CUSTOM_STAGE" ]] || return 0
 
   msg_info "Staging custom scripts"
   for cat in "${CUSTOM_CATEGORIES[@]}"; do
-    if [[ "$CUSTOM_LOOSE_AS_SYSTEM" == "yes" ]]; then
-      [[ "$cat" == "System" ]] || continue
-      src="$CUSTOM_SCRIPT_DIR"
-    else
-      src="${CUSTOM_SCRIPT_DIR}/${cat}"
-    fi
+    src="${CUSTOM_STAGE}/${cat}"
     [[ -d "$src" ]] || continue
 
     dst="${stage}/rdgw/custom/${cat}"
@@ -680,8 +942,7 @@ generate_answer_file() {
   # are registered here in specialize rather than by the startup task, which
   # races it. RunOnce under HKLM fires at the first interactive logon and the
   # value deletes itself once it has run.
-  if [[ -n "$CUSTOM_SCRIPT_DIR" && "$CUSTOM_LOOSE_AS_SYSTEM" != "yes" \
-        && "$(count_scripts "${CUSTOM_SCRIPT_DIR}/FirstLogon")" -gt 0 ]]; then
+  if [[ -n "$CUSTOM_STAGE" && "$(count_scripts "${CUSTOM_STAGE}/FirstLogon")" -gt 0 ]]; then
     firstlogon_block="
                 <RunSynchronousCommand wcm:action=\"add\">
                     <Order>3</Order>
@@ -1218,13 +1479,12 @@ case "${RESOURCE_SCOPE}" in
 esac
 
 CUSTOM_SUMMARY=""
-if [[ -n "$CUSTOM_SCRIPT_DIR" ]]; then
+if [[ "$(custom_total)" -gt 0 ]]; then
   CUSTOM_SUMMARY="
 ${BOLD}Your own scripts${CL}
-   Taken from ${BL}${CUSTOM_SCRIPT_DIR}${CL} and run from
-   ${BL}C:\\Windows\\Setup\\Scripts\\custom${CL}. They are logged in the same file,
-   prefixed ${BL}custom/<category>${CL}. One that fails or runs past 15 minutes is
-   logged and skipped rather than stopping the build.
+   $(custom_total) of them, run from ${BL}C:\\Windows\\Setup\\Scripts\\custom${CL} and logged
+   in the same file, prefixed ${BL}custom/<category>${CL}. One that fails or runs
+   past 15 minutes is logged and skipped rather than stopping the build.
 "
 fi
 

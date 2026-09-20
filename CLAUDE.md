@@ -183,6 +183,12 @@ bug will surface.
   `RG`, `CG`, `ALL` - and gives `ALL` as "All resources". What `ResourceGroupName`
   should be alongside `ALL` is *not* documented; the empty string is convention.
 - `qm sendkey <vmid> <key>` is confirmed against the `qm` manual page.
+- The custom-script TUI is dry-run covered in six scenarios: importing a directory laid
+  out by category, importing a directory of loose files, writing a `.ps1` and a `.reg`
+  through a stubbed editor, writing a `FirstLogon` script and confirming the extra
+  `RunSynchronousCommand` appears in the answer file, an editor that saves nothing and
+  the file being discarded, and adding two scripts then removing one in review. The
+  generated `autounattend.xml` parses in every case.
 - Every element of the generated answer file was checked against the Unattended Windows Setup
   Reference on Microsoft Learn: component names, valid configuration passes, child elements.
   The load-bearing one is `Microsoft-Windows-Deployment\RunSynchronous\RunSynchronousCommand`
@@ -295,6 +301,19 @@ dgw-setup.log` and stays
   are deliberately the schneegans.de generator's names, with the same timing and the
   same accepted extensions. The operator asked for it in those terms. Do not rename them
   to something tidier.
+- Custom scripts can be written in the TUI or imported from disk, and both routes feed
+  one staging tree (`CUSTOM_STAGE`, a `mktemp -d` the exit trap removes) laid out as
+  `<category>/<filename>`. Everything downstream - the count in the menu title, the
+  decision to register `FirstLogon`, the ISO staging, the closing summary - reads that
+  tree rather than asking where a file came from. Keep it that way; it is what let the
+  editor route be added without touching any of them.
+- Two traps in that code, both found by the dry-run suite rather than by reading:
+  `custom_stage_dir` **sets** `CUSTOM_STAGE` and prints nothing, because calling it as
+  `stage="$(custom_stage_dir)"` runs the assignment in a subshell and the global comes
+  back empty on the other side. And `custom_have_tty` probes `/dev/tty` by opening it,
+  because `[[ -r /dev/tty ]]` passes on a node that then fails with "No such device or
+  address" when there is no controlling terminal - which is exactly what happens under
+  a test runner, and would silently skip the editor.
 - The security toggles in the unattended path (UAC, Defender, Core Isolation, lockout, blank
   passwords, Ctrl+Alt+Del) all default to leaving Windows as it ships. They exist because the
   operator explicitly asked to be able to loosen them. State the consequence once in the

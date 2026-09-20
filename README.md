@@ -140,7 +140,7 @@ Say yes to "unattended install" and it asks the following. Nothing here has a sa
 | Disable Core Isolation | no | |
 | Require Ctrl+Alt+Del | no | The one that defaults to the *less* strict answer, because sending Ctrl+Alt+Del to a Proxmox console is a menu trip rather than a keystroke. |
 | Housekeeping settings | yes | 8.3 names off, fast startup off, long paths on, WPBT off, no Windows Update auto-reboot, system sounds off, NumLock on, and Explorer/taskbar/theme defaults suited to RDP. |
-| Custom scripts | no | Scripts of your own, in the four categories below. |
+| Custom scripts | no | Opens a menu: write scripts of your own here, or import files you already have. |
 
 The four security toggles all default to leaving Windows exactly as it ships. They exist because the operator asked for them; each prompt states what it costs, and then does what you picked without arguing further.
 
@@ -155,16 +155,48 @@ A retail or volume-licence ISO reports `Windows Server 2025 Standard (Desktop Ex
 
 ### Custom scripts
 
-Say yes and it asks for a directory on the Proxmox host. Put your scripts in subdirectories named for when you want them to run. The names and the timing are the ones the [schneegans.de generator](https://schneegans.de/windows/unattend-generator/) uses, since that is the vocabulary most people arrive with:
+Say yes and you get a small menu that stays open until you are done:
 
-| Subdirectory | When it runs | As whom |
+```
+Custom scripts (2 so far)
+
+  write    Write a new script here
+  import   Import a file or a directory from this host
+  review   Review what will be included, or remove one
+  done     Finished
+```
+
+**write** asks two questions and then opens an editor. First *when* it should run, then *what kind* it is:
+
+| Phase | When it runs | As whom |
 |---|---|---|
-| `System/` | First boot, before anyone logs on, ahead of the RD Gateway role install | SYSTEM |
-| `DefaultUser/` | First boot, with `C:\Users\Default\NTUSER.DAT` mounted | SYSTEM |
-| `FirstLogon/` | The first interactive logon | That user, elevated |
-| `UserOnce/` | Each new user's first logon | That user |
+| `System` | First boot, before anyone logs on, ahead of the RD Gateway role install | SYSTEM |
+| `DefaultUser` | First boot, with `C:\Users\Default\NTUSER.DAT` mounted | SYSTEM |
+| `FirstLogon` | The first interactive logon | That user, elevated |
+| `UserOnce` | Each new user's first logon | That user |
 
-`.ps1`, `.cmd`, `.bat` and `.reg` are recognised and anything else is ignored. Within a category they run in filename order, so name them `10-first.ps1`, `20-second.ps1`. If the directory has scripts but none of those subdirectories, it offers to treat them all as `System` scripts, which is almost always what was meant.
+| Kind | Extension | Run with |
+|---|---|---|
+| PowerShell | `.ps1` | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File` |
+| Batch | `.cmd` | `cmd.exe /c` |
+| Registry | `.reg` | `reg.exe import` |
+
+It suggests a filename numbered in tens (`10-script.ps1`, then `20-`, then `30-`) so there is room to slot something in between later, and opens `$VISUAL`, `$EDITOR`, `nano`, `vim` or `vi` — whichever it finds first — on a file already seeded with a header saying where the script will run and what will run it:
+
+```powershell
+# FirstLogon script for this RD Gateway build.
+#
+# Runs at:     the first interactive logon, elevated
+# Started as:  powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+#
+# Output and the exit code go to C:\Windows\Setup\Scripts\rdgw-setup.log.
+# A non-zero exit is logged and skipped rather than stopping the build, and
+# anything still running after fifteen minutes is killed.
+```
+
+Save with nothing added and it tells you so and throws the file away. If the box has no editor at all it falls back to reading the script off the terminal until you type `EOF` on a line by itself.
+
+**import** takes a file or a whole directory. A single file asks which phase it belongs to. A directory is read from subdirectories named for the phases, and if it has scripts but none of those subdirectories, it offers to treat them all as `System` scripts:
 
 ```
 /root/rdgw-scripts/
@@ -174,11 +206,17 @@ Say yes and it asks for a directory on the Proxmox host. Put your scripts in sub
   UserOnce/10-map-drives.ps1
 ```
 
+**review** lists everything staged so far and lets you drop one.
+
+Both routes end in the same place, so you can write one script by hand, import a directory of others, and ship them together. Within a phase they run in filename order. `.ps1`, `.cmd`, `.bat` and `.reg` are recognised; anything else is ignored.
+
 `System` runs before the gateway role is installed, so a script there can put something in place that the gateway then uses — importing a real certificate into `LocalMachine\My`, for instance, which saves you the self-signed one. A script that fails, or that runs longer than fifteen minutes, is logged and skipped rather than stopping the build; everything lands in the same `rdgw-setup.log`, prefixed `custom/<category>`.
 
-A `.reg` file in `DefaultUser/` is rewritten before import: `HKEY_CURRENT_USER` becomes the mounted hive, because there is no current user at that point. Write it as though you were the logged-on user and it will land in every profile created afterwards.
+A `.reg` file in `DefaultUser` is rewritten before import: `HKEY_CURRENT_USER` becomes the mounted hive, because there is no current user at that point. Write it as though you were the logged-on user and it will land in every profile created afterwards.
 
 One timing detail worth knowing. The answer file logs the new account on automatically, exactly once, and that profile is created from the Default User hive at roughly the same moment `Configure-Guest.ps1` is writing to it. `FirstLogon` catches that first automatic logon reliably because the answer file registers it during the specialize pass, ahead of any logon. `UserOnce` is registered in the Default User hive and may not reach that very first profile, so put anything the first account must have in `FirstLogon`.
+
+Nothing you add is run on the Proxmox host. It is copied to the unattend CD and runs inside the guest.
 
 ### What lands on the unattend CD
 

@@ -3,8 +3,9 @@
     Runs the scripts you supplied to windows-rdgw-vm.sh, one category at a time.
 
 .DESCRIPTION
-    windows-rdgw-vm.sh copies whatever you put in its custom-scripts directory
-    onto the unattend CD, and the specialize pass lands it here:
+    windows-rdgw-vm.sh copies whatever you added during the build - written in
+    its editor or imported from disk - onto the unattend CD, and the specialize
+    pass lands it here:
 
         C:\Windows\Setup\Scripts\custom\System\
         C:\Windows\Setup\Scripts\custom\DefaultUser\
