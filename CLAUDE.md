@@ -12,7 +12,7 @@ behind one public hostname, using stock RD clients.
 
 | File | Runs on | Status |
 |---|---|---|
-| `windows-rdgw-vm.sh` | Proxmox host, root | Dry-run verified. **Run for real once**, see below |
+| `windows-rdgw-vm.sh` | Proxmox host, root | **Run for real three times.** Boots and installs, see below |
 | `Setup-RDGateway.ps1` | The Windows guest, elevated | Written, parse/lint verified, **never run for real** |
 | `Configure-Guest.ps1` | The Windows guest, SYSTEM | Written, parse/lint verified, **never run for real** |
 | `Invoke-GatewaySetup.ps1` | The Windows guest, SYSTEM | Written, parse/lint verified, **never run for real** |
@@ -24,12 +24,22 @@ behind one public hostname, using stock RD clients.
 | `README.md` | — | Repo intro plus the full runbook |
 | `RELAY.md` | — | The optional relay: architecture, steps, caveats |
 
-The operator ran `windows-rdgw-vm.sh` on the real Proxmox host on 2026-09-19. The
-VM was built and started, and then stopped dead at the Windows DVD's "Press any
-key to boot from CD or DVD" prompt, which nobody was there to answer. That is
-fixed: `press_a_key` now answers it from the host with `qm sendkey`. Nothing
-past that point has been observed on real hardware, so everything under
-"Assumed, never executed" still stands.
+`windows-rdgw-vm.sh` has been run for real on the operator's Proxmox VE 9.2.20
+host three times, and the DVD boot prompt defeated the first two. On 2026-09-19
+nobody was there to answer it. On 2026-09-20 the script was there and still
+failed, twice, for two different reasons - a twenty-second window that closed
+before OVMF reached the DVD, and then a `qm monitor` call that hung forever on
+piped input and froze the script mid-loop. Both are in "Ruled out" and in the
+`press_a_key` convention below, because each one looked correct right up until
+it met hardware.
+
+The third run, watched live over the Proxmox console on 2026-09-20, worked:
+one keypress, answered at the right moment, and Windows Setup installed
+unattended. The lesson worth keeping is not any of the three bugs. It is that
+this repo was written for months against documentation, and the defect that
+actually mattered was invisible to `bash -n`, to shellcheck, to nine dry-run
+scenarios and to two adversarial review passes, because all of them stub `qm`.
+When something here is uncertain, get on the host and look.
 
 `windows-rdgw-vm.sh` offers two paths. The **shell-only** path is the original behaviour: a
 configured VM with both ISOs attached, Windows installed by hand. The **unattended** path
@@ -295,14 +305,18 @@ bug will surface.
   `Configure-Guest.ps1` is writing that hive, so `UserOnce` may miss the first account.
   `FirstLogon` is registered in specialize precisely so it cannot lose that race, and
   the README says to put anything the first account needs there.
-- **Nothing else about the unattended path has been executed.** The riskiest parts, in order:
-  the `/IMAGE/NAME` value must match the media exactly and differs on Evaluation ISOs; the
-  `$WinPEDriver$` scan is documented for Windows Server but has not been watched working
-  here; and the `RDGW-FirstBoot` scheduled task's reboot handoff is reasoned about rather
-  than observed. Each failure is visible and recoverable — Setup stops at a readable error,
-  and the task logs every step to `C:\Windows\Setup\Scripts
-dgw-setup.log` and stays
-  registered so a reboot retries — but none of it has met a real disk.
+- **The unattended path now boots and installs, watched on the real host on 2026-09-20.**
+  `press_a_key` answered the DVD prompt with exactly one keypress and stopped, Windows
+  Setup ran unattended with no wizard, and the install reached "Installing Windows Server"
+  with a progress bar. That single observation retires three of the four riskiest
+  assumptions at once, because Setup could not have got that far otherwise: the
+  `/IMAGE/NAME` value **did** match this retail/VL media, the `$WinPEDriver$` scan **did**
+  load `vioscsi` (or Setup would have stopped with no disks to install to), and the
+  `CreatePartition` layout **did** apply to a real disk. Do not re-list these as unverified.
+  What is still only reasoned about is everything after the last Setup reboot: the
+  `RDGW-FirstBoot` scheduled task's reboot handoff, and the four custom-script registration
+  points. Those failures stay visible and recoverable — the task logs every step to
+  `C:\Windows\Setup\Scripts\rdgw-setup.log` and stays registered so a reboot retries.
 - `DiskID 0` in the answer file assumes the VirtIO SCSI disk is the only disk. True for a VM
   this script builds; add a second disk before install and it stops being true.
 - **RDP-over-UDP through nginx stream is the least certain thing in the repo.** Note that
