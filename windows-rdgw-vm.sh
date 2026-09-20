@@ -1239,7 +1239,16 @@ generate_answer_file() {
                 <RunSynchronousCommand wcm:action="add">
                     <Order>2</Order>
                     <Description>Register the first-boot task</Description>
-                    <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Setup\Scripts\Invoke-GatewaySetup.ps1 -Register</Path>
+                    <!--
+                      -ScriptRoot is passed explicitly and is not decoration.
+                      The script defaults it to \$PSScriptRoot, and on a real
+                      Server 2025 build that came back empty; Join-Path then
+                      threw on the next line and the script died before
+                      registering the task or writing one word to the log.
+                      Three builds failed that way. Say it out loud here so
+                      nothing depends on that variable being populated.
+                    -->
+                    <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Setup\Scripts\Invoke-GatewaySetup.ps1 -Register -ScriptRoot C:\Windows\Setup\Scripts</Path>
                 </RunSynchronousCommand>${firstlogon_block}
             </RunSynchronous>
         </component>

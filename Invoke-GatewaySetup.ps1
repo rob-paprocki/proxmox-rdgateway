@@ -39,6 +39,26 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# $PSScriptRoot came back EMPTY on a real Windows Server 2025 build, and that
+# one empty string cost three failed builds. Join-Path throws on an empty
+# -Path, so the script died on the very next line - before the log existed,
+# before the task was registered, before it could say a single word about why.
+# From the outside it looked exactly like "the customizations silently didn't
+# apply": scripts present on disk, no task, no log, no clue.
+#
+# Observed, not theorised: running this by hand on that guest reproduced it,
+# and adding -ScriptRoot made the same command succeed immediately. Why the
+# variable is empty there is still unexplained - it is populated on Windows 11
+# PowerShell 5.1 for both absolute and relative -File, with LF or CRLF endings,
+# all of which were tested. So do not trust it. Take the first source that
+# actually yields something, and say so if we had to fall back.
+if ([string]::IsNullOrWhiteSpace($ScriptRoot)) {
+    $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
+}
+if ([string]::IsNullOrWhiteSpace($ScriptRoot)) {
+    $ScriptRoot = 'C:\Windows\Setup\Scripts'
+}
+
 $TaskName = 'RDGW-FirstBoot'
 $LogPath = Join-Path $ScriptRoot 'rdgw-setup.log'
 $StatePath = Join-Path $ScriptRoot 'rdgw-state.json'
@@ -48,12 +68,38 @@ $MaxBoots = 5
 # ------------------------------------------------------------------------------
 # Registration. Kept here so the schtasks arguments live next to the script they
 # launch rather than buried in the answer file.
+#
+# This runs once, from the answer file's specialize pass, and it used to be the
+# quietest code in the repo: it created the task, trusted schtasks, and exited.
+# When it failed there was nothing to find. It now writes to the same log as
+# everything else and, more importantly, reads the task back before claiming
+# success - because "schtasks said 0" and "the task exists" turned out not to
+# be the same question.
 # ------------------------------------------------------------------------------
 if ($Register) {
     $self = Join-Path $ScriptRoot 'Invoke-GatewaySetup.ps1'
-    $action = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$self`""
+    $action = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$self`" -ScriptRoot `"$ScriptRoot`""
+    $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+
+    "$stamp  [info] Registering '$TaskName' from $ScriptRoot" |
+        Tee-Object -FilePath $LogPath -Append | Write-Host
+
     & schtasks.exe /Create /TN $TaskName /SC ONSTART /RU SYSTEM /RL HIGHEST /F /TR $action
-    exit $LASTEXITCODE
+    $createRc = $LASTEXITCODE
+
+    & schtasks.exe /Query /TN $TaskName 2>&1 | Out-Null
+    $exists = ($LASTEXITCODE -eq 0)
+
+    $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    if ($exists) {
+        "$stamp  [info] '$TaskName' registered and read back - first boot will run it" |
+            Tee-Object -FilePath $LogPath -Append | Write-Host
+        exit 0
+    }
+
+    "$stamp  [error] '$TaskName' was NOT created (schtasks exit $createRc). Nothing will configure this machine. Run this by hand, elevated: powershell -NoProfile -ExecutionPolicy Bypass -File $self -Register" |
+        Tee-Object -FilePath $LogPath -Append | Write-Host
+    exit 1
 }
 
 # ------------------------------------------------------------------------------

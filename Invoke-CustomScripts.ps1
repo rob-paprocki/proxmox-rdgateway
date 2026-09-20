@@ -84,6 +84,17 @@ param(
 
 $ErrorActionPreference = 'Continue'
 
+# $PSScriptRoot came back empty on a real Server 2025 build. Join-Path throws on
+# an empty -Path, which would kill this script on the next line, before the log
+# exists - and "my script never ran, and nothing says why" is the exact failure
+# this file was written to make impossible. See CLAUDE.md.
+if ([string]::IsNullOrWhiteSpace($ScriptRoot)) {
+    $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
+}
+if ([string]::IsNullOrWhiteSpace($ScriptRoot)) {
+    $ScriptRoot = 'C:\Windows\Setup\Scripts'
+}
+
 $LogPath = Join-Path $ScriptRoot 'rdgw-setup.log'
 $script:LogWritable = $true
 

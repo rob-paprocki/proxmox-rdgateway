@@ -313,10 +313,25 @@ bug will surface.
   `/IMAGE/NAME` value **did** match this retail/VL media, the `$WinPEDriver$` scan **did**
   load `vioscsi` (or Setup would have stopped with no disks to install to), and the
   `CreatePartition` layout **did** apply to a real disk. Do not re-list these as unverified.
-  What is still only reasoned about is everything after the last Setup reboot: the
-  `RDGW-FirstBoot` scheduled task's reboot handoff, and the four custom-script registration
-  points. Those failures stay visible and recoverable — the task logs every step to
+  What happens after the last Setup reboot has now been watched too, and it did not work:
+  the `RDGW-FirstBoot` task was never registered, because of the `$PSScriptRoot` bug
+  above. Fixed, but **the fix has not yet been through a clean build** - the first-boot
+  chain (Configure-Guest, the role install, the four custom-script registration points)
+  therefore remains the one part of this repo never observed working end to end. When it
+  fails it stays visible and recoverable: the task logs every step to
   `C:\Windows\Setup\Scripts\rdgw-setup.log` and stays registered so a reboot retries.
+- **Edge's first-run experience is not suppressed anywhere.** The operator expected it to
+  be; nothing in any script has ever touched Edge. If it is wanted, the machine-wide
+  policy `HKLM\SOFTWARE\Policies\Microsoft\Edge\HideFirstRunExperience = 1` is the right
+  place, precisely because it does not depend on the Default User hive and so cannot lose
+  the race described below.
+- **The Default User hive cannot reach the auto-logon account.** Everything under
+  `ApplyTweaks` - taskbar left, dark theme, Explorer defaults, desktop icons - is written
+  into `C:\Users\Default\NTUSER.DAT` so that new profiles inherit it. `AutoLogon` creates
+  the first profile from that hive at roughly the same moment, and on the observed build
+  the profile won: `rdgadmin` came up with a centred taskbar and the light theme. So even
+  once the first-boot chain runs, expect these to miss the first account unless the
+  settings are also written into profiles that already exist.
 - `DiskID 0` in the answer file assumes the VirtIO SCSI disk is the only disk. True for a VM
   this script builds; add a second disk before install and it stops being true.
 - **RDP-over-UDP through nginx stream is the least certain thing in the repo.** Note that
@@ -387,6 +402,32 @@ bug will surface.
   setting took. That is what "I'm not really sure the customizations are being applied"
   looked like from their side. Verified empirically: with `2>&1` only the `Write-Output`
   line survives the pipe; `*>&1` carries all of it.
+- **Never let `$PSScriptRoot` be the only way a guest script finds itself.** On a real
+  Server 2025 build it came back **empty**, and that one empty string is what actually
+  broke three builds. `Join-Path` throws on an empty `-Path`, so
+  `Invoke-GatewaySetup.ps1 -Register` died on its next line: no scheduled task, no
+  `Configure-Guest.ps1`, no custom scripts, no RD Gateway role, and - because it died
+  before the log existed - not one word written down. From the console it looked
+  identical to "the customizations silently didn't apply", which is why it survived two
+  rounds of fixing the wrong thing. Observed directly: `schtasks /query /tn
+  rdgw-firstboot` returned "cannot find the path specified", `C:\Windows\Setup\Scripts`
+  held all six files but no `rdgw-setup.log`, running the command by hand reproduced
+  `Cannot bind argument to parameter 'Path' because it is an empty string`, and adding
+  `-ScriptRoot` made that same command print `SUCCESS: The scheduled task
+  "RDGW-FirstBoot" has successfully been created`. Windows Setup's own
+  `Panther\UnattendGC\setupact.log` confirms both RunSynchronous commands were found and
+  processed, so the answer file was never at fault. **Why** the variable is empty there is
+  still unexplained: it is populated on Windows 11 PowerShell 5.1 for absolute and
+  relative `-File`, with LF and CRLF endings, all tested. Do not spend a session trying to
+  reproduce it - just never depend on it. Every guest script now falls back to
+  `Split-Path -Parent $MyInvocation.MyCommand.Definition` and then to a literal
+  `C:\Windows\Setup\Scripts`, the answer file passes `-ScriptRoot` explicitly, and
+  **no param default may call `Join-Path`** - a default that throws kills the script
+  during parameter binding, before its first statement, where no catch can help.
+- **Registration must read the task back.** `-Register` used to create the task, trust
+  `schtasks`, and exit silently. It now logs before and after and re-queries the task,
+  because "schtasks exited 0" and "the task exists" are different questions, and the
+  answer to the second one is what the whole build depends on.
 - **Silence is not an acceptable answer to "did my script run".**
   `Invoke-CustomScripts.ps1` used to `exit 0` without logging when a category directory
   was missing or matched no files, which is indistinguishable from never being called.

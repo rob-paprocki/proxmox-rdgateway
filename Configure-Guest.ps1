@@ -32,11 +32,36 @@
 
 [CmdletBinding()]
 param(
-    [string] $ConfigPath = (Join-Path $PSScriptRoot 'rdgw-config.psd1'),
-    [string] $LogPath = (Join-Path $PSScriptRoot 'rdgw-setup.log')
+    [string] $ConfigPath = '',
+    [string] $LogPath = ''
 )
 
 $ErrorActionPreference = 'Continue'
+
+# These two defaults used to be (Join-Path $PSScriptRoot '...'), evaluated
+# inside the param block. On a real Server 2025 build $PSScriptRoot came back
+# empty, and Join-Path throws on an empty -Path - from inside a param default,
+# which means the script dies during parameter binding, before its first
+# statement, before the log it is holding the path to. There is no catch that
+# helps and nothing is written down. See CLAUDE.md.
+#
+# Resolving in the body instead means the worst case is a wrong path we can
+# report, not a script that vanishes.
+if ([string]::IsNullOrWhiteSpace($script:Root)) {
+    $script:Root = $PSScriptRoot
+}
+if ([string]::IsNullOrWhiteSpace($script:Root)) {
+    $script:Root = Split-Path -Parent $MyInvocation.MyCommand.Definition
+}
+if ([string]::IsNullOrWhiteSpace($script:Root)) {
+    $script:Root = 'C:\Windows\Setup\Scripts'
+}
+if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+    $ConfigPath = Join-Path $script:Root 'rdgw-config.psd1'
+}
+if ([string]::IsNullOrWhiteSpace($LogPath)) {
+    $LogPath = Join-Path $script:Root 'rdgw-setup.log'
+}
 
 $script:LogPath = $LogPath
 $script:LogWritable = $true
@@ -283,7 +308,7 @@ if (-not $loaded) {
     # created afterwards. The UserOnce registration goes in for the same
     # reason: a RunOnce value in this hive is inherited by each new profile and
     # fires at that user's first logon, then deletes itself.
-    $runner = Join-Path $PSScriptRoot 'Invoke-CustomScripts.ps1'
+    $runner = Join-Path $script:Root 'Invoke-CustomScripts.ps1'
     if (Test-Path -LiteralPath $runner) {
         try {
             & $runner -Category DefaultUser -HiveRoot $mountPoint
@@ -291,7 +316,7 @@ if (-not $loaded) {
             Write-Bad "Custom DefaultUser scripts failed: $($_.Exception.Message)"
         }
 
-        $userOnceDir = Join-Path $PSScriptRoot 'custom\UserOnce'
+        $userOnceDir = Join-Path $script:Root 'custom\UserOnce'
         $userOnceCount = 0
         if (Test-Path -LiteralPath $userOnceDir) {
             $userOnceCount = @(Get-ChildItem -LiteralPath $userOnceDir -File -ErrorAction SilentlyContinue).Count
