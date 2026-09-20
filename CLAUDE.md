@@ -157,6 +157,29 @@ same counters under `blockstat:` as one indented stanza per device (`ide0:`, `id
 `efidisk0:`, each with `rd_bytes:`). Every call still goes through `timeout`, because
 nothing in that loop may be allowed to block forever again.
 
+**XML comments anywhere below `<component>` in the answer file.** They are legal XML,
+`xmllint --noout` is perfectly happy, every dry-run scenario passes, and Windows fails
+the entire pass. Observed: a comment placed between `<Description>` and `<Path>` inside a
+`<RunSynchronousCommand>` produced, twenty minutes into a real install,
+
+```
+UnattendDumpSetting: Error code = 0x80220005
+UnattendDumpSetting: Pass = specialize
+UnattendErrorFromResults: Windows could not parse or process unattend answer file
+This installation is blocked from completing due to compliance failures or invalid input
+```
+
+and on screen only "The computer restarted unexpectedly or encountered an unexpected
+error." The same log also carried `CApplyDrivers::CopyToDriverStore ... 0x80070002` and a
+dozen `BFSVC: BfspCopyFile` failures, both of which are **red herrings** - the ESP was
+fully populated and the driver payload complete. Do not chase them. Comments at the
+document root, inside `<settings>` and as direct children of `<component>` are fine and
+have shipped since before the first successful build; it is nesting them deeper that
+breaks. `build_unattend_iso` now refuses to ship a file with any, via
+`xmllint --xpath 'count(//*[local-name()="component"]/*//comment())'`, and that guard is
+regression-tested against the exact file that failed. Keep prose about the answer file in
+`windows-rdgw-vm.sh`, where it costs nothing.
+
 **WARP / Cloudflare One client, Tailscale, any client-side agent.** Violates the
 no-install-on-clients constraint.
 

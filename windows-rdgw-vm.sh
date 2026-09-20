@@ -1103,6 +1103,21 @@ generate_answer_file() {
             </ProductKey>"
   fi
 
+  # Order 2 passes -ScriptRoot explicitly, and that is not decoration: the
+  # script defaults it to $PSScriptRoot, which came back EMPTY on a real
+  # Server 2025 build, so Join-Path threw and the script died before
+  # registering the task or writing one word to the log.
+  #
+  # That explanation used to live in an XML comment next to the <Path> element
+  # it describes. It cost a whole build. Windows accepts comments at the
+  # document root, inside <settings> and inside <component>, but a comment
+  # inside <RunSynchronousCommand> makes the specialize pass fail outright:
+  # "Windows could not parse or process unattend answer file", error
+  # 0x80220005, and Setup stops at "The computer restarted unexpectedly".
+  # The file is still well-formed XML, so xmllint is happy and only a real
+  # install finds it. Keep prose about the answer file in this script, where
+  # it costs nothing, and emit no comments below <component>.
+  #
   # The cosmetic shell settings get applied twice, and the second time is this
   # one. Configure-Guest.ps1 writes them into the Default User hive so later
   # profiles inherit them, but the AutoLogon account's profile is copied out of
@@ -1258,15 +1273,6 @@ generate_answer_file() {
                 <RunSynchronousCommand wcm:action="add">
                     <Order>2</Order>
                     <Description>Register the first-boot task</Description>
-                    <!--
-                      -ScriptRoot is passed explicitly and is not decoration.
-                      The script defaults it to \$PSScriptRoot, and on a real
-                      Server 2025 build that came back empty; Join-Path then
-                      threw on the next line and the script died before
-                      registering the task or writing one word to the log.
-                      Three builds failed that way. Say it out loud here so
-                      nothing depends on that variable being populated.
-                    -->
                     <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Setup\Scripts\Invoke-GatewaySetup.ps1 -Register -ScriptRoot C:\Windows\Setup\Scripts</Path>
                 </RunSynchronousCommand>${shell_block}${firstlogon_block}
             </RunSynchronous>
@@ -1382,7 +1388,23 @@ build_unattend_iso() {
       msg_error "the account name, password, hostname or time zone."
       exit 1
     fi
-    msg_ok "Answer file written and well-formed"
+
+    # Well-formed is not the same as acceptable. A comment inside
+    # <RunSynchronousCommand> parses fine here and then makes Windows fail the
+    # whole specialize pass with 0x80220005, twenty minutes into an install,
+    # at a dialog that says only "The computer restarted unexpectedly". That
+    # cost a build. Comments are fine at the root, in <settings> and in
+    # <component>; below that, refuse to ship one.
+    local deep_comments
+    deep_comments="$(xmllint --xpath \
+      'count(//*[local-name()="component"]/*//comment())' \
+      "${stage}/autounattend.xml" 2>/dev/null || echo 0)"
+    if [[ "$deep_comments" != "0" ]]; then
+      msg_error "The answer file has ${deep_comments} XML comment(s) nested below <component>."
+      msg_error "Windows rejects the whole pass for this. Move the prose into this script."
+      exit 1
+    fi
+    msg_ok "Answer file written, well-formed, no comments Windows will choke on"
   else
     msg_ok "Answer file written"
   fi
