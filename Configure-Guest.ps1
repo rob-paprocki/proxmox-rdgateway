@@ -289,6 +289,31 @@ if (-not $loaded) {
     Set-Reg $iconKey '{645FF040-5081-101B-9F08-00AA002F954E}' 0
     Set-Reg $iconKey '{59031a47-3f72-44a7-89c5-5595fe6b30ee}' 0
 
+    # Anything you supplied for the DefaultUser category runs here, while the
+    # hive is still mounted, so what it writes is inherited by every profile
+    # created afterwards. The UserOnce registration goes in for the same
+    # reason: a RunOnce value in this hive is inherited by each new profile and
+    # fires at that user's first logon, then deletes itself.
+    $runner = Join-Path $PSScriptRoot 'Invoke-CustomScripts.ps1'
+    if (Test-Path -LiteralPath $runner) {
+        try {
+            & $runner -Category DefaultUser -HiveRoot $mountPoint
+        } catch {
+            Write-Bad "Custom DefaultUser scripts failed: $($_.Exception.Message)"
+        }
+
+        $userOnceDir = Join-Path $PSScriptRoot 'custom\UserOnce'
+        $userOnceCount = 0
+        if (Test-Path -LiteralPath $userOnceDir) {
+            $userOnceCount = @(Get-ChildItem -LiteralPath $userOnceDir -File -ErrorAction SilentlyContinue).Count
+        }
+        if ($userOnceCount -gt 0) {
+            $cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Category UserOnce' -f $runner
+            Set-Reg "$u\Software\Microsoft\Windows\CurrentVersion\RunOnce" 'RDGWUserOnce' $cmd 'String'
+            Write-Good "UserOnce scripts ($userOnceCount) registered for every new profile"
+        }
+    }
+
     [gc]::Collect()
     & reg.exe unload $mountPoint 2>&1 | Out-Null
     if ($LASTEXITCODE -eq 0) {

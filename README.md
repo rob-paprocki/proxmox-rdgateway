@@ -9,6 +9,7 @@ the wizard twice and without guessing at the WMI calls.
 | [`Setup-RDGateway.ps1`](Setup-RDGateway.ps1) | Inside the guest, elevated | Installs the RDS-Gateway role, binds a certificate, writes the CAP and RAP, opens the firewall |
 | [`Configure-Guest.ps1`](Configure-Guest.ps1) | Inside the guest, as SYSTEM | Applies the security and housekeeping answers given during the build |
 | [`Invoke-GatewaySetup.ps1`](Invoke-GatewaySetup.ps1) | Inside the guest, as SYSTEM | First-boot orchestrator — survives the role-install reboot and runs the two above |
+| [`Invoke-CustomScripts.ps1`](Invoke-CustomScripts.ps1) | Inside the guest | Runs scripts of your own, in the four categories, at the right moment |
 | [`vps-relay-setup.sh`](vps-relay-setup.sh) | A small public VPS | *Optional.* Layer 4 front door so nothing has to be open at home |
 | [`proxmox-relay-peer.sh`](proxmox-relay-peer.sh) | Proxmox host, as root | *Optional.* Home end of that relay — outbound WireGuard, forwarding, NAT |
 
@@ -108,7 +109,7 @@ The one-liner at the top works for both paths:
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/main/windows-rdgw-vm.sh)"
 ```
 
-The unattended path needs three more files — `Setup-RDGateway.ps1`, `Configure-Guest.ps1` and `Invoke-GatewaySetup.ps1` — to put on the ISO it builds. Local copies always win. From a checkout nothing is downloaded and your edits are used. Only when they aren't sitting next to the script does it fetch them, and then it prints every URL before touching the network.
+The unattended path needs four more files — `Setup-RDGateway.ps1`, `Configure-Guest.ps1`, `Invoke-GatewaySetup.ps1` and `Invoke-CustomScripts.ps1` — to put on the ISO it builds. Local copies always win. From a checkout nothing is downloaded and your edits are used. Only when they aren't sitting next to the script does it fetch them, and then it prints every URL before touching the network.
 
 Those three are copied to the unattend CD and run *inside the guest*. They are never executed on the Proxmox host.
 
@@ -130,7 +131,7 @@ Say yes to "unattended install" and it asks the following. Nothing here has a sa
 | Password | — | Asked twice. Leave it empty for a blank password; it will confirm that you meant it. |
 | External FQDN | `rdg.example.com` | Passed straight to `Setup-RDGateway.ps1 -ExternalFqdn`. |
 | Windows time zone ID | `Eastern Standard Time` | The Windows name, not the IANA one. `tzutil /l` lists them. |
-| Target machines | *(empty)* | Space separated. Empty scopes the RAP to this server only. |
+| What clients may reach | Any machine the gateway can reach | Three options. "Only machines I name" then asks for a space separated list. See [what the two policies mean](#what-the-two-policies-mean). |
 | Edition | Standard (Desktop Experience) | Picks the image name **and** the matching GVLK together so they can't drift apart. There are Evaluation entries, which correctly send no key at all. |
 | Lockout threshold | `10` | `0` disables lockout entirely. |
 | Lockout window | `15` minutes | Used for both the window and the duration. |
@@ -139,6 +140,7 @@ Say yes to "unattended install" and it asks the following. Nothing here has a sa
 | Disable Core Isolation | no | |
 | Require Ctrl+Alt+Del | no | The one that defaults to the *less* strict answer, because sending Ctrl+Alt+Del to a Proxmox console is a menu trip rather than a keystroke. |
 | Housekeeping settings | yes | 8.3 names off, fast startup off, long paths on, WPBT off, no Windows Update auto-reboot, system sounds off, NumLock on, and Explorer/taskbar/theme defaults suited to RDP. |
+| Custom scripts | no | Scripts of your own, in the four categories below. |
 
 The four security toggles all default to leaving Windows exactly as it ships. They exist because the operator asked for them; each prompt states what it costs, and then does what you picked without arguing further.
 
@@ -151,14 +153,42 @@ dism /Get-WimInfo /WimFile:<mount>\sources\install.wim
 
 A retail or volume-licence ISO reports `Windows Server 2025 Standard (Desktop Experience)`. The free Evaluation ISO reports `Windows Server 2025 Standard Evaluation (Desktop Experience)`, and a GVLK cannot activate it — evaluation has to be converted with `DISM /online /Set-Edition` first. Pick the matching entry from the menu, or the "type the image name myself" option.
 
+### Custom scripts
+
+Say yes and it asks for a directory on the Proxmox host. Put your scripts in subdirectories named for when you want them to run. The names and the timing are the ones the [schneegans.de generator](https://schneegans.de/windows/unattend-generator/) uses, since that is the vocabulary most people arrive with:
+
+| Subdirectory | When it runs | As whom |
+|---|---|---|
+| `System/` | First boot, before anyone logs on, ahead of the RD Gateway role install | SYSTEM |
+| `DefaultUser/` | First boot, with `C:\Users\Default\NTUSER.DAT` mounted | SYSTEM |
+| `FirstLogon/` | The first interactive logon | That user, elevated |
+| `UserOnce/` | Each new user's first logon | That user |
+
+`.ps1`, `.cmd`, `.bat` and `.reg` are recognised and anything else is ignored. Within a category they run in filename order, so name them `10-first.ps1`, `20-second.ps1`. If the directory has scripts but none of those subdirectories, it offers to treat them all as `System` scripts, which is almost always what was meant.
+
+```
+/root/rdgw-scripts/
+  System/10-import-cert.ps1
+  System/20-install-tools.cmd
+  DefaultUser/10-explorer.reg
+  UserOnce/10-map-drives.ps1
+```
+
+`System` runs before the gateway role is installed, so a script there can put something in place that the gateway then uses — importing a real certificate into `LocalMachine\My`, for instance, which saves you the self-signed one. A script that fails, or that runs longer than fifteen minutes, is logged and skipped rather than stopping the build; everything lands in the same `rdgw-setup.log`, prefixed `custom/<category>`.
+
+A `.reg` file in `DefaultUser/` is rewritten before import: `HKEY_CURRENT_USER` becomes the mounted hive, because there is no current user at that point. Write it as though you were the logged-on user and it will land in every profile created afterwards.
+
+One timing detail worth knowing. The answer file logs the new account on automatically, exactly once, and that profile is created from the Default User hive at roughly the same moment `Configure-Guest.ps1` is writing to it. `FirstLogon` catches that first automatic logon reliably because the answer file registers it during the specialize pass, ahead of any logon. `UserOnce` is registered in the Default User hive and may not reach that very first profile, so put anything the first account must have in `FirstLogon`.
+
 ### What lands on the unattend CD
 
-Four things, and `DRY_RUN=1` prints the generated answer file in full so you can read it before anything is written:
+Five things, and `DRY_RUN=1` prints the generated answer file in full so you can read it before anything is written:
 
 - `autounattend.xml` — Windows Setup finds this by itself. It scans the root of every removable drive looking for exactly that filename, so no boot-order change is needed.
 - `$WinPEDriver$\` — `vioscsi`, `viostor` and `NetKVM` from `2k25\amd64`. Windows Server scans every drive letter from C upward for a directory with this name during the windowsPE pass and stages every INF underneath it. That is what removes the **Load driver** step.
 - `rdgw\*.ps1` — copied to `C:\Windows\Setup\Scripts` during the specialize pass.
 - `rdgw\rdgw-config.psd1` — every answer you gave, as plain data.
+- `rdgw\custom\` — your own scripts, if you supplied any. Carried across by the same copy step, so no extra answer-file command is needed to place them.
 
 [`sample-autounattend.xml`](sample-autounattend.xml) is a committed copy of what a default run produces, so the shape is reviewable without running anything.
 
@@ -172,11 +202,12 @@ The CD is attached on `sata0` — q35 gives you only `ide0` and `ide2`, and both
 
 Nothing to do. It is here so you know what is happening and where to look if it stalls.
 
-1. Windows Setup boots from the DVD, finds `autounattend.xml` on the unattend CD, and stages the VirtIO drivers from `$WinPEDriver$`.
-2. It wipes disk 0 — the only disk this VM has — and partitions it EFI 300 MiB, MSR 16 MiB, then NTFS for the rest. There is deliberately no explicit recovery partition: Windows creates the WinRE partition itself on an NTFS boot volume by shrinking the OS volume on first boot.
-3. It installs the edition you chose.
-4. The specialize pass copies the scripts to `C:\Windows\Setup\Scripts` and registers a startup task called `RDGW-FirstBoot`.
-5. That task applies your answers, installs the RD Gateway role, reboots if Windows asks for one, then runs `Setup-RDGateway.ps1` and checks that the `TSGateway` service came up.
+1. The script answers the DVD's "Press any key to boot from CD or DVD" prompt from the host with `qm sendkey`, repeatedly for the first minute after `qm start`. See [the boot prompt](#the-boot-prompt) for why it is done this way and not by rebuilding the ISO.
+2. Windows Setup finds `autounattend.xml` on the unattend CD and stages the VirtIO drivers from `$WinPEDriver$`.
+3. It wipes disk 0 — the only disk this VM has — and partitions it EFI 300 MiB, MSR 16 MiB, then NTFS for the rest. There is deliberately no explicit recovery partition: Windows creates the WinRE partition itself on an NTFS boot volume by shrinking the OS volume on first boot.
+4. It installs the edition you chose.
+5. The specialize pass copies the scripts to `C:\Windows\Setup\Scripts` and registers a startup task called `RDGW-FirstBoot`.
+6. That task applies your answers, runs any `System` scripts of yours, installs the RD Gateway role, reboots if Windows asks for one, then runs `Setup-RDGateway.ps1` and checks that the `TSGateway` service came up.
 
 Expect two or three reboots and roughly twenty to forty minutes. Everything is timestamped in:
 
@@ -190,11 +221,25 @@ That role-install reboot is why `Invoke-GatewaySetup.ps1` exists. `Setup-RDGatew
 
 Then skip to Phase 4. Phase 3 lists what the automated path already did.
 
+### The boot prompt
+
+The Windows DVD's EFI loader prints "Press any key to boot from CD or DVD" and gives up after about five seconds. On an unattended build nobody is there to answer it, the firmware falls through to an empty disk, and the VM stops at the UEFI shell. That is the first thing that will go wrong if you build this by hand.
+
+The prompt has to stay, though. Setup reboots two or three times before it finishes, the DVD is still first in the boot order each time, and the prompt timing out is exactly what lets those reboots fall through to the disk instead of restarting the install. Rebuilding the media around `efisys_noprompt.bin` — which does ship on the ISO, next to `efisys.bin` — would fix the first boot and buy an endless reinstall loop in exchange.
+
+So the prompt stays and the host answers it once, with [`qm sendkey`](https://pve.proxmox.com/pve-docs/qm.1.html):
+
+```bash
+qm sendkey 9000 ret
+```
+
+The script sends that every two seconds for the first sixty, which covers OVMF's startup plus the prompt's own window without having to guess when it appears. Enter is not bound to anything in the OVMF splash, and Setup is driven by the answer file, so a key that arrives early or late does nothing. Set `BOOT_KEY_SECONDS` to change how long it keeps trying.
+
 ### If you chose the shell-only path
 
 Open the console from the Proxmox web UI. Two things trip people up:
 
-**Press a key fast.** "Press any key to boot from CD or DVD" times out in about five seconds. Miss it and you land in the UEFI shell — type `exit`, choose Boot Manager, pick the DVD drive.
+**The boot prompt is already answered.** If you let the script start the VM, it has been pressing Enter for you. If you started it yourself and missed the five second window, you land in the UEFI shell: type `exit`, choose Boot Manager, pick the DVD drive.
 
 **Windows Setup will show you no disks.** That is expected, not a failure. Windows has no idea what a VirtIO SCSI controller is. Click **Load driver** → **Browse** → the second CD drive → `vioscsi\2k25\amd64` → Next. Your 80 GiB disk appears. While you're in there, load `NetKVM\2k25\amd64` too so the NIC works on first boot.
 
@@ -285,7 +330,9 @@ List the machines you want to reach and the script builds the policy around them
 
 The gateway box itself is always included, so you keep a way in even when the machine you were actually after is powered off. For each name you give it, the script also resolves and adds the FQDN and IP, because the RAP matches on the exact string the client asks for — and it warns you about anything that didn't resolve, since the gateway has to resolve the target again at connect time or you get event 301.
 
-Three scopes are available. `-TargetMachines` selects `Listed` automatically. `ThisServerOnly` is the default with no targets given. `AnyResource` skips the list entirely and permits anything the gateway can reach — convenient, but a leaked credential then opens your whole LAN rather than a chosen handful, so prefer the list.
+Three scopes are available, and the unattended build asks which one you want. `AnyResource` skips the list entirely and permits anything the gateway can reach; it is what the unattended path offers first, because it is what most people mean by "a gateway for my LAN". `Listed` is this server plus the machines you name, and `-TargetMachines` selects it automatically. `ThisServerOnly` is the default when you run `Setup-RDGateway.ps1` by hand with no arguments.
+
+`AnyResource` is a jump host: a credential that passes the CAP reaches your whole LAN rather than a chosen handful. Nothing about it bypasses the far end, though. Each target still has to have Remote Desktop switched on, your account in its own local Remote Desktop Users group, and its firewall permitting 3389 from the gateway. The RAP decides where you may tunnel, not what you may log into.
 
 To restrict by user instead, create a dedicated local group and pass it in:
 

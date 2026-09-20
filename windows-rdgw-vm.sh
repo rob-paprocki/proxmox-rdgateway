@@ -23,15 +23,26 @@
 #      DRY_RUN=1 bash windows-rdgw-vm.sh     # print every command, run nothing
 #                                            # and echo the generated answer file
 #
+#  Environment overrides:
+#
+#      REPO_REF           branch or tag to fetch the PowerShell files from
+#      REPO_RAW           a different raw URL prefix entirely, e.g. a fork
+#      BOOT_KEY_SECONDS   how long to keep answering the DVD's "press any key
+#                         to boot" prompt after the VM starts (default 60)
+#
 #  What it touches on the network:
 #
 #    - the VirtIO driver ISO, only if you have none and ask it to download one
-#    - Setup-RDGateway.ps1, Configure-Guest.ps1 and Invoke-GatewaySetup.ps1,
-#      only on the unattended path and only when they are not already sitting
-#      next to this script. Local copies always win, so from a checkout nothing
-#      is fetched. Those three are copied to the unattend ISO and run inside
-#      the guest — they are never executed on the Proxmox host. Every URL is
-#      printed before it is fetched, and REPO_REF pins the branch or tag.
+#    - Setup-RDGateway.ps1, Configure-Guest.ps1, Invoke-GatewaySetup.ps1 and
+#      Invoke-CustomScripts.ps1, only on the unattended path and only when they
+#      are not already sitting next to this script. Local copies always win, so
+#      from a checkout nothing is fetched. Those four are copied to the unattend
+#      ISO and run inside the guest — they are never executed on the Proxmox
+#      host. Every URL is printed before it is fetched, and REPO_REF pins the
+#      branch or tag.
+#
+#  Scripts of your own, if you supply any, are read from a directory you name
+#  and copied to that same ISO. They are never run here either.
 #
 #  Nothing else leaves the machine. Read every line before you run it.
 #
@@ -62,14 +73,29 @@ else
 fi
 unset _src
 
-# The unattend ISO carries three PowerShell files. Running from a checkout they
+# The unattend ISO carries four PowerShell files. Running from a checkout they
 # are already next to this script; running from the one-liner they have to be
 # fetched. Pin a different ref or point somewhere else entirely with:
 #   REPO_REF=some-branch bash -c "$(curl -fsSL .../windows-rdgw-vm.sh)"
 REPO_REF="${REPO_REF:-main}"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/${REPO_REF}}"
-SUPPORT_FILES=(Setup-RDGateway.ps1 Configure-Guest.ps1 Invoke-GatewaySetup.ps1)
+SUPPORT_FILES=(Setup-RDGateway.ps1 Configure-Guest.ps1 Invoke-GatewaySetup.ps1 Invoke-CustomScripts.ps1)
 SUPPORT_DIR=""
+
+# How long to keep answering the Windows DVD's "press any key to boot" prompt
+# after the VM starts. See press_a_key for why that is necessary.
+BOOT_KEY_SECONDS="${BOOT_KEY_SECONDS:-60}"
+
+# Scripts of your own, in the four categories the schneegans.de generator uses.
+# Empty unless pick_custom_scripts finds some.
+CUSTOM_CATEGORIES=(System DefaultUser FirstLogon UserOnce)
+CUSTOM_SCRIPT_DIR=""
+CUSTOM_LOOSE_AS_SYSTEM="no"
+
+# Answered by pick_resource_scope. Initialised here so the most restrictive
+# setting is the one a future reordering would fall back to, never the widest.
+RESOURCE_SCOPE="ThisServerOnly"
+TARGET_MACHINES=""
 
 # Set while an unattend ISO is being built, so the exit trap can clean up a
 # loop mount, a staging directory or a download directory if something fails
@@ -354,6 +380,146 @@ ask_password() {
   done
 }
 
+# Which machines the gateway will proxy connections to. This is the resource
+# side of the policy pair: the CAP decides who gets through the gateway at all,
+# and this decides what they may reach once they are.
+#
+# Setup-RDGateway.ps1 turns AnyResource into a RAP with ResourceGroupType 'ALL'
+# and the other two into a named resource group holding an explicit list.
+pick_resource_scope() {
+  local choice
+  choice="$(whiptail --backtitle "$APP" --title "What clients may reach" --radiolist \
+    "Once someone is through the gateway, what should they be allowed to reach?\n\nEvery target still needs Remote Desktop switched on and your account in its own local Remote Desktop Users group. The gateway decides where you may tunnel, not what you may log into." 17 78 3 \
+    "any"    "Any machine the gateway can reach"       ON  \
+    "listed" "Only machines I name, plus the gateway"  OFF \
+    "self"   "Only the gateway itself"                 OFF 3>&1 1>&2 2>&3)" || exit_script
+
+  TARGET_MACHINES=""
+  case "$choice" in
+    any)
+      RESOURCE_SCOPE="AnyResource"
+      whiptail --backtitle "$APP" --title "Any machine" --msgbox \
+        "Anything this server can route to is reachable through it.\n\nThat is a jump host: a credential that passes the connection policy reaches your whole LAN rather than a chosen list. Windows Firewall on each target is still in the way, and each target still controls its own Remote Desktop Users group." 14 72
+      ;;
+    listed)
+      RESOURCE_SCOPE="Listed"
+      ask "Machines to allow (space separated names or IPs)" ""
+      TARGET_MACHINES="$ASK_RESULT"
+      ;;
+    self)
+      RESOURCE_SCOPE="ThisServerOnly"
+      ;;
+  esac
+}
+
+# Count the script files directly inside a directory. Anything we cannot hand
+# to a documented Windows interpreter is ignored rather than silently copied.
+count_scripts() {
+  local d="$1" n=0 f
+  if [[ -d "$d" ]]; then
+    for f in "$d"/*.ps1 "$d"/*.cmd "$d"/*.bat "$d"/*.reg; do
+      [[ -f "$f" ]] && n=$((n + 1))
+    done
+  fi
+  printf "%s" "$n"
+}
+
+# Scripts of your own, run on the new machine at four different moments. The
+# names and the timing come from the schneegans.de unattend generator, because
+# that is the vocabulary most people arrive with:
+#
+#   System       as SYSTEM on the first boot, before anyone logs on
+#   DefaultUser  as SYSTEM with C:\Users\Default\NTUSER.DAT mounted, so what
+#                you write lands in every profile created afterwards
+#   FirstLogon   at the first interactive logon, elevated
+#   UserOnce     at each new user's first logon, in that user's own context
+#
+# They are read from subdirectories of one directory on this host, which keeps
+# whiptail out of the business of editing script bodies and works the same way
+# whether this script came from a checkout or from the one-liner.
+pick_custom_scripts() {
+  local dir cat n total loose found
+
+  whiptail --backtitle "$APP" --title "Custom scripts" --yesno \
+    "Run scripts of your own on the new machine?\n\nThey are read from subdirectories of a directory on this host:\n\n  System/       as SYSTEM, before anyone logs on\n  DefaultUser/  as SYSTEM, Default User hive mounted\n  FirstLogon/   first interactive logon, elevated\n  UserOnce/     each new user's first logon\n\n.ps1, .cmd, .bat and .reg are recognised." 20 74 --defaultno || return 0
+
+  while true; do
+    ask "Directory holding those subdirectories" "/root/rdgw-scripts"
+    dir="${ASK_RESULT%/}"
+
+    if [[ ! -d "$dir" ]]; then
+      whiptail --backtitle "$APP" --title "Not found" --yesno \
+        "${dir} is not a directory.\n\nTry a different path?" 10 66 && continue
+      return 0
+    fi
+
+    found=""
+    total=0
+    for cat in "${CUSTOM_CATEGORIES[@]}"; do
+      n="$(count_scripts "${dir}/${cat}")"
+      if [[ "$n" -gt 0 ]]; then
+        found+="  ${cat}: ${n}\n"
+        total=$((total + n))
+      fi
+    done
+
+    # Scripts sitting loose in the directory with no category subdirectory at
+    # all almost always mean "just run these", so offer the obvious reading
+    # rather than reporting nothing found.
+    if [[ "$total" -eq 0 ]]; then
+      loose="$(count_scripts "$dir")"
+      if [[ "$loose" -gt 0 ]]; then
+        if whiptail --backtitle "$APP" --title "No category subdirectories" --yesno \
+            "${dir} holds ${loose} script(s) but none of the ${CUSTOM_CATEGORIES[*]} subdirectories.\n\nTreat them as System scripts?" 12 72; then
+          CUSTOM_LOOSE_AS_SYSTEM="yes"
+          found="  System: ${loose}\n"
+          total="$loose"
+        fi
+      fi
+    fi
+
+    if [[ "$total" -eq 0 ]]; then
+      whiptail --backtitle "$APP" --title "Nothing to run" --yesno \
+        "No .ps1, .cmd, .bat or .reg files under ${dir}.\n\nTry a different path?" 10 70 && continue
+      return 0
+    fi
+
+    CUSTOM_SCRIPT_DIR="$dir"
+    whiptail --backtitle "$APP" --title "Custom scripts" --msgbox \
+      "Found ${total} script(s):\n\n$(printf "%b" "$found")\nWithin a category they run in filename order, so 10-first.ps1 runs before 20-second.ps1.\n\nA script that fails is logged and the build carries on." 16 72
+    return 0
+  done
+}
+
+# Copy the chosen scripts into the staging tree. They go under rdgw/ so the
+# existing specialize xcopy carries them across with everything else; no extra
+# answer-file command is needed to place them.
+stage_custom_scripts() {
+  local stage="$1" cat src dst f staged=0
+
+  [[ -n "$CUSTOM_SCRIPT_DIR" ]] || return 0
+
+  msg_info "Staging custom scripts"
+  for cat in "${CUSTOM_CATEGORIES[@]}"; do
+    if [[ "$CUSTOM_LOOSE_AS_SYSTEM" == "yes" ]]; then
+      [[ "$cat" == "System" ]] || continue
+      src="$CUSTOM_SCRIPT_DIR"
+    else
+      src="${CUSTOM_SCRIPT_DIR}/${cat}"
+    fi
+    [[ -d "$src" ]] || continue
+
+    dst="${stage}/rdgw/custom/${cat}"
+    for f in "$src"/*.ps1 "$src"/*.cmd "$src"/*.bat "$src"/*.reg; do
+      [[ -f "$f" ]] || continue
+      run mkdir -p "$dst"
+      run cp "$f" "${dst}/"
+      staged=$((staged + 1))
+    done
+  done
+  msg_ok "Custom scripts staged (${staged})"
+}
+
 unattend_settings() {
   ask "Local administrator account name" "rdgadmin"
   ADMIN_USER="$ASK_RESULT"
@@ -368,8 +534,7 @@ unattend_settings() {
   ask "Windows time zone ID" "Eastern Standard Time"
   WIN_TIMEZONE="$ASK_RESULT"
 
-  ask "Target machines to reach (space separated, blank for this server only)" ""
-  TARGET_MACHINES="$ASK_RESULT"
+  pick_resource_scope
 
   pick_edition
 
@@ -406,6 +571,8 @@ unattend_settings() {
   APPLY_TWEAKS="true"
   whiptail --backtitle "$APP" --title "Server housekeeping" \
     --yesno "Apply the housekeeping settings?\n\n8.3 names off, fast startup off, long paths on, WPBT off, no Windows Update auto-reboot, system sounds off, NumLock on, and Explorer/taskbar/theme defaults suited to RDP.\n\nNone of these are security relevant." 15 72 || APPLY_TWEAKS="false"
+
+  pick_custom_scripts
 }
 
 # Find the three PowerShell files the unattend ISO needs, or fetch them.
@@ -499,7 +666,7 @@ stage_drivers() {
 }
 
 generate_answer_file() {
-  local stage="$1" product_key_block=""
+  local stage="$1" product_key_block="" firstlogon_block=""
 
   if [[ -n "$GVLK" ]]; then
     product_key_block="
@@ -507,6 +674,20 @@ generate_answer_file() {
                 <Key>${GVLK}</Key>
                 <WillShowUI>Never</WillShowUI>
             </ProductKey>"
+  fi
+
+  # FirstLogon scripts have to beat the single automatic logon below, so they
+  # are registered here in specialize rather than by the startup task, which
+  # races it. RunOnce under HKLM fires at the first interactive logon and the
+  # value deletes itself once it has run.
+  if [[ -n "$CUSTOM_SCRIPT_DIR" && "$CUSTOM_LOOSE_AS_SYSTEM" != "yes" \
+        && "$(count_scripts "${CUSTOM_SCRIPT_DIR}/FirstLogon")" -gt 0 ]]; then
+    firstlogon_block="
+                <RunSynchronousCommand wcm:action=\"add\">
+                    <Order>3</Order>
+                    <Description>Register the first-logon custom scripts</Description>
+                    <Path>reg.exe add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce /v RDGWFirstLogon /t REG_SZ /d \"powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Windows\\Setup\\Scripts\\Invoke-CustomScripts.ps1 -Category FirstLogon\" /f</Path>
+                </RunSynchronousCommand>"
   fi
 
   write_file "${stage}/autounattend.xml" 644 <<XMLEOF
@@ -633,7 +814,7 @@ generate_answer_file() {
                     <Order>2</Order>
                     <Description>Register the first-boot task</Description>
                     <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Setup\Scripts\Invoke-GatewaySetup.ps1 -Register</Path>
-                </RunSynchronousCommand>
+                </RunSynchronousCommand>${firstlogon_block}
             </RunSynchronous>
         </component>
     </settings>
@@ -709,6 +890,7 @@ generate_config_psd1() {
     AccountName          = '${ADMIN_USER}'
     ExternalFqdn         = '${EXTERNAL_FQDN}'
     TargetMachines       = @(${targets})
+    ResourceScope        = '${RESOURCE_SCOPE}'
     CertificateSource    = 'SelfSigned'
 
     LockoutThreshold     = ${LOCKOUT_THRESHOLD}
@@ -748,6 +930,8 @@ build_unattend_iso() {
     run cp "${SUPPORT_DIR}/${f}" "${stage}/rdgw/${f}"
   done
   msg_ok "Scripts staged"
+
+  stage_custom_scripts "$stage"
 
   iso_dir="$(iso_dir_for_storage "$UNATTEND_STORAGE")"
   if [[ -z "$iso_dir" ]]; then
@@ -803,6 +987,37 @@ ${DGN}TPM 2.0        ${BL}${ADD_TPM}${CL}
 ${DGN}Bridge         ${BL}${BRG}${CL}
 ${DGN}Start after    ${BL}${START_VM}${CL}
 EOF
+}
+
+# The Windows DVD's EFI loader prints "Press any key to boot from CD or DVD"
+# and gives up after about five seconds.
+#
+# That prompt has to stay. Setup reboots two or three times before it is
+# finished, the DVD is still first in the boot order each time, and the prompt
+# timing out is exactly what lets those reboots fall through to the disk
+# instead of starting the install over. Rebuilding the media around
+# efisys_noprompt.bin would fix the first boot and buy an endless reinstall
+# loop in exchange.
+#
+# So the prompt stays and the host answers it, once. qm sendkey pushes a
+# keystroke into the running VM; sending one every couple of seconds covers
+# OVMF's startup and the prompt's own window without having to guess when it
+# appears. Enter is not bound to anything in the OVMF splash, and Setup is
+# driven by the answer file, so a key that lands early or late does nothing.
+press_a_key() {
+  local deadline
+  msg_info "Answering the \"press any key to boot\" prompt for ${BOOT_KEY_SECONDS}s"
+  printf "   ${DIM}\$ qm sendkey %s ret${CL}   (every 2s until the window closes)\n" "$VMID"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    msg_ok "Skipped — DRY_RUN"
+    return 0
+  fi
+  deadline=$((SECONDS + BOOT_KEY_SECONDS))
+  while (( SECONDS < deadline )); do
+    qm sendkey "$VMID" ret >/dev/null 2>&1 || true
+    sleep 2
+  done
+  msg_ok "Boot prompt answered"
 }
 
 ask() {  # ask <title> <default> -> ASK_RESULT
@@ -978,10 +1193,41 @@ if [[ "$START_VM" == "yes" ]]; then
   msg_info "Starting the VM"
   run qm start "$VMID"
   msg_ok "Started"
+  press_a_key
 fi
 
 # ------------------------------------------------------------------------------
 # What happens next
+#
+# Two blocks the unattended summary interpolates, built here so the heredoc
+# below stays readable.
+RESOURCE_SUMMARY=""
+case "${RESOURCE_SCOPE}" in
+  AnyResource)
+    RESOURCE_SUMMARY="   ${BL}Any machine this server can route to.${CL} Each one still needs Remote
+   Desktop switched on and your account in its own local Remote Desktop
+   Users group; the gateway decides where you may tunnel, not what you may
+   log into." ;;
+  Listed)
+    RESOURCE_SUMMARY="   The gateway itself plus: ${BL}${TARGET_MACHINES}${CL}
+   Anything not on that list is refused with event 301, so add machines by
+   re-running ${BL}Setup-RDGateway.ps1 -TargetMachines${CL} later." ;;
+  *)
+    RESOURCE_SUMMARY="   ${BL}This gateway only.${CL} Re-run ${BL}Setup-RDGateway.ps1${CL} with
+   ${BL}-TargetMachines${CL} or ${BL}-ResourceScope AnyResource${CL} to widen it." ;;
+esac
+
+CUSTOM_SUMMARY=""
+if [[ -n "$CUSTOM_SCRIPT_DIR" ]]; then
+  CUSTOM_SUMMARY="
+${BOLD}Your own scripts${CL}
+   Taken from ${BL}${CUSTOM_SCRIPT_DIR}${CL} and run from
+   ${BL}C:\\Windows\\Setup\\Scripts\\custom${CL}. They are logged in the same file,
+   prefixed ${BL}custom/<category>${CL}. One that fails or runs past 15 minutes is
+   logged and skipped rather than stopping the build.
+"
+fi
+
 if [[ "$UNATTEND" == "yes" ]]; then
 cat <<EOF
 
@@ -991,14 +1237,18 @@ Nothing below needs you at the console. It is here so you know what is
 happening and where to look if it stalls.
 
 ${BOLD}What runs, in order${CL}
-   1. Windows Setup boots from the DVD, finds ${BL}autounattend.xml${CL} on the
-      unattend CD by itself, and stages the VirtIO drivers from the
-      ${BL}\$WinPEDriver\$${CL} folder on that same CD. No "Load driver" step.
-   2. It wipes disk 0, partitions it (EFI / MSR / NTFS), and installs
+   1. The DVD asks you to press a key to boot from it. This script answered
+      that from the host with ${BL}qm sendkey${CL}, which is why nothing had to
+      be at the console. The prompt is left in place on purpose: Setup's own
+      reboots rely on it timing out to fall through to the disk.
+   2. Windows Setup finds ${BL}autounattend.xml${CL} on the unattend CD by
+      itself and stages the VirtIO drivers from the ${BL}\$WinPEDriver\$${CL}
+      folder on that same CD. No "Load driver" step.
+   3. It wipes disk 0, partitions it (EFI / MSR / NTFS), and installs
       ${BL}${IMAGE_NAME}${CL}.
-   3. The specialize pass copies the scripts to
+   4. The specialize pass copies the scripts to
       ${BL}C:\\Windows\\Setup\\Scripts${CL} and registers a startup task.
-   4. That task applies your settings, installs the RD Gateway role, reboots
+   5. That task applies your settings, installs the RD Gateway role, reboots
       if Windows asks, then runs ${BL}Setup-RDGateway.ps1${CL} and verifies the
       TSGateway service.
 
@@ -1010,6 +1260,9 @@ ${BOLD}Where to look${CL}
    ${BL}C:\\Windows\\Panther\\setupact.log${CL}           Windows Setup itself
 
    The gateway is done when the log ends with ${BL}First-boot setup finished.${CL}
+${CUSTOM_SUMMARY}
+${BOLD}Reachable through the gateway${CL}
+${RESOURCE_SUMMARY}
 
 ${BOLD}When it is finished${CL}
    Detach the media and delete the unattend CD — it holds the account password
@@ -1033,9 +1286,10 @@ cat <<EOF
 ${BOLD}${GN}VM ${VMID} is built.${CL} Windows is not installed yet — do that next.
 
 ${BOLD}1. Open the console${CL}
-   Proxmox web UI -> VM ${VMID} -> Console. Press a key fast when it says
-   "Press any key to boot from CD" — if you miss it you land in the UEFI shell;
-   type ${BL}exit${CL}, pick Boot Manager, and choose the DVD.
+   Proxmox web UI -> VM ${VMID} -> Console. The "Press any key to boot from
+   CD" prompt has already been answered for you from the host. If you started
+   this VM yourself instead, and missed the window, you land in the UEFI
+   shell: type ${BL}exit${CL}, pick Boot Manager, and choose the DVD.
 
 ${BOLD}2. Load the storage driver${CL}
    Windows Setup will show ${YW}no disks${CL}. That is expected.
