@@ -32,15 +32,42 @@
 
 [CmdletBinding()]
 param(
-    [string] $ConfigPath = (Join-Path $PSScriptRoot 'rdgw-config.psd1')
+    [string] $ConfigPath = (Join-Path $PSScriptRoot 'rdgw-config.psd1'),
+    [string] $LogPath = (Join-Path $PSScriptRoot 'rdgw-setup.log')
 )
 
 $ErrorActionPreference = 'Continue'
 
-function Write-Step { param([string] $m) Write-Host "`n=== $m ===" }
-function Write-Good { param([string] $m) Write-Host "    [ ok ] $m" }
-function Write-Skip { param([string] $m) Write-Host "    [skip] $m" }
-function Write-Bad  { param([string] $m) Write-Host "    [fail] $m" }
+$script:LogPath = $LogPath
+$script:LogWritable = $true
+$script:Failures = 0
+
+# This file logs itself, and that is not optional decoration.
+#
+# It used to print with Write-Host alone and let the caller capture it with
+# "& Configure-Guest.ps1 2>&1 | Tee-Object". That never worked: 2>&1 merges the
+# error stream into the success stream, but Write-Host writes to the
+# information stream, which a plain pipe does not carry. So every [ ok ] and
+# [fail] line this script produced went to a console nobody was watching and
+# none of it reached rdgw-setup.log - leaving an operator with a log that
+# records the build happening and nothing about whether any setting took.
+function Write-Line {
+    param([string] $Line)
+    Write-Host $Line
+    if ($script:LogWritable) {
+        try {
+            Add-Content -LiteralPath $script:LogPath -Value $Line -Encoding ASCII -ErrorAction Stop
+        } catch {
+            $script:LogWritable = $false
+            Write-Host "    (log not writable: $($_.Exception.Message))"
+        }
+    }
+}
+
+function Write-Step { param([string] $m) Write-Line "" ; Write-Line "=== $m ===" }
+function Write-Good { param([string] $m) Write-Line "    [ ok ] $m" }
+function Write-Skip { param([string] $m) Write-Line "    [skip] $m" }
+function Write-Bad  { param([string] $m) $script:Failures++ ; Write-Line "    [fail] $m" }
 
 # Wrapper so one failed registry write cannot take the whole run down.
 function Set-Reg {
@@ -363,4 +390,9 @@ if (Test-Path -LiteralPath 'C:\Windows.old') {
 }
 
 Write-Step "Done"
+if ($script:Failures -gt 0) {
+    Write-Line "    $($script:Failures) setting(s) could not be applied - see the [fail] lines above"
+} else {
+    Write-Line "    every setting applied without error"
+}
 exit 0

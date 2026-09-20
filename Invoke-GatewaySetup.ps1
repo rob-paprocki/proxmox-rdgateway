@@ -180,11 +180,15 @@ try {
 if (-not $state.GuestConfigured) {
     Write-Line "Applying guest configuration"
     try {
-        & (Join-Path $ScriptRoot 'Configure-Guest.ps1') -ConfigPath $ConfigPath 2>&1 |
-            Tee-Object -FilePath $LogPath -Append | Write-Host
+        # No pipe and no Tee-Object: Configure-Guest.ps1 appends to the same log
+        # itself. It has to, because everything it prints goes to the
+        # information stream, which "2>&1 | Tee-Object" does not carry - that is
+        # how its per-setting results went missing for the whole of this file's
+        # existence.
+        & (Join-Path $ScriptRoot 'Configure-Guest.ps1') -ConfigPath $ConfigPath -LogPath $LogPath
         $state.GuestConfigured = $true
         Save-State $state
-        Write-Line "Guest configuration applied"
+        Write-Line "Configure-Guest.ps1 finished - read its [ ok ] and [fail] lines above"
     } catch {
         Write-Line "Configure-Guest.ps1 failed: $($_.Exception.Message)" 'warn'
         Write-Line "Continuing to the gateway role anyway - these settings are not required for it." 'warn'

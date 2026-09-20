@@ -235,7 +235,9 @@ function Import-RegFile {
 $dir = Join-Path (Join-Path $ScriptRoot 'custom') $Category
 
 if (-not (Test-Path -LiteralPath $dir)) {
-    # Nothing was supplied for this category. Not worth a line in the log.
+    # Worth a line even though nothing is wrong. "Did my script run?" is not
+    # answerable from a log that stays silent in every case where it did not.
+    Write-Line "nothing supplied for this category ($dir does not exist)"
     exit 0
 }
 
@@ -249,6 +251,13 @@ $files = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
         @{ Expression = { $_.Name } })
 
 if ($files.Count -eq 0) {
+    $other = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue)
+    if ($other.Count -gt 0) {
+        Write-Line "$dir holds $($other.Count) file(s) but none with a .ps1, .cmd, .bat or .reg extension - nothing run" 'warn'
+        $other | ForEach-Object { Write-Line "  ignored: $($_.Name)" 'warn' }
+    } else {
+        Write-Line "$dir is empty - nothing to run"
+    }
     exit 0
 }
 

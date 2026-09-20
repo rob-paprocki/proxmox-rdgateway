@@ -335,6 +335,21 @@ dgw-setup.log` and stays
   decision to register `FirstLogon`, the ISO staging, the closing summary - reads that
   tree rather than asking where a file came from. Keep it that way; it is what let the
   editor route be added without touching any of them.
+- **Every guest-side script writes to `rdgw-setup.log` itself. Do not go back to
+  piping a child into `Tee-Object`.** `Configure-Guest.ps1` prints with `Write-Host`,
+  which goes to the information stream, and the caller captured it with
+  `& Configure-Guest.ps1 2>&1 | Tee-Object`. `2>&1` merges the *error* stream into
+  success; it does not carry stream 6. So for the whole life of that file, not one of
+  its `[ ok ]` / `[fail]` lines ever reached the log - the operator got "Applying guest
+  configuration", "Guest configuration applied", and no record of whether a single
+  setting took. That is what "I'm not really sure the customizations are being applied"
+  looked like from their side. Verified empirically: with `2>&1` only the `Write-Output`
+  line survives the pipe; `*>&1` carries all of it.
+- **Silence is not an acceptable answer to "did my script run".**
+  `Invoke-CustomScripts.ps1` used to `exit 0` without logging when a category directory
+  was missing or matched no files, which is indistinguishable from never being called.
+  It now logs in all three cases: nothing supplied, directory empty, and directory
+  holding only files it will not run (naming them).
 - **Anything that came from a prompt and lands in a generated file goes through
   `xml_escape` or `psd1_quote` first.** Both files are built by string interpolation
   and neither format forgives a stray character: `Tr0ub4dor&3` is an ordinary Windows

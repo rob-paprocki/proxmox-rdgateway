@@ -452,16 +452,27 @@ pick_resource_scope() {
   esac
 }
 
-# Count the script files directly inside a directory. Anything we cannot hand
-# to a documented Windows interpreter is ignored rather than silently copied.
+# List the script files directly inside a directory, one per line, sorted.
+# Anything we cannot hand to a documented Windows interpreter is left out
+# rather than silently copied.
+#
+# Case-insensitive on purpose. Linux globs are not, so a perfectly reasonable
+# INSTALL.PS1 sitting in an import directory used to be skipped here and then
+# reported as "no scripts found" - which is worse than either accepting it or
+# refusing it. custom_copy_in lower-cases the extension as it copies, so
+# everything downstream of the staging tree stays plain lower case.
+list_scripts() {
+  local d="$1"
+  [[ -d "$d" ]] || return 0
+  find "$d" -maxdepth 1 -type f \
+    \( -iname '*.ps1' -o -iname '*.cmd' -o -iname '*.bat' -o -iname '*.reg' \) \
+    2>/dev/null | sort || true
+}
+
 count_scripts() {
-  local d="$1" n=0 f
-  if [[ -d "$d" ]]; then
-    for f in "$d"/*.ps1 "$d"/*.cmd "$d"/*.bat "$d"/*.reg; do
-      [[ -f "$f" ]] && n=$((n + 1))
-    done
-  fi
-  printf "%s" "$n"
+  local n
+  n="$(list_scripts "$1" | grep -c . || true)"
+  printf "%s" "${n:-0}"
 }
 
 # ------------------------------------------------------------------------------
@@ -687,7 +698,7 @@ custom_safe_name() {
 # Copy one script into the staging tree, refusing anything a Windows
 # interpreter cannot be handed. Returns non-zero and says why if it cannot.
 custom_copy_in() {
-  local src="$1" cat="$2" dst
+  local src="$1" cat="$2" dst base ext name
   case "$src" in
     *.ps1|*.cmd|*.bat|*.reg|*.PS1|*.CMD|*.BAT|*.REG) ;;
     *)
@@ -695,9 +706,17 @@ custom_copy_in() {
         "$(basename -- "$src")\n\nOnly .ps1, .cmd, .bat and .reg can be run on the other end." 10 68 || true
       return 1 ;;
   esac
+  # Everything downstream - count_scripts, stage_custom_scripts, custom_review -
+  # globs lower case, so INSTALL.PS1 would be accepted here and then be invisible
+  # to all three of them. Normalise the extension rather than teaching four
+  # globs about case.
+  base="$(basename -- "$src")"
+  ext="$(printf '%s' "${base##*.}" | tr '[:upper:]' '[:lower:]')"
+  name="${base%.*}.${ext}"
+
   dst="${CUSTOM_STAGE}/${cat}"
   mkdir -p "$dst" || { msg_error "Could not create ${dst}"; return 1; }
-  cp -- "$src" "${dst}/" || { msg_error "Could not copy ${src}"; return 1; }
+  cp -- "$src" "${dst}/${name}" || { msg_error "Could not copy ${src}"; return 1; }
   return 0
 }
 
@@ -795,10 +814,10 @@ custom_import_path() {
   custom_stage_dir
   for cat in "${CUSTOM_CATEGORIES[@]}"; do
     [[ -d "${src}/${cat}" ]] || continue
-    for f in "${src}/${cat}"/*.ps1 "${src}/${cat}"/*.cmd "${src}/${cat}"/*.bat "${src}/${cat}"/*.reg; do
-      [[ -f "$f" ]] || continue
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
       custom_copy_in "$f" "$cat" && added=$((added + 1))
-    done
+    done < <(list_scripts "${src}/${cat}")
   done
 
   # Scripts sitting loose at the top level are offered whether or not a
@@ -809,10 +828,10 @@ custom_import_path() {
   if [[ "$loose" -gt 0 ]]; then
     if whiptail --backtitle "$APP" --title "Loose scripts" --yesno \
         "${src} also holds ${loose} script(s) directly, outside the ${CUSTOM_CATEGORIES[*]} subdirectories.\n\nTreat those as System scripts?" 13 72; then
-      for f in "$src"/*.ps1 "$src"/*.cmd "$src"/*.bat "$src"/*.reg; do
-        [[ -f "$f" ]] || continue
+      while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
         custom_copy_in "$f" System && added=$((added + 1))
-      done
+      done < <(list_scripts "$src")
     fi
   fi
 
@@ -830,12 +849,11 @@ custom_review() {
 
   if [[ -n "$CUSTOM_STAGE" ]]; then
     for cat in "${CUSTOM_CATEGORIES[@]}"; do
-      for f in "${CUSTOM_STAGE}/${cat}"/*.ps1 "${CUSTOM_STAGE}/${cat}"/*.cmd \
-               "${CUSTOM_STAGE}/${cat}"/*.bat "${CUSTOM_STAGE}/${cat}"/*.reg; do
-        [[ -f "$f" ]] || continue
+      while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
         rel="${cat}/$(basename -- "$f")"
         rows+=("$rel" "$(custom_when_text "$cat")" "OFF")
-      done
+      done < <(list_scripts "${CUSTOM_STAGE}/${cat}")
     done
   fi
 
@@ -893,12 +911,12 @@ stage_custom_scripts() {
     [[ -d "$src" ]] || continue
 
     dst="${stage}/rdgw/custom/${cat}"
-    for f in "$src"/*.ps1 "$src"/*.cmd "$src"/*.bat "$src"/*.reg; do
-      [[ -f "$f" ]] || continue
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
       run mkdir -p "$dst"
       run cp "$f" "${dst}/"
       staged=$((staged + 1))
-    done
+    done < <(list_scripts "$src")
   done
   msg_ok "Custom scripts staged (${staged})"
 }
@@ -1352,6 +1370,34 @@ build_unattend_iso() {
 
   stage_custom_scripts "$stage"
 
+  # The last cheap place to see what the guest will get. A file that never made
+  # it onto the CD is indistinguishable, from inside Windows, from one the
+  # first-boot task decided not to run.
+  # The last cheap place to see what the guest will get. A file that never made
+  # it onto the CD is indistinguishable, from inside Windows, from one the
+  # first-boot task decided not to run.
+  msg_info "Going on the CD"
+  local f b
+  if [[ -d "${stage}/rdgw" ]]; then
+    while IFS= read -r f; do
+      printf "     %s
+" "${f#"${stage}/"}"
+      b="$(basename -- "$f")"
+      # Joliet allows 64 characters, or 103 with -joliet-long. Past that Windows
+      # sees a truncated name and the runner never matches it.
+      if (( ${#b} > 100 )); then
+        msg_warn "Name is too long for the CD and will be truncated: ${b}"
+      fi
+    done < <(find "${stage}/rdgw" -type f 2>/dev/null | sort || true)
+    if [[ -d "${stage}/\$WinPEDriver\$" ]]; then
+      printf "     %s\$WinPEDriver\$: %s file(s)%s
+" "$DIM"         "$(find "${stage}/\$WinPEDriver\$" -type f 2>/dev/null | wc -l)" "$CL"
+    fi
+  else
+    printf "     %s(nothing on disk — DRY_RUN printed the copies instead of making them)%s
+" "$DIM" "$CL"
+  fi
+
   iso_dir="$(iso_dir_for_storage "$UNATTEND_STORAGE")"
   if [[ -z "$iso_dir" ]]; then
     msg_error "Could not resolve the ISO directory for storage '${UNATTEND_STORAGE}'."
@@ -1362,8 +1408,8 @@ build_unattend_iso() {
   msg_info "Building ${out}"
   run mkdir -p "$iso_dir"
   case "$ISO_TOOL" in
-    xorriso) run xorriso -as mkisofs -quiet -J -r -V UNATTEND -o "$out" "$stage" ;;
-    *)       run "$ISO_TOOL" -quiet -J -r -V UNATTEND -o "$out" "$stage" ;;
+    xorriso) run xorriso -as mkisofs -quiet -J -joliet-long -r -V UNATTEND -o "$out" "$stage" ;;
+    *)       run "$ISO_TOOL" -quiet -J -joliet-long -r -V UNATTEND -o "$out" "$stage" ;;
   esac
   # The answer file inside carries the account password in clear text.
   run chmod 600 "$out"
