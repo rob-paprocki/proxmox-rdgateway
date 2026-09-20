@@ -1381,32 +1381,76 @@ build_unattend_iso() {
   # Belt and braces over xml_escape. Windows Setup rejecting the answer file
   # looks identical to Setup ignoring it, twenty minutes in, at a screen with no
   # useful error. Catch it here instead.
-  if [[ "$DRY_RUN" != "1" ]] && command -v xmllint >/dev/null 2>&1; then
-    if ! xmllint --noout "${stage}/autounattend.xml" 2>/dev/null; then
-      msg_error "The generated autounattend.xml is not well-formed XML."
-      msg_error "Re-run with DRY_RUN=1 to read it. Suspect whatever you typed into"
-      msg_error "the account name, password, hostname or time zone."
-      exit 1
+  # Check the answer file, and say which tool did the checking.
+  #
+  # This used to be "command -v xmllint, else skip". On a real Proxmox VE 9
+  # host that means skip - xmllint is not installed - so the only validation
+  # this repo had never ran once where it mattered, silently. Proxmox does
+  # ship perl with XML::LibXML, which pve-manager itself depends on, so prefer
+  # that and keep python3 as a second string. If neither exists, say so out
+  # loud rather than printing a reassuring line.
+  #
+  # Two questions, one pass:
+  #   1. Is it well-formed? A stray & from a password is enough to break it.
+  #   2. Does it carry an XML comment below <component>? That is legal XML
+  #      which Windows rejects outright, failing the whole pass with
+  #      0x80220005 twenty minutes into an install. See CLAUDE.md.
+  local xml_file="${stage}/autounattend.xml" deep="" tool=""
+  if [[ "$DRY_RUN" != "1" ]]; then
+    if command -v xmllint >/dev/null 2>&1; then
+      tool="xmllint"
+      xmllint --noout "$xml_file" 2>/dev/null || deep="malformed"
+      [[ -z "$deep" ]] && deep="$(xmllint --xpath \
+        'count(//*[local-name()="component"]/*//comment())' "$xml_file" 2>/dev/null || echo 0)"
+    elif perl -MXML::LibXML -e 1 >/dev/null 2>&1; then
+      tool="perl XML::LibXML"
+      deep="$(perl -MXML::LibXML -e '
+        my $d = eval { XML::LibXML->load_xml(location => $ARGV[0]) };
+        unless ($d) { print q{malformed}; exit 0 }
+        print scalar @{[ $d->findnodes(q{//*[local-name()="component"]/*//comment()}) ]};
+      ' "$xml_file" 2>/dev/null)" || deep="malformed"
+    elif command -v python3 >/dev/null 2>&1; then
+      tool="python3"
+      deep="$(python3 - "$xml_file" <<'PYEOF'
+import sys, xml.dom.minidom
+try:
+    d = xml.dom.minidom.parse(sys.argv[1])
+except Exception:
+    print("malformed"); raise SystemExit(0)
+def below(n):
+    t = 0
+    for k in n.childNodes:
+        if k.nodeType == k.COMMENT_NODE: t += 1
+        elif k.nodeType == k.ELEMENT_NODE: t += below(k)
+    return t
+total = 0
+for c in d.getElementsByTagName("*"):
+    if c.localName == "component":
+        for kid in c.childNodes:
+            if kid.nodeType == kid.ELEMENT_NODE:
+                total += below(kid)
+print(total)
+PYEOF
+)" || deep="malformed"
     fi
+  fi
 
-    # Well-formed is not the same as acceptable. A comment inside
-    # <RunSynchronousCommand> parses fine here and then makes Windows fail the
-    # whole specialize pass with 0x80220005, twenty minutes into an install,
-    # at a dialog that says only "The computer restarted unexpectedly". That
-    # cost a build. Comments are fine at the root, in <settings> and in
-    # <component>; below that, refuse to ship one.
-    local deep_comments
-    deep_comments="$(xmllint --xpath \
-      'count(//*[local-name()="component"]/*//comment())' \
-      "${stage}/autounattend.xml" 2>/dev/null || echo 0)"
-    if [[ "$deep_comments" != "0" ]]; then
-      msg_error "The answer file has ${deep_comments} XML comment(s) nested below <component>."
-      msg_error "Windows rejects the whole pass for this. Move the prose into this script."
-      exit 1
-    fi
-    msg_ok "Answer file written, well-formed, no comments Windows will choke on"
-  else
+  if [[ "$deep" == "malformed" ]]; then
+    msg_error "The generated autounattend.xml is not well-formed XML."
+    msg_error "Re-run with DRY_RUN=1 to read it. Suspect whatever you typed into"
+    msg_error "the account name, password, hostname or time zone."
+    exit 1
+  elif [[ -n "$deep" && "$deep" != "0" ]]; then
+    msg_error "The answer file carries ${deep} XML comment(s) nested below <component>."
+    msg_error "Legal XML, and Windows fails the whole pass for it. Move the prose"
+    msg_error "into windows-rdgw-vm.sh instead. See CLAUDE.md, 'Ruled out'."
+    exit 1
+  elif [[ -n "$tool" ]]; then
+    msg_ok "Answer file written, checked with ${tool}"
+  elif [[ "$DRY_RUN" == "1" ]]; then
     msg_ok "Answer file written"
+  else
+    msg_warn "Answer file written but NOT checked - no xmllint, perl XML::LibXML or python3"
   fi
 
   msg_info "Staging the first-boot scripts"

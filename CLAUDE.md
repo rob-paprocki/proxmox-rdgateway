@@ -175,10 +175,19 @@ dozen `BFSVC: BfspCopyFile` failures, both of which are **red herrings** - the E
 fully populated and the driver payload complete. Do not chase them. Comments at the
 document root, inside `<settings>` and as direct children of `<component>` are fine and
 have shipped since before the first successful build; it is nesting them deeper that
-breaks. `build_unattend_iso` now refuses to ship a file with any, via
-`xmllint --xpath 'count(//*[local-name()="component"]/*//comment())'`, and that guard is
-regression-tested against the exact file that failed. Keep prose about the answer file in
-`windows-rdgw-vm.sh`, where it costs nothing.
+breaks. `build_unattend_iso` now refuses to ship a file with any. Keep prose about the
+answer file in `windows-rdgw-vm.sh`, where it costs nothing.
+
+That check nearly shipped useless, which is its own lesson: **`xmllint` is not installed
+on Proxmox VE 9.** The answer-file validation had always been written as
+`command -v xmllint || skip`, so on the operator's host it silently did nothing, and had
+never once run where it mattered. Proxmox does guarantee `perl` with `XML::LibXML`
+(pve-manager depends on it) and ships `python3`, so the check now tries xmllint, then
+perl, then python3, and **says which one ran** - or warns loudly that none did. Verified
+on the host across all three cases: a comment inside `<RunSynchronousCommand>` returns 1,
+a comment directly under `<component>` returns 0, malformed XML is caught. Do not write
+another `command -v X || silently skip` check in this repo; a check nobody can see fail is
+not a check.
 
 **WARP / Cloudflare One client, Tailscale, any client-side agent.** Violates the
 no-install-on-clients constraint.
