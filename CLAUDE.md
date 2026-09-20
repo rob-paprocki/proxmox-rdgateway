@@ -372,11 +372,25 @@ dgw-setup.log` and stays
   key that lands early or late does nothing". It does not. Setup shows a Cancel button
   that takes focus, and a fixed sixty seconds of Enter hammered it, opening and closing
   a confirmation dialog for the rest of the minute. It stayed harmless only because that
-  dialog also defaults to Cancel. So the loop now stops on evidence rather than a timer:
+  dialog also defaults to Cancel. So the loop stops on evidence rather than a timer:
   `qm_bytes_read ide0` via the QEMU monitor tells the difference between "OVMF is looking
-  at the DVD" and "Setup is streaming boot.wim off it", and `BOOT_KEY_SECONDS` is only a
-  backstop for when the monitor cannot be read. Do not raise it back to a long fixed
-  window.
+  at the DVD" and "Setup is streaming boot.wim off it". The third lesson, from the run
+  after that fix: **stopping on evidence is only half of it, and starting on a timer
+  loses the prompt.** That version kept the byte-counter stop but still pressed on a
+  schedule inside a fixed twenty seconds opening the moment `qm start` returned, and each
+  pass spawns `qm monitor` and `qm sendkey`, two Perl programs, so the window bought
+  seven or eight presses. OVMF with a TPM to measure does not reach the DVD that fast.
+  The operator watched the window expire and answered the prompt by hand. Both halves are
+  the same question - is the prompt on screen now - so the counter answers both: zero
+  means the firmware has not opened the disc and there is nothing to answer, a number
+  that has stopped moving is the prompt waiting, and a number still climbing means
+  something is streaming and no key is wanted. Keys go out only in that middle state,
+  which is what lets `BOOT_KEY_SECONDS` be patient (180s) without ever hammering Cancel.
+  Covered by four stubbed scenarios; the load-bearing one is `neverboots`, where the DVD
+  is never opened and the correct number of keypresses is **zero**. Do not reintroduce a
+  press that is not conditioned on the counter having stopped moving. The blind path,
+  when the monitor will not answer at all, keeps its own short budget
+  (`BOOT_KEY_BLIND_SECONDS`) precisely because it cannot make that distinction.
 - **A bare `whiptail --msgbox` aborts the script.** Under `set -Eeuo pipefail`,
   whiptail returns non-zero when a box is dismissed with Esc, the `ERR` trap fires, and
   every answer already typed is gone. Every informational box ends `|| true`. Every box

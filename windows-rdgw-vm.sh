@@ -27,9 +27,9 @@
 #
 #      REPO_REF           branch or tag to fetch the PowerShell files from
 #      REPO_RAW           a different raw URL prefix entirely, e.g. a fork
-#      BOOT_KEY_SECONDS   backstop for answering the DVD's "press any key to
-#                         boot" prompt; normally it stops as soon as the DVD
-#                         starts streaming (default 20)
+#      BOOT_KEY_SECONDS   how long to watch for the DVD's "press any key to
+#                         boot" prompt; it stops as soon as the DVD starts
+#                         streaming (default 180)
 #      BOOT_KEY           the key to send for that prompt (default ret)
 #
 #  What it touches on the network:
@@ -85,8 +85,11 @@ SUPPORT_FILES=(Setup-RDGateway.ps1 Configure-Guest.ps1 Invoke-GatewaySetup.ps1 I
 SUPPORT_DIR=""
 
 # Answering the Windows DVD's "press any key to boot" prompt. See press_a_key.
-# The cap is a backstop; normally it stops as soon as the DVD starts streaming.
-BOOT_KEY_SECONDS="${BOOT_KEY_SECONDS:-20}"
+# BOOT_KEY_SECONDS is how long to keep watching for the prompt, not how long to
+# press: keys go out only while the DVD is open and quiet. The blind budget is
+# far shorter because a key nobody can account for is the dangerous kind.
+BOOT_KEY_SECONDS="${BOOT_KEY_SECONDS:-180}"
+BOOT_KEY_BLIND_SECONDS="${BOOT_KEY_BLIND_SECONDS:-30}"
 BOOT_KEY="${BOOT_KEY:-ret}"
 BOOT_KEY_STOP_MB="${BOOT_KEY_STOP_MB:-24}"
 
@@ -1472,12 +1475,25 @@ EOF
 # How many bytes QEMU has read from a drive, via the monitor. Best effort: it
 # prints nothing when the monitor is unavailable or the output does not parse,
 # and the caller copes.
+# It asks for the named device and, failing that, totals every rd_bytes line in
+# the output. The fallback matters more than it looks: the device name in "info
+# blockstats" depends on how Proxmox handed the drive to QEMU, and guessing it
+# wrong would not merely lose the DVD counter, it would drop press_a_key into
+# its blind mode - the one branch that cannot tell a boot prompt from Setup's
+# Cancel button. Totalling is honest at this point in the boot because the disk
+# is still blank and nothing but the DVD is being read at any volume. Any
+# rd_bytes at all means the monitor answered, so a total of zero still prints.
 qm_bytes_read() {
-  local dev="$1"
-  printf 'info blockstats\n' \
-    | qm monitor "$VMID" 2>/dev/null \
-    | awk -v d="$dev" '$0 ~ d && match($0, /rd_bytes=[0-9]+/) {
-        print substr($0, RSTART + 9, RLENGTH - 9); exit }'
+  local dev="$1" out
+  out="$(printf 'info blockstats\n' | qm monitor "$VMID" 2>/dev/null)" || return 0
+  printf '%s\n' "$out" | awk -v d="$dev" '
+    match($0, /rd_bytes=[0-9]+/) {
+      n = substr($0, RSTART + 9, RLENGTH - 9)
+      any = 1
+      if ($0 ~ d) { named = n; found = 1 }
+      total += n
+    }
+    END { if (found) print named; else if (any) print total }'
 }
 
 # Answer the DVD's "Press any key to boot from CD or DVD" prompt, once, then
@@ -1496,33 +1512,77 @@ qm_bytes_read() {
 # a loader, and after it Setup streams boot.wim off the same disc. A read count
 # past BOOT_KEY_STOP_MB means we are through and can stop pressing.
 #
-# BOOT_KEY_SECONDS is now only a backstop for when the monitor cannot be read,
-# and it is short for the same reason. Nothing here can rescue a VM that never
-# reached the prompt, so it says so rather than pressing on in silence.
+# The second version got the other half wrong. It kept the stop condition but
+# still pressed on a schedule, inside a fixed twenty-second window opening the
+# moment qm start returned - and every pass spawns qm monitor and qm sendkey,
+# two Perl programs, so twenty seconds bought seven or eight presses. OVMF with
+# a TPM to measure does not usually reach the DVD that fast. The operator
+# watched the whole window expire before the prompt appeared and then answered
+# it by hand.
+#
+# Both halves are the same question - is the prompt on screen right now - and
+# the byte counter answers it. Zero means the firmware has not opened the disc
+# yet, so there is nothing to answer. A number that has stopped moving means the
+# firmware opened the disc, read a loader, and is now waiting on somebody: that
+# is the prompt, and that is when to press. A number still climbing means
+# something is streaming and no key of ours is wanted. Since keys now go out
+# only in that middle state, the clock can afford to be patient.
+#
+# It can only afford that while the counter is readable. When the monitor will
+# not answer we are back to pressing on faith, which is the thing that hammered
+# Cancel, so that path stays on a short leash and says so.
 press_a_key() {
-  local deadline bytes sent=0 stop_at
+  local deadline bytes last="" sent=0 stop_at tries=0
+
   stop_at=$(( BOOT_KEY_STOP_MB * 1024 * 1024 ))
 
   msg_info "Answering the \"press any key to boot\" prompt"
-  printf "   ${DIM}\$ qm sendkey %s %s${CL}   (once a second until the DVD starts streaming)\n" "$VMID" "$BOOT_KEY"
+  printf "   ${DIM}\$ qm sendkey %s %s${CL}   (only while the DVD is open and quiet)\n" "$VMID" "$BOOT_KEY"
   if [[ "$DRY_RUN" == "1" ]]; then
     msg_ok "Skipped — DRY_RUN"
     return 0
   fi
 
-  deadline=$((SECONDS + BOOT_KEY_SECONDS))
-  while (( SECONDS < deadline )); do
+  # Settle which mode we are in before starting, because it decides how long we
+  # are allowed to keep going. QEMU can be slow to answer in the first seconds
+  # after qm start, so let the monitor miss a few times before writing it off.
+  while (( tries < 5 )); do
     bytes="$(qm_bytes_read ide0)"
-    if [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes > stop_at )); then
-      msg_ok "Setup is reading the DVD - stopped after ${sent} keypress(es)"
-      return 0
-    fi
-    qm sendkey "$VMID" "$BOOT_KEY" >/dev/null 2>&1 || true
-    sent=$((sent + 1))
+    [[ "$bytes" =~ ^[0-9]+$ ]] && break
+    tries=$((tries + 1))
     sleep 1
   done
 
-  msg_warn "Sent ${sent} keypress(es) in ${BOOT_KEY_SECONDS}s and never saw the DVD stream"
+  if [[ ! "$bytes" =~ ^[0-9]+$ ]]; then
+    msg_warn "Cannot read the DVD's byte counter from the monitor - pressing blind"
+    deadline=$((SECONDS + BOOT_KEY_BLIND_SECONDS))
+    while (( SECONDS < deadline )); do
+      qm sendkey "$VMID" "$BOOT_KEY" >/dev/null 2>&1 || true
+      sent=$((sent + 1))
+      sleep 2
+    done
+    msg_warn "Sent ${sent} keypress(es) blind over ${BOOT_KEY_BLIND_SECONDS}s. Watch the console."
+    return 0
+  fi
+
+  deadline=$((SECONDS + BOOT_KEY_SECONDS))
+  while (( SECONDS < deadline )); do
+    if [[ "$bytes" =~ ^[0-9]+$ ]]; then
+      if (( bytes > stop_at )); then
+        msg_ok "Setup is streaming the DVD - stopped after ${sent} keypress(es)"
+        return 0
+      fi
+      if (( bytes > 0 )) && [[ "$bytes" == "$last" ]]; then
+        qm sendkey "$VMID" "$BOOT_KEY" >/dev/null 2>&1 || true
+        sent=$((sent + 1))
+      fi
+      last="$bytes"
+    fi
+    sleep 1
+    bytes="$(qm_bytes_read ide0)"
+  done
+
+  msg_warn "Watched ${BOOT_KEY_SECONDS}s, sent ${sent} keypress(es), never saw Setup stream the DVD"
   msg_warn "Open the console. If the VM is at the UEFI shell, type ${BL}exit${CL} and boot the DVD by hand."
   return 0
 }

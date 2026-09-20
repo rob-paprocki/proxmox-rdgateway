@@ -273,9 +273,17 @@ So the prompt stays and the host answers it once, with [`qm sendkey`](https://pv
 qm sendkey 9000 ret
 ```
 
-The script sends that every two seconds for the first sixty, which covers OVMF's startup plus the prompt's own window without having to guess when it appears. Enter is not bound to anything in the OVMF splash, and Setup is driven by the answer file, so a key that arrives early or late does nothing. Set `BOOT_KEY_SECONDS` to change how long it keeps trying.
+Knowing *when* to send it is the whole difficulty, and guessing does not work in either direction. Sending Enter on a fixed schedule for a fixed minute reaches Windows Setup, which shows a Cancel button that takes focus, so the surplus keypresses open and close its confirmation dialog for the rest of the minute. Shortening the window to twenty seconds instead expires before OVMF has finished measuring the TPM and looked at the DVD at all, so the prompt appears to an audience of nobody. Both were tried on real builds.
 
-This happens on the unattended path only. Without an answer file, Windows Setup is a live wizard within that same minute, and Enter every two seconds would click through the language screen, **Install now**, the edition list and the EULA before you had looked at the console. So the shell-only path leaves the prompt to you.
+What the VM will tell you, through the QEMU monitor, is how many bytes it has read off the DVD:
+
+```bash
+echo 'info blockstats' | qm monitor 9000
+```
+
+Zero means the firmware has not opened the disc yet, so there is nothing to answer. A number that has stopped climbing means the firmware read a loader and is now waiting for somebody, which is the prompt. A number still climbing means Setup is streaming `boot.wim` and no key of yours is wanted. The script polls that counter once a second and sends Enter only in the middle case, which is why it can afford to wait a patient three minutes without ever touching Cancel. `BOOT_KEY_SECONDS` sets that ceiling. If the monitor cannot be read at all the script says so and falls back to pressing blind, on a deliberately short leash, because blind is the mode that cannot tell a boot prompt from a Cancel button.
+
+This happens on the unattended path only. Without an answer file, Windows Setup is a live wizard within the first minute, and a stray Enter would click through the language screen, **Install now**, the edition list and the EULA before you had looked at the console. So the shell-only path leaves the prompt to you.
 
 ### If you chose the shell-only path
 
