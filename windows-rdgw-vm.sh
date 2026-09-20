@@ -1468,30 +1468,55 @@ EOF
 # loop in exchange.
 #
 # So the prompt stays and the host answers it, once. qm sendkey pushes a
-# keystroke into the running VM; sending one every couple of seconds covers
-# OVMF's startup and the prompt's own window without having to guess when it
-# appears. Enter is not bound to anything in the OVMF splash, and Setup is
-# driven by the answer file, so a key that lands early or late does nothing.
-# How many bytes QEMU has read from a drive, via the monitor. Best effort: it
-# prints nothing when the monitor is unavailable or the output does not parse,
-# and the caller copes.
-# It asks for the named device and, failing that, totals every rd_bytes line in
-# the output. The fallback matters more than it looks: the device name in "info
-# blockstats" depends on how Proxmox handed the drive to QEMU, and guessing it
-# wrong would not merely lose the DVD counter, it would drop press_a_key into
-# its blind mode - the one branch that cannot tell a boot prompt from Setup's
-# Cancel button. Totalling is honest at this point in the boot because the disk
-# is still blank and nothing but the DVD is being read at any volume. Any
-# rd_bytes at all means the monitor answered, so a total of zero still prints.
+# keystroke into the running VM, and it does work - confirmed on the operator's
+# host by sending one to a VM parked on "Press any key to enter the Boot
+# Manager Menu" and watching the menu open. Knowing *when* to send it is the
+# whole difficulty, and that is what the byte counter below is for.
+# How many bytes QEMU has read from a drive. Best effort: it prints nothing
+# when the counter cannot be read, and the caller copes.
+#
+# Do not put this back on "qm monitor". Measured on the operator's Proxmox VE
+# 9.2.20 host, against a running VM:
+#
+#     printf 'info blockstats\n' | qm monitor 200     ->  exit 124 under
+#                                                         timeout 10, zero
+#                                                         bytes of output
+#
+# It does not merely fail to answer. It never exits, and it prints its own
+# "qm>" prompt into the caller's terminal - so qm_bytes_read never returned,
+# press_a_key hung inside it forever, and the VM sat on an unanswered boot
+# prompt until it timed out into "No bootable option or device was found".
+# That was the real cause of two failed builds. qm monitor wants a terminal;
+# a pipe does not satisfy it, and there is no flag that changes this.
+#
+# "qm status <vmid> --verbose" needs no terminal, exits by itself, and carries
+# the same counters in an indented stanza per device:
+#
+#     blockstat:
+#             ide0:
+#                     rd_bytes: 3405824
+#                     rd_operations: 1663
+#
+# It asks for the named device and, failing that, totals every rd_bytes it saw.
+# The fallback matters because guessing the device name wrong would not merely
+# lose the DVD counter, it would drop press_a_key into its blind mode - the one
+# branch that cannot tell a boot prompt from Setup's Cancel button. Totalling
+# is honest at this point in the boot because the disk is still blank and
+# nothing but the DVD is being read at any volume. Any rd_bytes at all means
+# the counter was readable, so a total of zero still prints.
+#
+# The timeout is belt and braces. Nothing in this loop may be allowed to block
+# forever again.
 qm_bytes_read() {
-  local dev="$1" out
-  out="$(printf 'info blockstats\n' | qm monitor "$VMID" 2>/dev/null)" || return 0
-  printf '%s\n' "$out" | awk -v d="$dev" '
-    match($0, /rd_bytes=[0-9]+/) {
-      n = substr($0, RSTART + 9, RLENGTH - 9)
+  local dev="$1"
+  timeout 10 qm status "$VMID" --verbose 2>/dev/null | awk -v d="$dev" '
+    /^blockstat:/            { inb = 1; next }
+    inb && /^[^[:space:]]/   { inb = 0 }
+    inb && NF == 1 && $1 ~ /:$/ { cur = substr($1, 1, length($1) - 1); next }
+    inb && $1 == "rd_bytes:" {
       any = 1
-      if ($0 ~ d) { named = n; found = 1 }
-      total += n
+      total += $2
+      if (cur == d) { named = $2; found = 1 }
     }
     END { if (found) print named; else if (any) print total }'
 }
@@ -1514,11 +1539,14 @@ qm_bytes_read() {
 #
 # The second version got the other half wrong. It kept the stop condition but
 # still pressed on a schedule, inside a fixed twenty-second window opening the
-# moment qm start returned - and every pass spawns qm monitor and qm sendkey,
-# two Perl programs, so twenty seconds bought seven or eight presses. OVMF with
-# a TPM to measure does not usually reach the DVD that fast. The operator
-# watched the whole window expire before the prompt appeared and then answered
-# it by hand.
+# moment qm start returned - and every pass spawns two Perl programs, so twenty
+# seconds bought seven or eight presses. OVMF with a TPM to measure does not
+# usually reach the DVD that fast. The operator watched the whole window expire
+# before the prompt appeared and then answered it by hand.
+#
+# The third version had the logic right and could not run it, because it read
+# the counter through qm monitor, which hangs on piped input. See qm_bytes_read
+# above. Watching that happen on the real host is what produced this version.
 #
 # Both halves are the same question - is the prompt on screen right now - and
 # the byte counter answers it. Zero means the firmware has not opened the disc
@@ -1554,7 +1582,7 @@ press_a_key() {
   done
 
   if [[ ! "$bytes" =~ ^[0-9]+$ ]]; then
-    msg_warn "Cannot read the DVD's byte counter from the monitor - pressing blind"
+    msg_warn "Cannot read the DVD's byte counter from qm status - pressing blind"
     deadline=$((SECONDS + BOOT_KEY_BLIND_SECONDS))
     while (( SECONDS < deadline )); do
       qm sendkey "$VMID" "$BOOT_KEY" >/dev/null 2>&1 || true

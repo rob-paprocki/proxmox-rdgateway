@@ -275,13 +275,24 @@ qm sendkey 9000 ret
 
 Knowing *when* to send it is the whole difficulty, and guessing does not work in either direction. Sending Enter on a fixed schedule for a fixed minute reaches Windows Setup, which shows a Cancel button that takes focus, so the surplus keypresses open and close its confirmation dialog for the rest of the minute. Shortening the window to twenty seconds instead expires before OVMF has finished measuring the TPM and looked at the DVD at all, so the prompt appears to an audience of nobody. Both were tried on real builds.
 
-What the VM will tell you, through the QEMU monitor, is how many bytes it has read off the DVD:
+What the VM will tell you is how many bytes it has read off the DVD:
 
 ```bash
-echo 'info blockstats' | qm monitor 9000
+qm status 9000 --verbose | sed -n '/^blockstat:/,/^[a-z]/p'
 ```
 
-Zero means the firmware has not opened the disc yet, so there is nothing to answer. A number that has stopped climbing means the firmware read a loader and is now waiting for somebody, which is the prompt. A number still climbing means Setup is streaming `boot.wim` and no key of yours is wanted. The script polls that counter once a second and sends Enter only in the middle case, which is why it can afford to wait a patient three minutes without ever touching Cancel. `BOOT_KEY_SECONDS` sets that ceiling. If the monitor cannot be read at all the script says so and falls back to pressing blind, on a deliberately short leash, because blind is the mode that cannot tell a boot prompt from a Cancel button.
+```
+blockstat:
+        ide0:
+                rd_bytes: 3405824      <- the Windows DVD
+                rd_operations: 1663
+        ide2:
+                rd_bytes: 163840       <- the VirtIO CD
+```
+
+Zero means the firmware has not opened the disc yet, so there is nothing to answer. A number that has stopped climbing means the firmware read a loader and is now waiting for somebody, which is the prompt. A number still climbing means Setup is streaming `boot.wim` and no key of yours is wanted. The script polls that counter once a second and sends Enter only in the middle case, which is why it can afford to wait a patient three minutes without ever touching Cancel. `BOOT_KEY_SECONDS` sets that ceiling. If the counter cannot be read at all the script says so and falls back to pressing blind, on a deliberately short leash, because blind is the mode that cannot tell a boot prompt from a Cancel button.
+
+Use `qm status`, not `qm monitor`. The monitor looks like the natural home for this and it is a trap: `printf 'info blockstats\n' | qm monitor 9000` prints nothing at all, never exits, and leaves its own `qm>` prompt sitting in your terminal. Piped that way it took the build script down with it twice.
 
 This happens on the unattended path only. Without an answer file, Windows Setup is a live wizard within the first minute, and a stray Enter would click through the language screen, **Install now**, the edition list and the EULA before you had looked at the console. So the shell-only path leaves the prompt to you.
 

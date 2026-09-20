@@ -128,6 +128,25 @@ over. Remove the prompt and you get an endless reinstall loop unless something a
 changes the boot order mid-install, which nothing does. `press_a_key` answers it once
 from the host instead, which leaves the timeout behaviour intact for every later boot.
 
+**`qm monitor` for reading anything programmatically.** It is the obvious home for
+`info blockstats`, and `qm(1)` documents it, so the next reader will reach for it.
+Measured on the operator's PVE 9.2.20 host against a running VM:
+
+```bash
+printf 'info blockstats\n' | qm monitor 200     # exit 124 under timeout 10, no output
+```
+
+It does not merely fail to answer. It never exits, and it prints its own `qm>` prompt
+into the caller's terminal. `press_a_key` called it in a command substitution, so
+`qm_bytes_read` never returned, the loop hung forever, and the VM sat on an unanswered
+boot prompt until OVMF gave up with "No bootable option or device was found". That is
+the true cause of the second and third failed builds - not the timing, which had already
+been fixed. `qm monitor` wants a terminal and a pipe does not satisfy it. Use
+`qm status <vmid> --verbose`, which needs no terminal, exits by itself, and carries the
+same counters under `blockstat:` as one indented stanza per device (`ide0:`, `ide2:`,
+`efidisk0:`, each with `rd_bytes:`). Every call still goes through `timeout`, because
+nothing in that loop may be allowed to block forever again.
+
 **WARP / Cloudflare One client, Tailscale, any client-side agent.** Violates the
 no-install-on-clients constraint.
 
@@ -196,7 +215,16 @@ bug will surface.
   `Win32_TSGatewayResourceAuthorizationPolicy`, which documents exactly three values -
   `RG`, `CG`, `ALL` - and gives `ALL` as "All resources". What `ResourceGroupName`
   should be alongside `ALL` is *not* documented; the empty string is convention.
-- `qm sendkey <vmid> <key>` is confirmed against the `qm` manual page.
+- `qm sendkey <vmid> <key>` is confirmed **on the real host**, not just against the
+  manual page: a VM parked on "Press any key to enter the Boot Manager Menu" was sent
+  `qm sendkey 200 ret` and the menu opened. Key injection was never the broken part.
+- The byte counter is read with `qm status <vmid> --verbose`, and its output format is
+  confirmed on the real host: `blockstat:` followed by one tab-indented stanza per
+  device, `ide0:` being the Windows DVD. Observed mid-boot with the prompt on screen:
+  `ide0: rd_bytes: 3405824, rd_operations: 1663`, which is the firmware having read a
+  loader and stopped - exactly the state `press_a_key` presses in. The parser is unit
+  tested against a transcription of that output, including a device legitimately
+  reading `0` (must return `"0"`, not empty) and a stopped VM (must return empty).
 - **An adversarial review pass ran over this branch** (six independent finders, one
   triage, two refuters per finding, opus tiebreak on disagreement). It produced 22 raw
   findings, 20 unique, all 20 read back against the source and confirmed. Every one is
@@ -378,7 +406,7 @@ dgw-setup.log` and stays
   after that fix: **stopping on evidence is only half of it, and starting on a timer
   loses the prompt.** That version kept the byte-counter stop but still pressed on a
   schedule inside a fixed twenty seconds opening the moment `qm start` returned, and each
-  pass spawns `qm monitor` and `qm sendkey`, two Perl programs, so the window bought
+  pass spawns two Perl programs, so the window bought
   seven or eight presses. OVMF with a TPM to measure does not reach the DVD that fast.
   The operator watched the window expire and answered the prompt by hand. Both halves are
   the same question - is the prompt on screen now - so the counter answers both: zero
@@ -389,8 +417,13 @@ dgw-setup.log` and stays
   Covered by four stubbed scenarios; the load-bearing one is `neverboots`, where the DVD
   is never opened and the correct number of keypresses is **zero**. Do not reintroduce a
   press that is not conditioned on the counter having stopped moving. The blind path,
-  when the monitor will not answer at all, keeps its own short budget
+  when the counter will not answer at all, keeps its own short budget
   (`BOOT_KEY_BLIND_SECONDS`) precisely because it cannot make that distinction.
+  The fourth lesson, and the one that actually cost the builds: **the logic was right
+  and could not run**, because it read the counter through `qm monitor`, which hangs on
+  piped input and took the whole script with it. See the `qm monitor` entry under "Ruled
+  out". Correct reasoning about the wrong mechanism still fails on real hardware, and
+  only running it on real hardware showed which.
 - **A bare `whiptail --msgbox` aborts the script.** Under `set -Eeuo pipefail`,
   whiptail returns non-zero when a box is dismissed with Esc, the `ERR` trap fires, and
   every answer already typed is gone. Every informational box ends `|| true`. Every box
