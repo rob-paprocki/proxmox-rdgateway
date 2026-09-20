@@ -23,15 +23,26 @@
 #      DRY_RUN=1 bash windows-rdgw-vm.sh     # print every command, run nothing
 #                                            # and echo the generated answer file
 #
+#  Environment overrides:
+#
+#      REPO_REF           branch or tag to fetch the PowerShell files from
+#      REPO_RAW           a different raw URL prefix entirely, e.g. a fork
+#      BOOT_KEY_SECONDS   how long to keep answering the DVD's "press any key
+#                         to boot" prompt after the VM starts (default 60)
+#
 #  What it touches on the network:
 #
 #    - the VirtIO driver ISO, only if you have none and ask it to download one
-#    - Setup-RDGateway.ps1, Configure-Guest.ps1 and Invoke-GatewaySetup.ps1,
-#      only on the unattended path and only when they are not already sitting
-#      next to this script. Local copies always win, so from a checkout nothing
-#      is fetched. Those three are copied to the unattend ISO and run inside
-#      the guest — they are never executed on the Proxmox host. Every URL is
-#      printed before it is fetched, and REPO_REF pins the branch or tag.
+#    - Setup-RDGateway.ps1, Configure-Guest.ps1, Invoke-GatewaySetup.ps1 and
+#      Invoke-CustomScripts.ps1, only on the unattended path and only when they
+#      are not already sitting next to this script. Local copies always win, so
+#      from a checkout nothing is fetched. Those four are copied to the unattend
+#      ISO and run inside the guest — they are never executed on the Proxmox
+#      host. Every URL is printed before it is fetched, and REPO_REF pins the
+#      branch or tag.
+#
+#  Scripts of your own, if you supply any, are read from a directory you name
+#  and copied to that same ISO. They are never run here either.
 #
 #  Nothing else leaves the machine. Read every line before you run it.
 #
@@ -62,14 +73,31 @@ else
 fi
 unset _src
 
-# The unattend ISO carries three PowerShell files. Running from a checkout they
+# The unattend ISO carries four PowerShell files. Running from a checkout they
 # are already next to this script; running from the one-liner they have to be
 # fetched. Pin a different ref or point somewhere else entirely with:
 #   REPO_REF=some-branch bash -c "$(curl -fsSL .../windows-rdgw-vm.sh)"
 REPO_REF="${REPO_REF:-main}"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/${REPO_REF}}"
-SUPPORT_FILES=(Setup-RDGateway.ps1 Configure-Guest.ps1 Invoke-GatewaySetup.ps1)
+SUPPORT_FILES=(Setup-RDGateway.ps1 Configure-Guest.ps1 Invoke-GatewaySetup.ps1 Invoke-CustomScripts.ps1)
 SUPPORT_DIR=""
+
+# How long to keep answering the Windows DVD's "press any key to boot" prompt
+# after the VM starts. See press_a_key for why that is necessary.
+BOOT_KEY_SECONDS="${BOOT_KEY_SECONDS:-60}"
+
+# Scripts of your own, in the four categories the schneegans.de generator uses.
+# CUSTOM_STAGE is a mktemp tree laid out as <category>/<filename>, created only
+# if you actually add something. The exit trap removes it.
+CUSTOM_CATEGORIES=(System DefaultUser FirstLogon UserOnce)
+CUSTOM_STAGE=""
+CUSTOM_CATEGORY=""
+CUSTOM_EXT=""
+
+# Answered by pick_resource_scope. Initialised here so the most restrictive
+# setting is the one a future reordering would fall back to, never the widest.
+RESOURCE_SCOPE="ThisServerOnly"
+TARGET_MACHINES=""
 
 # Set while an unattend ISO is being built, so the exit trap can clean up a
 # loop mount, a staging directory or a download directory if something fails
@@ -111,6 +139,7 @@ cleanup_handler() {
   fi
   [[ -n "$UNATTEND_STAGE" ]] && rm -rf "$UNATTEND_STAGE"
   [[ -n "$UNATTEND_SUPPORT" ]] && rm -rf "$UNATTEND_SUPPORT"
+  [[ -n "$CUSTOM_STAGE" ]] && rm -rf "$CUSTOM_STAGE"
   return 0
 }
 trap cleanup_handler EXIT
@@ -126,6 +155,39 @@ shell_quote() {
     fi
   done
   printf '%s' "${out% }"
+}
+
+# Everything the wizard asks for comes back from whiptail with no character
+# restriction, and both generated files have their own quoting rules. Tr0ub4dor&3
+# is a perfectly ordinary Windows password and a bare & is not well-formed XML:
+# without these, Setup rejects the answer file twenty minutes into a build the
+# script already called ready.
+xml_escape() {
+  local s="$1"
+  # Do not drop the backslashes. bash 5.2 turned on patsub_replacement, which
+  # makes an unquoted & in the replacement mean "the text that matched", so
+  # ${s//</&lt;} yields <lt; on a Proxmox VE 8 host and the escaping quietly
+  # achieves nothing. Escaping the & is correct on 5.1 too, where quote removal
+  # simply drops the backslash.
+  s="${s//&/\&amp;}"
+  s="${s//</\&lt;}"
+  s="${s//>/\&gt;}"
+  printf '%s' "$s"
+}
+
+# An XML comment additionally cannot contain a double hyphen.
+xml_comment() {
+  local s
+  s="$(xml_escape "$1")"
+  printf '%s' "${s//--/- -}"
+}
+
+# PowerShell wants a literal ' inside a single-quoted string doubled. Without
+# this an account named O'Brien produces a data file that throws before any of
+# Invoke-GatewaySetup.ps1's own diagnostics can run.
+psd1_quote() {
+  local s="${1//\'/\'\'}"
+  printf "'%s'" "$s"
 }
 
 run() {
@@ -341,7 +403,7 @@ ask_password() {
     second="$(whiptail --backtitle "$APP" --title "Administrator password" \
       --passwordbox "Type it again." 10 70 3>&1 1>&2 2>&3)" || exit_script
     if [[ "$first" != "$second" ]]; then
-      whiptail --backtitle "$APP" --title "Mismatch" --msgbox "Those did not match. Try again." 8 50
+      whiptail --backtitle "$APP" --title "Mismatch" --msgbox "Those did not match. Try again." 8 50 || true
       continue
     fi
     if [[ -z "$first" ]]; then
@@ -352,6 +414,489 @@ ask_password() {
     if [[ -z "$first" ]]; then BLANK_PASSWORD="true"; else BLANK_PASSWORD="false"; fi
     return
   done
+}
+
+# Which machines the gateway will proxy connections to. This is the resource
+# side of the policy pair: the CAP decides who gets through the gateway at all,
+# and this decides what they may reach once they are.
+#
+# Setup-RDGateway.ps1 turns AnyResource into a RAP with ResourceGroupType 'ALL'
+# and the other two into a named resource group holding an explicit list.
+pick_resource_scope() {
+  local choice
+  choice="$(whiptail --backtitle "$APP" --title "What clients may reach" --radiolist \
+    "Once someone is through the gateway, what should they be allowed to reach?\n\nEvery target still needs Remote Desktop switched on and your account in its own local Remote Desktop Users group. The gateway decides where you may tunnel, not what you may log into." 17 78 3 \
+    "any"    "Any machine the gateway can reach"       ON  \
+    "listed" "Only machines I name, plus the gateway"  OFF \
+    "self"   "Only the gateway itself"                 OFF 3>&1 1>&2 2>&3)" || exit_script
+
+  TARGET_MACHINES=""
+  case "$choice" in
+    any)
+      RESOURCE_SCOPE="AnyResource"
+      whiptail --backtitle "$APP" --title "Any machine" --msgbox \
+        "Anything this server can route to is reachable through it.\n\nThat is a jump host: a credential that passes the connection policy reaches your whole LAN rather than a chosen list. Windows Firewall on each target is still in the way, and each target still controls its own Remote Desktop Users group." 14 72 || true
+      ;;
+    listed)
+      RESOURCE_SCOPE="Listed"
+      ask "Machines to allow (space separated names or IPs)" ""
+      TARGET_MACHINES="$ASK_RESULT"
+      ;;
+    self)
+      RESOURCE_SCOPE="ThisServerOnly"
+      ;;
+  esac
+}
+
+# Count the script files directly inside a directory. Anything we cannot hand
+# to a documented Windows interpreter is ignored rather than silently copied.
+count_scripts() {
+  local d="$1" n=0 f
+  if [[ -d "$d" ]]; then
+    for f in "$d"/*.ps1 "$d"/*.cmd "$d"/*.bat "$d"/*.reg; do
+      [[ -f "$f" ]] && n=$((n + 1))
+    done
+  fi
+  printf "%s" "$n"
+}
+
+# ------------------------------------------------------------------------------
+# Scripts of your own
+#
+# Four categories, run on the new machine at four different moments. The names
+# and the timing come from the schneegans.de unattend generator, because that
+# is the vocabulary most people arrive with:
+#
+#   System       as SYSTEM on the first boot, before anyone logs on
+#   DefaultUser  as SYSTEM with C:\Users\Default\NTUSER.DAT mounted, so what
+#                you write lands in every profile created afterwards
+#   FirstLogon   at the first interactive logon, elevated
+#   UserOnce     at each new user's first logon, in that user's own context
+#
+# You can write one here or import files you already have. Either way it ends
+# up in one staging tree laid out as <category>/<filename>, which
+# build_unattend_iso copies onto the CD. That tree is a mktemp directory the
+# exit trap removes, so the helpers below write to it directly instead of
+# through run(): there is nothing here for DRY_RUN to protect you from, and the
+# answer file needs the real counts to decide what to register.
+# ------------------------------------------------------------------------------
+
+# Sets CUSTOM_STAGE. Deliberately not a function that prints the path: calling
+# it as "$(custom_stage_dir)" would run the assignment in a subshell and the
+# global would come back empty on the other side.
+custom_stage_dir() {
+  [[ -n "$CUSTOM_STAGE" ]] || CUSTOM_STAGE="$(mktemp -d)"
+}
+
+custom_total() {
+  local cat total=0
+  if [[ -n "$CUSTOM_STAGE" ]]; then
+    for cat in "${CUSTOM_CATEGORIES[@]}"; do
+      total=$((total + $(count_scripts "${CUSTOM_STAGE}/${cat}")))
+    done
+  fi
+  printf '%s' "$total"
+}
+
+custom_when_text() {
+  case "$1" in
+    System)      printf 'before anyone logs on, as SYSTEM' ;;
+    DefaultUser) printf 'Default User hive mounted, as SYSTEM' ;;
+    FirstLogon)  printf 'the first interactive logon, elevated' ;;
+    UserOnce)    printf "each new user's first logon, as them" ;;
+  esac
+}
+
+# Cancel on these two goes back to the menu rather than out of the script, so
+# they return non-zero instead of calling exit_script the way the others do.
+pick_custom_category() {
+  CUSTOM_CATEGORY="$(whiptail --backtitle "$APP" --title "When should it run?" --radiolist \
+    "Pick the phase. These are the schneegans.de category names." 15 74 4 \
+    "System"      "$(custom_when_text System)"      ON  \
+    "DefaultUser" "$(custom_when_text DefaultUser)" OFF \
+    "FirstLogon"  "$(custom_when_text FirstLogon)"  OFF \
+    "UserOnce"    "$(custom_when_text UserOnce)"    OFF 3>&1 1>&2 2>&3)" || return 1
+  [[ -n "$CUSTOM_CATEGORY" ]]
+}
+
+pick_custom_kind() {
+  CUSTOM_EXT="$(whiptail --backtitle "$APP" --title "What kind of script?" --radiolist \
+    "The extension is what picks the interpreter on the other end." 13 74 3 \
+    "ps1" "PowerShell   run with powershell.exe" ON  \
+    "cmd" "Batch        run with cmd.exe /c"     OFF \
+    "reg" "Registry     imported with reg.exe"   OFF 3>&1 1>&2 2>&3)" || return 1
+  [[ -n "$CUSTOM_EXT" ]]
+}
+
+# Open the editor on something rather than a blank page, so the context is in
+# front of you while you write and still there if the file is read later.
+custom_seed_file() {
+  local path="$1" cat="$2" ext="$3" when
+  when="$(custom_when_text "$cat")"
+
+  case "$ext" in
+    ps1)
+      cat >"$path" <<SEEDEOF
+# ${cat} script for this RD Gateway build.
+#
+# Runs at:     ${when}
+# Started as:  powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+#
+# Output and the exit code go to C:\\Windows\\Setup\\Scripts\\rdgw-setup.log.
+# A non-zero exit is logged and skipped rather than stopping the build, and
+# anything still running after fifteen minutes is killed.
+
+SEEDEOF
+      ;;
+    cmd)
+      cat >"$path" <<SEEDEOF
+@echo off
+:: ${cat} script for this RD Gateway build.
+::
+:: Runs at:     ${when}
+:: Started as:  cmd.exe /c
+::
+:: Output and the exit code go to C:\\Windows\\Setup\\Scripts\\rdgw-setup.log.
+
+SEEDEOF
+      ;;
+    reg)
+      cat >"$path" <<SEEDEOF
+Windows Registry Editor Version 5.00
+
+; ${cat} script for this RD Gateway build.
+;
+; Runs at:     ${when}
+; Imported by: reg.exe import
+SEEDEOF
+      if [[ "$cat" == "DefaultUser" ]]; then
+        cat >>"$path" <<SEEDEOF
+;
+; Write HKEY_CURRENT_USER as though you were the logged-on user. It is
+; rewritten to point at the mounted Default User hive before it is imported,
+; so what you set here is inherited by every profile created afterwards.
+SEEDEOF
+      fi
+      printf '\n' >>"$path"
+      ;;
+  esac
+
+  # Only .reg files get rewritten for the mounted hive. A .ps1 or .cmd in this
+  # category runs as SYSTEM with nobody logged on, so HKCU points at SYSTEM's
+  # own profile and a write there reaches no real user. Say where the hive is.
+  if [[ "$cat" == "DefaultUser" && "$ext" != "reg" ]]; then
+    case "$ext" in
+      ps1)
+        cat >>"$path" <<'HIVEEOF'
+# Nobody is logged on yet, so HKCU: here is SYSTEM's own profile, not the one
+# new accounts inherit. The Default User hive is mounted for you:
+#
+#   $env:RDGW_HIVE_PATH    Registry::HKEY_USERS\rdgwDefault
+#
+#   New-Item -Path "$env:RDGW_HIVE_PATH\Software\Example" -Force
+#   New-ItemProperty -Path "$env:RDGW_HIVE_PATH\Software\Example" `
+#       -Name Sample -Value 1 -PropertyType DWord -Force
+
+HIVEEOF
+        ;;
+      cmd)
+        cat >>"$path" <<'HIVEEOF'
+:: Nobody is logged on yet, so HKCU here is SYSTEM's own profile. The Default
+:: User hive is mounted at %RDGW_HIVE_ROOT% (HKU\rdgwDefault) - write there:
+::
+::   reg add "%RDGW_HIVE_ROOT%\Software\Example" /v Sample /t REG_DWORD /d 1 /f
+
+HIVEEOF
+        ;;
+    esac
+  fi
+}
+
+# Can we actually reach the terminal by name? [[ -r /dev/tty ]] is not enough:
+# the node can exist and still refuse to open when there is no controlling
+# terminal. Try it for real rather than asking about it.
+custom_have_tty() {
+  { true </dev/tty >/dev/tty; } 2>/dev/null
+}
+
+# $VISUAL and $EDITOR first, then what Proxmox actually ships.
+custom_find_editor() {
+  local e
+  for e in "${VISUAL:-}" "${EDITOR:-}" nano vim vi; do
+    [[ -n "$e" ]] || continue
+    if command -v "${e%% *}" >/dev/null 2>&1; then
+      printf '%s' "$e"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# No editor on the box. Take the body off the terminal instead. /dev/tty and
+# not stdin, because in the one-liner form stdin has already been spent on the
+# script itself.
+custom_paste_into() {
+  local path="$1" line
+  printf "\n   Paste the script, then a line containing only ${BL}EOF${CL}\n\n"
+  while IFS= read -r line; do
+    [[ "$line" == "EOF" ]] && break
+    printf '%s\n' "$line" >>"$path"
+  done < <(if custom_have_tty; then cat /dev/tty; else cat; fi)
+  printf "\n"
+}
+
+# Did anything survive besides the header we seeded and blank lines?
+custom_has_content() {
+  local path="$1" line trimmed
+  while IFS= read -r line; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$trimmed" ]] && continue
+    case "$trimmed" in
+      "#"*|"::"*|";"*|"@echo off"|"Windows Registry Editor"*) continue ;;
+      [Rr][Ee][Mm][[:space:]]*) continue ;;
+    esac
+    return 0
+  done <"$path"
+  return 1
+}
+
+# Turn whatever was typed into something every later stage can actually see.
+#
+# Three things bite here. A name ending in "/" leaves ${x##*/} empty, so the
+# file becomes ".ps1" - a dotfile, which bash globs skip without dotglob, so it
+# is staged and then invisible to every count, listing and copy. A name with a
+# space survives all the way to the guest and then breaks Start-Process, which
+# joins its argument array without quoting. And a name that is only an
+# extension leaves nothing to sort on.
+custom_safe_name() {
+  local raw="$1" ext="$2" fallback="$3" name
+  name="${raw##*/}"
+  name="${name//[[:space:]]/-}"
+  [[ "$name" == *".${ext}" ]] || name="${name}.${ext}"
+  case "$name" in
+    .*) name="$fallback" ;;
+  esac
+  [[ -n "${name%.*}" ]] || name="$fallback"
+  printf '%s' "$name"
+}
+
+# Copy one script into the staging tree, refusing anything a Windows
+# interpreter cannot be handed. Returns non-zero and says why if it cannot.
+custom_copy_in() {
+  local src="$1" cat="$2" dst
+  case "$src" in
+    *.ps1|*.cmd|*.bat|*.reg|*.PS1|*.CMD|*.BAT|*.REG) ;;
+    *)
+      whiptail --backtitle "$APP" --title "Not a script" --msgbox \
+        "$(basename -- "$src")\n\nOnly .ps1, .cmd, .bat and .reg can be run on the other end." 10 68 || true
+      return 1 ;;
+  esac
+  dst="${CUSTOM_STAGE}/${cat}"
+  mkdir -p "$dst" || { msg_error "Could not create ${dst}"; return 1; }
+  cp -- "$src" "${dst}/" || { msg_error "Could not copy ${src}"; return 1; }
+  return 0
+}
+
+custom_write_script() {
+  local stage cat ext name path editor next
+  local -a ed
+
+  pick_custom_category || return 0
+  cat="$CUSTOM_CATEGORY"
+  pick_custom_kind || return 0
+  ext="$CUSTOM_EXT"
+
+  custom_stage_dir
+  stage="$CUSTOM_STAGE"
+  mkdir -p "${stage}/${cat}"
+
+  # Numbered in tens so there is room to slot something in between, and taken
+  # from the highest prefix already present rather than the count - after a
+  # removal the count would hand back a number that is still in use. Zero
+  # padded because the runner sorts these as text, where 100 sorts before 20.
+  next="$(ls -1 "${stage}/${cat}" 2>/dev/null | sed -n 's/^0*\([0-9]\{1,\}\)-.*/\1/p' | sort -n | tail -1)"
+  next=$(( (${next:-0} / 10 + 1) * 10 ))
+  next="$(printf '%03d' "$next")"
+
+  ask "File name (scripts run in filename order)" "${next}-script.${ext}"
+  name="$(custom_safe_name "$ASK_RESULT" "$ext" "${next}-script.${ext}")"
+  path="${stage}/${cat}/${name}"
+
+  if [[ -e "$path" ]]; then
+    whiptail --backtitle "$APP" --title "Already there" --yesno \
+      "${cat}/${name} already exists.\n\nOverwrite it? Saying no takes you back to the menu." 10 68 --defaultno || return 0
+  fi
+
+  custom_seed_file "$path" "$cat" "$ext"
+
+  if editor="$(custom_find_editor)"; then
+    read -r -a ed <<<"$editor"
+    msg_info "Opening ${BL}${cat}/${name}${CL} in ${BL}${ed[0]}${CL}"
+    # whiptail has been drawing on the terminal, so hand it over properly. In
+    # the one-liner form stdin is not the terminal, hence asking for it by
+    # name - but only when it is actually there to ask for.
+    if custom_have_tty; then
+      "${ed[@]}" "$path" </dev/tty >/dev/tty 2>&1 || true
+    else
+      "${ed[@]}" "$path" || true
+    fi
+    # code, subl, gedit and friends fork and return immediately, so without
+    # this the content check below runs against a file nobody has typed into
+    # yet and deletes it out from under the open window.
+    case "${ed[0]##*/}" in
+      code|code-insiders|codium|subl|sublime_text|gedit|atom|kate|gnome-text-editor)
+        msg_warn "${ed[0]##*/} returns straight away - it does not wait for you to close it"
+        if custom_have_tty; then
+          printf "   Press Enter once you have saved and closed it. "
+          read -r _ </dev/tty || true
+          printf "\n"
+        fi ;;
+    esac
+  else
+    msg_warn "No editor found - tried \$VISUAL, \$EDITOR, nano, vim, vi"
+    custom_paste_into "$path"
+  fi
+
+  if custom_has_content "$path"; then
+    msg_ok "Added ${BL}${cat}/${name}${CL}"
+  else
+    rm -f "$path"
+    whiptail --backtitle "$APP" --title "Nothing saved" --msgbox \
+      "${name} had nothing in it beyond the header, so it was discarded." 9 68 || true
+  fi
+}
+
+custom_import_path() {
+  local src cat f added=0 loose base
+
+  ask "File or directory to import" "/root/rdgw-scripts"
+  src="${ASK_RESULT%/}"
+  [[ -n "$src" ]] || return 0
+
+  if [[ -f "$src" ]]; then
+    pick_custom_category || return 0
+    custom_stage_dir
+    base="$(basename -- "$src")"
+    custom_copy_in "$src" "$CUSTOM_CATEGORY" || return 0
+    msg_ok "Added ${BL}${CUSTOM_CATEGORY}/${base}${CL}"
+    return 0
+  fi
+
+  if [[ ! -d "$src" ]]; then
+    whiptail --backtitle "$APP" --title "Not found" --msgbox \
+      "${src} is not a file or a directory." 8 66 || true
+    return 0
+  fi
+
+  custom_stage_dir
+  for cat in "${CUSTOM_CATEGORIES[@]}"; do
+    [[ -d "${src}/${cat}" ]] || continue
+    for f in "${src}/${cat}"/*.ps1 "${src}/${cat}"/*.cmd "${src}/${cat}"/*.bat "${src}/${cat}"/*.reg; do
+      [[ -f "$f" ]] || continue
+      custom_copy_in "$f" "$cat" && added=$((added + 1))
+    done
+  done
+
+  # Scripts sitting loose at the top level are offered whether or not a
+  # category subdirectory also matched. Gating this on "nothing else matched"
+  # meant a mixed directory imported the subdirectories and dropped the loose
+  # files without saying so.
+  loose="$(count_scripts "$src")"
+  if [[ "$loose" -gt 0 ]]; then
+    if whiptail --backtitle "$APP" --title "Loose scripts" --yesno \
+        "${src} also holds ${loose} script(s) directly, outside the ${CUSTOM_CATEGORIES[*]} subdirectories.\n\nTreat those as System scripts?" 13 72; then
+      for f in "$src"/*.ps1 "$src"/*.cmd "$src"/*.bat "$src"/*.reg; do
+        [[ -f "$f" ]] || continue
+        custom_copy_in "$f" System && added=$((added + 1))
+      done
+    fi
+  fi
+
+  if [[ "$added" -eq 0 ]]; then
+    whiptail --backtitle "$APP" --title "Nothing to import" --msgbox \
+      "No .ps1, .cmd, .bat or .reg files under ${src}." 9 70 || true
+  else
+    msg_ok "Imported ${added} script(s) from ${BL}${src}${CL}"
+  fi
+}
+
+custom_review() {
+  local cat f rel choice
+  local -a rows=()
+
+  if [[ -n "$CUSTOM_STAGE" ]]; then
+    for cat in "${CUSTOM_CATEGORIES[@]}"; do
+      for f in "${CUSTOM_STAGE}/${cat}"/*.ps1 "${CUSTOM_STAGE}/${cat}"/*.cmd \
+               "${CUSTOM_STAGE}/${cat}"/*.bat "${CUSTOM_STAGE}/${cat}"/*.reg; do
+        [[ -f "$f" ]] || continue
+        rel="${cat}/$(basename -- "$f")"
+        rows+=("$rel" "$(custom_when_text "$cat")" "OFF")
+      done
+    done
+  fi
+
+  if [[ "${#rows[@]}" -eq 0 ]]; then
+    whiptail --backtitle "$APP" --title "Custom scripts" --msgbox \
+      "Nothing added yet." 8 50 || true
+    return 0
+  fi
+
+  choice="$(whiptail --backtitle "$APP" --title "What will be included" --radiolist \
+    "All of these go on the CD, in filename order within each category.\n\nPick one to remove it, or leave it on 'keep everything'." 20 78 9 \
+    "keep everything" "" ON "${rows[@]}" 3>&1 1>&2 2>&3)" || return 0
+
+  if [[ -n "$choice" && "$choice" != "keep everything" ]]; then
+    rm -f "${CUSTOM_STAGE}/${choice}"
+    msg_ok "Removed ${BL}${choice}${CL}"
+  fi
+}
+
+pick_custom_scripts() {
+  local choice total
+
+  whiptail --backtitle "$APP" --title "Custom scripts" --yesno \
+    "Run scripts of your own on the new machine?\n\nWrite them here, or import files already sitting on this host. Each one is tagged with when it should run:\n\n  System        before anyone logs on, as SYSTEM\n  DefaultUser   with the Default User hive mounted\n  FirstLogon    the first interactive logon, elevated\n  UserOnce      each new user's first logon\n\nPowerShell, batch and .reg files are all supported." 21 76 --defaultno || return 0
+
+  while true; do
+    total="$(custom_total)"
+    choice="$(whiptail --backtitle "$APP" --title "Custom scripts (${total} so far)" --menu \
+      "" 14 76 4 \
+      "write"  "Write a new script here" \
+      "import" "Import a file or a directory from this host" \
+      "review" "Review what will be included, or remove one" \
+      "done"   "Finished" 3>&1 1>&2 2>&3)" || return 0
+
+    case "$choice" in
+      write)  custom_write_script ;;
+      import) custom_import_path ;;
+      review) custom_review ;;
+      *)      return 0 ;;
+    esac
+  done
+}
+
+# Copy what you added onto the CD. It goes under rdgw/ so the existing
+# specialize xcopy carries it across with everything else; no extra answer-file
+# command is needed to place it.
+stage_custom_scripts() {
+  local stage="$1" cat src dst f staged=0
+
+  [[ -n "$CUSTOM_STAGE" ]] || return 0
+
+  msg_info "Staging custom scripts"
+  for cat in "${CUSTOM_CATEGORIES[@]}"; do
+    src="${CUSTOM_STAGE}/${cat}"
+    [[ -d "$src" ]] || continue
+
+    dst="${stage}/rdgw/custom/${cat}"
+    for f in "$src"/*.ps1 "$src"/*.cmd "$src"/*.bat "$src"/*.reg; do
+      [[ -f "$f" ]] || continue
+      run mkdir -p "$dst"
+      run cp "$f" "${dst}/"
+      staged=$((staged + 1))
+    done
+  done
+  msg_ok "Custom scripts staged (${staged})"
 }
 
 unattend_settings() {
@@ -368,8 +913,7 @@ unattend_settings() {
   ask "Windows time zone ID" "Eastern Standard Time"
   WIN_TIMEZONE="$ASK_RESULT"
 
-  ask "Target machines to reach (space separated, blank for this server only)" ""
-  TARGET_MACHINES="$ASK_RESULT"
+  pick_resource_scope
 
   pick_edition
 
@@ -406,6 +950,8 @@ unattend_settings() {
   APPLY_TWEAKS="true"
   whiptail --backtitle "$APP" --title "Server housekeeping" \
     --yesno "Apply the housekeeping settings?\n\n8.3 names off, fast startup off, long paths on, WPBT off, no Windows Update auto-reboot, system sounds off, NumLock on, and Explorer/taskbar/theme defaults suited to RDP.\n\nNone of these are security relevant." 15 72 || APPLY_TWEAKS="false"
+
+  pick_custom_scripts
 }
 
 # Find the three PowerShell files the unattend ISO needs, or fetch them.
@@ -414,32 +960,41 @@ unattend_settings() {
 # them — behaves exactly as before and nothing is downloaded. Only the one-liner
 # path reaches the network, and it prints every URL before fetching it.
 resolve_support_files() {
-  local f missing=0
+  local f fetched=0 local_count=0
 
-  for f in "${SUPPORT_FILES[@]}"; do
-    [[ -f "${SCRIPT_DIR}/${f}" ]] || missing=1
-  done
-
-  if [[ "$missing" -eq 0 ]]; then
-    SUPPORT_DIR="$SCRIPT_DIR"
-    msg_ok "PowerShell files found locally (${BL}${SCRIPT_DIR}${CL})"
-    return
-  fi
-
-  msg_warn "The PowerShell files are not next to this script — fetching them"
-  printf "     from ${BL}%s${CL}\n" "$REPO_RAW"
-  printf "     %sThese are copied to the unattend ISO and run inside the guest, not here.%s\n" "$DIM" "$CL"
-
+  # Resolved one at a time. The old all-or-nothing form meant a single absent
+  # file sent every other one to a download too, so three hand-edited local
+  # copies were quietly excluded from the build in favour of upstream - the
+  # opposite of what "local copies always win" is supposed to mean.
   SUPPORT_DIR="$(mktemp -d)"
   UNATTEND_SUPPORT="$SUPPORT_DIR"
 
   for f in "${SUPPORT_FILES[@]}"; do
-    printf "   ${DIM}\$ curl -fsSL -o %s %s${CL}\n" "${SUPPORT_DIR}/${f}" "${REPO_RAW}/${f}"
+    if [[ -f "${SCRIPT_DIR}/${f}" ]]; then
+      cp -- "${SCRIPT_DIR}/${f}" "${SUPPORT_DIR}/${f}" || {
+        msg_error "Could not read ${SCRIPT_DIR}/${f}"
+        exit 1
+      }
+      local_count=$((local_count + 1))
+      continue
+    fi
+
+    if [[ "$fetched" -eq 0 ]]; then
+      msg_warn "Not every PowerShell file is next to this script — fetching what is missing"
+      printf "     %sThey are copied to the unattend ISO and run inside the guest, not here.%s
+" "$DIM" "$CL"
+    fi
+    fetched=$((fetched + 1))
+
+    printf "   ${DIM}\$ curl -fsSL -o %s %s${CL}
+" "${SUPPORT_DIR}/${f}" "${REPO_RAW}/${f}"
     [[ "$DRY_RUN" == "1" ]] && continue
     if ! curl -fsSL -o "${SUPPORT_DIR}/${f}" "${REPO_RAW}/${f}"; then
       msg_error "Could not download ${f}"
-      printf "     Tried: %s\n" "${REPO_RAW}/${f}"
-      printf "     Check REPO_REF (currently '%s'), or clone the repo and run from there.\n" "$REPO_REF"
+      printf "     Tried: %s
+" "${REPO_RAW}/${f}"
+      printf "     Check REPO_REF (currently '%s'), or clone the repo and run from there.
+" "$REPO_REF"
       exit 1
     fi
     if [[ ! -s "${SUPPORT_DIR}/${f}" ]]; then
@@ -447,7 +1002,12 @@ resolve_support_files() {
       exit 1
     fi
   done
-  msg_ok "Fetched ${#SUPPORT_FILES[@]} PowerShell files (ref ${BL}${REPO_REF}${CL})"
+
+  if [[ "$fetched" -eq 0 ]]; then
+    msg_ok "All ${local_count} PowerShell files found locally (${BL}${SCRIPT_DIR}${CL})"
+  else
+    msg_ok "${local_count} local, ${fetched} fetched from ${BL}${REPO_REF}${CL}"
+  fi
 }
 
 require_iso_tool() {
@@ -499,20 +1059,42 @@ stage_drivers() {
 }
 
 generate_answer_file() {
-  local stage="$1" product_key_block=""
+  local stage="$1" product_key_block="" firstlogon_block=""
+  local x_user x_pass x_hn x_tz x_img x_key c_hn
+
+  x_user="$(xml_escape "$ADMIN_USER")"
+  x_pass="$(xml_escape "$ADMIN_PASS")"
+  x_hn="$(xml_escape "$HN")"
+  x_tz="$(xml_escape "$WIN_TIMEZONE")"
+  x_img="$(xml_escape "$IMAGE_NAME")"
+  x_key="$(xml_escape "$GVLK")"
+  c_hn="$(xml_comment "$HN")"
 
   if [[ -n "$GVLK" ]]; then
     product_key_block="
             <ProductKey>
-                <Key>${GVLK}</Key>
+                <Key>${x_key}</Key>
                 <WillShowUI>Never</WillShowUI>
             </ProductKey>"
+  fi
+
+  # FirstLogon scripts have to beat the single automatic logon below, so they
+  # are registered here in specialize rather than by the startup task, which
+  # races it. RunOnce under HKLM fires at the first interactive logon and the
+  # value deletes itself once it has run.
+  if [[ -n "$CUSTOM_STAGE" && "$(count_scripts "${CUSTOM_STAGE}/FirstLogon")" -gt 0 ]]; then
+    firstlogon_block="
+                <RunSynchronousCommand wcm:action=\"add\">
+                    <Order>3</Order>
+                    <Description>Register the first-logon custom scripts</Description>
+                    <Path>reg.exe add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce /v RDGWFirstLogon /t REG_SZ /d \"powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Windows\\Setup\\Scripts\\Invoke-CustomScripts.ps1 -Category FirstLogon\" /f</Path>
+                </RunSynchronousCommand>"
   fi
 
   write_file "${stage}/autounattend.xml" 644 <<XMLEOF
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Generated by windows-rdgw-vm.sh for VM ${VMID} (${HN}).
+    Generated by windows-rdgw-vm.sh for VM ${VMID} (${c_hn}).
 
     Read this before you boot it. It wipes disk 0 without asking.
 
@@ -593,7 +1175,7 @@ generate_answer_file() {
                     <InstallFrom>
                         <MetaData wcm:action="add">
                             <Key>/IMAGE/NAME</Key>
-                            <Value>${IMAGE_NAME}</Value>
+                            <Value>${x_img}</Value>
                         </MetaData>
                     </InstallFrom>
                     <InstallTo>
@@ -606,15 +1188,15 @@ generate_answer_file() {
 
             <UserData>
                 <AcceptEula>true</AcceptEula>
-                <FullName>${ADMIN_USER}</FullName>${product_key_block}
+                <FullName>${x_user}</FullName>${product_key_block}
             </UserData>
         </component>
     </settings>
 
     <settings pass="specialize">
         <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-            <ComputerName>${HN}</ComputerName>
-            <TimeZone>${WIN_TIMEZONE}</TimeZone>
+            <ComputerName>${x_hn}</ComputerName>
+            <TimeZone>${x_tz}</TimeZone>
         </component>
 
         <!--
@@ -633,7 +1215,7 @@ generate_answer_file() {
                     <Order>2</Order>
                     <Description>Register the first-boot task</Description>
                     <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Setup\Scripts\Invoke-GatewaySetup.ps1 -Register</Path>
-                </RunSynchronousCommand>
+                </RunSynchronousCommand>${firstlogon_block}
             </RunSynchronous>
         </component>
     </settings>
@@ -650,10 +1232,10 @@ generate_answer_file() {
             <UserAccounts>
                 <LocalAccounts>
                     <LocalAccount wcm:action="add">
-                        <Name>${ADMIN_USER}</Name>
+                        <Name>${x_user}</Name>
                         <Group>Administrators</Group>
                         <Password>
-                            <Value>${ADMIN_PASS}</Value>
+                            <Value>${x_pass}</Value>
                             <PlainText>true</PlainText>
                         </Password>
                     </LocalAccount>
@@ -667,11 +1249,11 @@ generate_answer_file() {
                 from a startup task as SYSTEM whether anyone logs on or not.
             -->
             <AutoLogon>
-                <Username>${ADMIN_USER}</Username>
+                <Username>${x_user}</Username>
                 <Enabled>true</Enabled>
                 <LogonCount>1</LogonCount>
                 <Password>
-                    <Value>${ADMIN_PASS}</Value>
+                    <Value>${x_pass}</Value>
                     <PlainText>true</PlainText>
                 </Password>
             </AutoLogon>
@@ -692,7 +1274,7 @@ XMLEOF
 generate_config_psd1() {
   local stage="$1" targets="" m
   for m in $TARGET_MACHINES; do
-    targets+="'${m}', "
+    targets+="$(psd1_quote "$m"), "
   done
   targets="${targets%, }"
 
@@ -705,10 +1287,11 @@ generate_config_psd1() {
 # is in autounattend.xml.
 #
 @{
-    ComputerName         = '${HN}'
-    AccountName          = '${ADMIN_USER}'
-    ExternalFqdn         = '${EXTERNAL_FQDN}'
+    ComputerName         = $(psd1_quote "$HN")
+    AccountName          = $(psd1_quote "$ADMIN_USER")
+    ExternalFqdn         = $(psd1_quote "$EXTERNAL_FQDN")
     TargetMachines       = @(${targets})
+    ResourceScope        = '${RESOURCE_SCOPE}'
     CertificateSource    = 'SelfSigned'
 
     LockoutThreshold     = ${LOCKOUT_THRESHOLD}
@@ -735,7 +1318,21 @@ build_unattend_iso() {
   msg_info "Generating the answer file"
   generate_answer_file "$stage"
   generate_config_psd1 "$stage"
-  msg_ok "Answer file written"
+
+  # Belt and braces over xml_escape. Windows Setup rejecting the answer file
+  # looks identical to Setup ignoring it, twenty minutes in, at a screen with no
+  # useful error. Catch it here instead.
+  if [[ "$DRY_RUN" != "1" ]] && command -v xmllint >/dev/null 2>&1; then
+    if ! xmllint --noout "${stage}/autounattend.xml" 2>/dev/null; then
+      msg_error "The generated autounattend.xml is not well-formed XML."
+      msg_error "Re-run with DRY_RUN=1 to read it. Suspect whatever you typed into"
+      msg_error "the account name, password, hostname or time zone."
+      exit 1
+    fi
+    msg_ok "Answer file written and well-formed"
+  else
+    msg_ok "Answer file written"
+  fi
 
   msg_info "Staging the first-boot scripts"
   local f
@@ -748,6 +1345,8 @@ build_unattend_iso() {
     run cp "${SUPPORT_DIR}/${f}" "${stage}/rdgw/${f}"
   done
   msg_ok "Scripts staged"
+
+  stage_custom_scripts "$stage"
 
   iso_dir="$(iso_dir_for_storage "$UNATTEND_STORAGE")"
   if [[ -z "$iso_dir" ]]; then
@@ -803,6 +1402,37 @@ ${DGN}TPM 2.0        ${BL}${ADD_TPM}${CL}
 ${DGN}Bridge         ${BL}${BRG}${CL}
 ${DGN}Start after    ${BL}${START_VM}${CL}
 EOF
+}
+
+# The Windows DVD's EFI loader prints "Press any key to boot from CD or DVD"
+# and gives up after about five seconds.
+#
+# That prompt has to stay. Setup reboots two or three times before it is
+# finished, the DVD is still first in the boot order each time, and the prompt
+# timing out is exactly what lets those reboots fall through to the disk
+# instead of starting the install over. Rebuilding the media around
+# efisys_noprompt.bin would fix the first boot and buy an endless reinstall
+# loop in exchange.
+#
+# So the prompt stays and the host answers it, once. qm sendkey pushes a
+# keystroke into the running VM; sending one every couple of seconds covers
+# OVMF's startup and the prompt's own window without having to guess when it
+# appears. Enter is not bound to anything in the OVMF splash, and Setup is
+# driven by the answer file, so a key that lands early or late does nothing.
+press_a_key() {
+  local deadline
+  msg_info "Answering the \"press any key to boot\" prompt for ${BOOT_KEY_SECONDS}s"
+  printf "   ${DIM}\$ qm sendkey %s ret${CL}   (every 2s until the window closes)\n" "$VMID"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    msg_ok "Skipped — DRY_RUN"
+    return 0
+  fi
+  deadline=$((SECONDS + BOOT_KEY_SECONDS))
+  while (( SECONDS < deadline )); do
+    qm sendkey "$VMID" ret >/dev/null 2>&1 || true
+    sleep 2
+  done
+  msg_ok "Boot prompt answered"
 }
 
 ask() {  # ask <title> <default> -> ASK_RESULT
@@ -978,10 +1608,45 @@ if [[ "$START_VM" == "yes" ]]; then
   msg_info "Starting the VM"
   run qm start "$VMID"
   msg_ok "Started"
+  # Only on the unattended path. With no answer file driving it, Windows Setup
+  # is a live wizard within the first minute, and Enter every two seconds would
+  # walk through the language screen, Install now, the edition list and the EULA
+  # before anyone had looked at the console. The shell-only path exists to let
+  # the operator drive those.
+  [[ "$UNATTEND" == "yes" ]] && press_a_key
 fi
 
 # ------------------------------------------------------------------------------
 # What happens next
+#
+# Two blocks the unattended summary interpolates, built here so the heredoc
+# below stays readable.
+RESOURCE_SUMMARY=""
+case "${RESOURCE_SCOPE}" in
+  AnyResource)
+    RESOURCE_SUMMARY="   ${BL}Any machine this server can route to.${CL} Each one still needs Remote
+   Desktop switched on and your account in its own local Remote Desktop
+   Users group; the gateway decides where you may tunnel, not what you may
+   log into." ;;
+  Listed)
+    RESOURCE_SUMMARY="   The gateway itself plus: ${BL}${TARGET_MACHINES}${CL}
+   Anything not on that list is refused with event 301, so add machines by
+   re-running ${BL}Setup-RDGateway.ps1 -TargetMachines${CL} later." ;;
+  *)
+    RESOURCE_SUMMARY="   ${BL}This gateway only.${CL} Re-run ${BL}Setup-RDGateway.ps1${CL} with
+   ${BL}-TargetMachines${CL} or ${BL}-ResourceScope AnyResource${CL} to widen it." ;;
+esac
+
+CUSTOM_SUMMARY=""
+if [[ "$(custom_total)" -gt 0 ]]; then
+  CUSTOM_SUMMARY="
+${BOLD}Your own scripts${CL}
+   $(custom_total) of them, run from ${BL}C:\\Windows\\Setup\\Scripts\\custom${CL} and logged
+   in the same file, prefixed ${BL}custom/<category>${CL}. One that fails or runs
+   past 15 minutes is logged and skipped rather than stopping the build.
+"
+fi
+
 if [[ "$UNATTEND" == "yes" ]]; then
 cat <<EOF
 
@@ -991,14 +1656,18 @@ Nothing below needs you at the console. It is here so you know what is
 happening and where to look if it stalls.
 
 ${BOLD}What runs, in order${CL}
-   1. Windows Setup boots from the DVD, finds ${BL}autounattend.xml${CL} on the
-      unattend CD by itself, and stages the VirtIO drivers from the
-      ${BL}\$WinPEDriver\$${CL} folder on that same CD. No "Load driver" step.
-   2. It wipes disk 0, partitions it (EFI / MSR / NTFS), and installs
+   1. The DVD asks you to press a key to boot from it. This script answered
+      that from the host with ${BL}qm sendkey${CL}, which is why nothing had to
+      be at the console. The prompt is left in place on purpose: Setup's own
+      reboots rely on it timing out to fall through to the disk.
+   2. Windows Setup finds ${BL}autounattend.xml${CL} on the unattend CD by
+      itself and stages the VirtIO drivers from the ${BL}\$WinPEDriver\$${CL}
+      folder on that same CD. No "Load driver" step.
+   3. It wipes disk 0, partitions it (EFI / MSR / NTFS), and installs
       ${BL}${IMAGE_NAME}${CL}.
-   3. The specialize pass copies the scripts to
+   4. The specialize pass copies the scripts to
       ${BL}C:\\Windows\\Setup\\Scripts${CL} and registers a startup task.
-   4. That task applies your settings, installs the RD Gateway role, reboots
+   5. That task applies your settings, installs the RD Gateway role, reboots
       if Windows asks, then runs ${BL}Setup-RDGateway.ps1${CL} and verifies the
       TSGateway service.
 
@@ -1010,6 +1679,9 @@ ${BOLD}Where to look${CL}
    ${BL}C:\\Windows\\Panther\\setupact.log${CL}           Windows Setup itself
 
    The gateway is done when the log ends with ${BL}First-boot setup finished.${CL}
+${CUSTOM_SUMMARY}
+${BOLD}Reachable through the gateway${CL}
+${RESOURCE_SUMMARY}
 
 ${BOLD}When it is finished${CL}
    Detach the media and delete the unattend CD — it holds the account password
@@ -1033,9 +1705,13 @@ cat <<EOF
 ${BOLD}${GN}VM ${VMID} is built.${CL} Windows is not installed yet — do that next.
 
 ${BOLD}1. Open the console${CL}
-   Proxmox web UI -> VM ${VMID} -> Console. Press a key fast when it says
-   "Press any key to boot from CD" — if you miss it you land in the UEFI shell;
-   type ${BL}exit${CL}, pick Boot Manager, and choose the DVD.
+   Proxmox web UI -> VM ${VMID} -> Console. Press a key when it offers to
+   boot from the DVD; you have about five seconds. Miss it and you land in the
+   UEFI shell: type ${BL}exit${CL}, pick Boot Manager, and choose the DVD.
+
+   ${DIM}The unattended path answers that prompt from the host. This one leaves
+   it to you on purpose - with no answer file driving Setup, a keystroke every
+   two seconds would walk through the very screens you are here to drive.${CL}
 
 ${BOLD}2. Load the storage driver${CL}
    Windows Setup will show ${YW}no disks${CL}. That is expected.

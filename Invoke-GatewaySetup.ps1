@@ -11,8 +11,8 @@
     reports RestartNeeded, and SetupComplete.cmd is not allowed to reboot and
     resume. So the work is split across boots and this script keeps the place:
 
-        boot 1   apply Configure-Guest.ps1, install the RDS-Gateway role,
-                 reboot if Windows asks for one
+        boot 1   apply Configure-Guest.ps1, run any custom System scripts,
+                 install the RDS-Gateway role, reboot if Windows asks for one
         boot 2   configure the gateway (Setup-RDGateway.ps1 -SkipRoleInstall),
                  verify, clean up, unregister the task
 
@@ -66,19 +66,27 @@ function Write-Line {
 }
 
 function Get-State {
+    $state = [pscustomobject]@{
+        Boots = 0
+        GuestConfigured = $false
+        SystemScriptsRun = $false
+        RoleInstalled = $false
+        GatewayConfigured = $false
+    }
     if (Test-Path -LiteralPath $StatePath) {
         try {
-            return (Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json)
+            $saved = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+            # Copy across only the fields we recognise, so a state file left by
+            # an older copy of this script still loads instead of starting the
+            # boot count over.
+            foreach ($name in $state.PSObject.Properties.Name) {
+                if ($saved.PSObject.Properties[$name]) { $state.$name = $saved.$name }
+            }
         } catch {
             Write-Line "State file unreadable, starting over: $($_.Exception.Message)" 'warn'
         }
     }
-    return [pscustomobject]@{
-        Boots = 0
-        GuestConfigured = $false
-        RoleInstalled = $false
-        GatewayConfigured = $false
-    }
+    return $state
 }
 
 function Save-State {
@@ -159,7 +167,13 @@ if ($state.Boots -gt $MaxBoots) {
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
     Stop-Here "Missing $ConfigPath. The unattend ISO did not copy cleanly."
 }
-$cfg = Import-PowerShellDataFile -LiteralPath $ConfigPath
+try {
+    $cfg = Import-PowerShellDataFile -LiteralPath $ConfigPath -ErrorAction Stop
+} catch {
+    # Without this the task dies on a raw parse exception and the log says
+    # nothing at all, which is the opposite of what this file exists for.
+    Stop-Here "$ConfigPath could not be parsed: $($_.Exception.Message)"
+}
 
 # --- 1. Guest settings -------------------------------------------------------
 if (-not $state.GuestConfigured) {
@@ -180,7 +194,33 @@ if (-not $state.GuestConfigured) {
     Write-Line "Guest configuration already applied on an earlier boot"
 }
 
-# --- 2. The RD Gateway role --------------------------------------------------
+# --- 2. Your own System scripts ----------------------------------------------
+#
+# Ahead of the role install, so a script here can put something in place that
+# the gateway then uses - importing a certificate into LocalMachine\My, say.
+# Invoke-CustomScripts.ps1 already logs and swallows a script that fails or
+# hangs; this catch is for the runner itself. Either way the gateway still
+# gets built.
+if (-not $state.SystemScriptsRun) {
+    $customRunner = Join-Path $ScriptRoot 'Invoke-CustomScripts.ps1'
+    if (Test-Path -LiteralPath $customRunner) {
+        try {
+            & $customRunner -Category System
+        } catch {
+            Write-Line "Custom System scripts failed: $($_.Exception.Message)" 'warn'
+        }
+        $state.SystemScriptsRun = $true
+        Save-State $state
+    } else {
+        # Do not latch. The runner is one of the four files the CD carries as a
+        # unit, so a missing one means the copy was incomplete - say so, and let
+        # the next boot try again rather than silently never running the
+        # operator's scripts.
+        Write-Line "Invoke-CustomScripts.ps1 is missing from $ScriptRoot - System scripts skipped, will retry next boot" 'warn'
+    }
+}
+
+# --- 3. The RD Gateway role --------------------------------------------------
 #
 # The reboot is only considered when this pass is the one that installed the
 # role. If the role was already there when we started, a pending-reboot flag is
@@ -211,27 +251,38 @@ if ($installedNow -and (Test-PendingReboot)) {
     exit 0
 }
 
-# --- 3. Gateway configuration ------------------------------------------------
+# --- 4. Gateway configuration ------------------------------------------------
 $setup = Join-Path $ScriptRoot 'Setup-RDGateway.ps1'
 if (-not (Test-Path -LiteralPath $setup)) {
     Stop-Here "Missing $setup. The unattend ISO did not copy cleanly."
 }
 
+# The scope is whatever was picked in the builder, passed through rather than
+# guessed at from whether a list happens to be present. An older config file
+# without the field falls back to the narrowest setting.
+$scope = if ($cfg.ResourceScope) { $cfg.ResourceScope } else { 'ThisServerOnly' }
+
 $arguments = @{
     ExternalFqdn = $cfg.ExternalFqdn
     CertificateSource = $cfg.CertificateSource
+    ResourceScope = $scope
     SkipRoleInstall = $true
 }
 if ($cfg.TargetMachines -and $cfg.TargetMachines.Count -gt 0) {
     $arguments['TargetMachines'] = $cfg.TargetMachines
-    $arguments['ResourceScope'] = 'Listed'
 }
 
-Write-Line "Running Setup-RDGateway.ps1 -ExternalFqdn $($cfg.ExternalFqdn) -SkipRoleInstall"
-if ($arguments.ContainsKey('TargetMachines')) {
-    Write-Line "Target machines: $($cfg.TargetMachines -join ', ')"
-} else {
-    Write-Line "No target machines given - the RAP will be scoped to this server only."
+Write-Line "Running Setup-RDGateway.ps1 -ExternalFqdn $($cfg.ExternalFqdn) -ResourceScope $scope -SkipRoleInstall"
+switch ($scope) {
+    'AnyResource' {
+        Write-Line "Resource scope: any machine this server can reach."
+    }
+    'Listed' {
+        Write-Line "Resource scope: this server plus $($cfg.TargetMachines -join ', ')"
+    }
+    default {
+        Write-Line "Resource scope: this server only."
+    }
 }
 
 try {
@@ -240,7 +291,7 @@ try {
     Stop-Here "Setup-RDGateway.ps1 failed: $($_.Exception.Message)"
 }
 
-# --- 4. Verify ---------------------------------------------------------------
+# --- 5. Verify ---------------------------------------------------------------
 $svc = Get-Service -Name TSGateway -ErrorAction SilentlyContinue
 if (-not $svc) {
     Stop-Here "The TSGateway service does not exist. Setup-RDGateway.ps1 did not complete."

@@ -12,17 +12,23 @@ behind one public hostname, using stock RD clients.
 
 | File | Runs on | Status |
 |---|---|---|
-| `windows-rdgw-vm.sh` | Proxmox host, root | Written, dry-run verified, **never run for real** |
+| `windows-rdgw-vm.sh` | Proxmox host, root | Dry-run verified. **Run for real once**, see below |
 | `Setup-RDGateway.ps1` | The Windows guest, elevated | Written, parse/lint verified, **never run for real** |
 | `Configure-Guest.ps1` | The Windows guest, SYSTEM | Written, parse/lint verified, **never run for real** |
 | `Invoke-GatewaySetup.ps1` | The Windows guest, SYSTEM | Written, parse/lint verified, **never run for real** |
+| `Invoke-CustomScripts.ps1` | The Windows guest | **Executed for real** on Windows PowerShell 5.1, see below |
 | `sample-autounattend.xml` | — | Committed sample of generated output. Not read by anything |
 | `vps-relay-setup.sh` | A public VPS | Optional path. Written, dry-run verified, **never run for real** |
 | `proxmox-relay-peer.sh` | Proxmox host, root | Optional path. Written, dry-run verified, **never run for real** |
 | `README.md` | — | Repo intro plus the full runbook |
 | `RELAY.md` | — | The optional relay: architecture, steps, caveats |
 
-Nothing has been deployed. No VM exists yet.
+The operator ran `windows-rdgw-vm.sh` on the real Proxmox host on 2026-09-19. The
+VM was built and started, and then stopped dead at the Windows DVD's "Press any
+key to boot from CD or DVD" prompt, which nobody was there to answer. That is
+fixed: `press_a_key` now answers it from the host with `qm sendkey`. Nothing
+past that point has been observed on real hardware, so everything under
+"Assumed, never executed" still stands.
 
 `windows-rdgw-vm.sh` offers two paths. The **shell-only** path is the original behaviour: a
 configured VM with both ISOs attached, Windows installed by hand. The **unattended** path
@@ -97,6 +103,16 @@ the browser path already rejected. There is no stock-client entry.
 **Cloudflare Spectrum.** The only Cloudflare product that proxies arbitrary TCP. Business
 plan and up, roughly $200/month.
 
+**Rebuilding the Windows ISO around `efisys_noprompt.bin` to kill the boot prompt.**
+The no-prompt boot image really does ship on the media, next to `efisys.bin`, and
+re-mastering with xorriso really would stop the DVD asking for a keypress. It also
+breaks the install. Windows Setup reboots two or three times before it finishes, the
+DVD is still first in the boot order each time, and the prompt timing out is exactly
+what lets those reboots fall through to the disk instead of starting the install
+over. Remove the prompt and you get an endless reinstall loop unless something also
+changes the boot order mid-install, which nothing does. `press_a_key` answers it once
+from the host instead, which leaves the timeout behaviour intact for every later boot.
+
 **WARP / Cloudflare One client, Tailscale, any client-side agent.** Violates the
 no-install-on-clients constraint.
 
@@ -149,6 +165,43 @@ bug will surface.
   round-trips through `Import-PowerShellDataFile` with the right types (`Boolean` for the
   toggles, `Int32` for the lockout numbers, `Object[]` for `TargetMachines`) both empty and
   populated.
+- `Invoke-CustomScripts.ps1` was **run for real** under `powershell.exe` 5.1 on the
+  operator's Windows box, not just parsed. Verified: dispatch by extension, filename
+  ordering, a non-zero exit code reported rather than swallowed, a hung script killed
+  at the timeout with the next one still running, and a `.reg` file rewritten from
+  `HKEY_CURRENT_USER` to `HKEY_USERS\<sid>` and imported into a genuinely mounted hive.
+  That last test pointed `-HiveRoot` at the tester's own live hive so the rewrite and
+  the import were both real rather than mocked. It found one real bug: `Start-Process
+  -PassThru` hands back an object whose `ExitCode` reads back empty once the child is
+  gone, so every script looked like it had failed. Reading `$proc.Handle` right after
+  starting keeps the handle open and fixes it - do not remove that line.
+- The RAP scope is wired end to end and all three values were dry-run to a config file
+  that round-trips: `AnyResource`, `Listed` with a machine list, `ThisServerOnly`.
+  `ResourceGroupType = 'ALL'` is confirmed against Microsoft's `Create` reference for
+  `Win32_TSGatewayResourceAuthorizationPolicy`, which documents exactly three values -
+  `RG`, `CG`, `ALL` - and gives `ALL` as "All resources". What `ResourceGroupName`
+  should be alongside `ALL` is *not* documented; the empty string is convention.
+- `qm sendkey <vmid> <key>` is confirmed against the `qm` manual page.
+- **An adversarial review pass ran over this branch** (six independent finders, one
+  triage, two refuters per finding, opus tiebreak on disagreement). It produced 22 raw
+  findings, 20 unique, all 20 read back against the source and confirmed. Every one is
+  fixed. The three worth remembering, because they were all invisible to the dry-run
+  suite: the missing XML escaping, the six bare msgboxes, and `Start-Process` dropping
+  everything after a space. The suite passed throughout, which is the point - it stubs
+  whiptail, so it never pressed Esc, and it never typed an ampersand.
+- Fixes verified empirically rather than by argument: `Start-Process` quoting and the
+  numeric sort were reproduced and then re-run green with spaces in both the directory
+  and the filename; the anchored `.reg` rewrite was proved to retarget a key header
+  while leaving the literal string `HKEY_CURRENT_USER` inside quoted value data intact;
+  `xml_escape` and `psd1_quote` were driven with `Tr0ub4dor&3<evil>` and `R&D O'Brien`
+  end to end, producing an `autounattend.xml` that parses and a `rdgw-config.psd1` whose
+  `AccountName` round-trips byte-identical through `Import-PowerShellDataFile`.
+- The custom-script TUI is dry-run covered in six scenarios: importing a directory laid
+  out by category, importing a directory of loose files, writing a `.ps1` and a `.reg`
+  through a stubbed editor, writing a `FirstLogon` script and confirming the extra
+  `RunSynchronousCommand` appears in the answer file, an editor that saves nothing and
+  the file being discarded, and adding two scripts then removing one in review. The
+  generated `autounattend.xml` parses in every case.
 - Every element of the generated answer file was checked against the Unattended Windows Setup
   Reference on Microsoft Learn: component names, valid configuration passes, child elements.
   The load-bearing one is `Microsoft-Windows-Deployment\RunSynchronous\RunSynchronousCommand`
@@ -191,7 +244,15 @@ bug will surface.
   `ImportRDGateway.ps1` does, but hasn't been run here. There's a WMI fallback
   (`SetCertificate` then `Configure`, both instance methods on the singleton) and, failing
   both, the script tells the operator to do it in `tsgateway.msc`.
-- **Nothing about the unattended path has been executed.** The riskiest parts, in order:
+- **The custom-script categories have not been watched on a real build.** The runner
+  itself has (above), but the four registration points have not: the `FirstLogon`
+  `RunOnce` value written by a specialize `RunSynchronousCommand`, and the `UserOnce`
+  `RunOnce` value written into the mounted Default User hive. The known interaction is
+  that `AutoLogon` with `LogonCount 1` creates the first profile at roughly the moment
+  `Configure-Guest.ps1` is writing that hive, so `UserOnce` may miss the first account.
+  `FirstLogon` is registered in specialize precisely so it cannot lose that race, and
+  the README says to put anything the first account needs there.
+- **Nothing else about the unattended path has been executed.** The riskiest parts, in order:
   the `/IMAGE/NAME` value must match the media exactly and differs on Evaluation ISOs; the
   `$WinPEDriver$` scan is documented for Windows Server but has not been watched working
   here; and the `RDGW-FirstBoot` scheduled task's reboot handoff is reasoned about rather
@@ -213,8 +274,8 @@ dgw-setup.log` and stays
    `dism /Get-WimInfo /WimFile:<mount>\sources\install.wim`. The edition menu's image names
    are for retail/VL media; Evaluation ISOs name their images differently and cannot be
    activated with a GVLK.
-3. Run `windows-rdgw-vm.sh` on the Proxmox host. Start with `DRY_RUN=1`, which prints the
-   whole generated answer file.
+3. Run `windows-rdgw-vm.sh` on the Proxmox host again, now that the boot prompt is
+   answered. Start with `DRY_RUN=1`, which prints the whole generated answer file.
 4. Unattended path: watch `C:\Windows\Setup\Scripts\rdgw-setup.log` and check the
    `UserGroupNames` readback it prints. Shell-only path: install Windows from the console
    (Setup shows **no disks** until `vioscsi\2k25\amd64` is loaded from the second CD, which
@@ -241,6 +302,64 @@ dgw-setup.log` and stays
   `autounattend.xml`. That is what `write_file` is for; it is duplicated in
   `windows-rdgw-vm.sh` and `vps-relay-setup.sh` on purpose, because each script has to stay
   runnable on its own.
+- `press_a_key` runs after `qm start` on both paths and is not optional decoration. The
+  first real run died without it. Keep the DVD prompt itself; answer it from the host.
+- The unattended path's resource-scope menu defaults to **any machine on the LAN**,
+  which is the widest of the three. That was the operator's explicit expectation of what
+  an RD Gateway is for, stated after the narrow default surprised them. The consequence
+  is stated once in a msgbox and once in `Setup-RDGateway.ps1`'s own run-time warning.
+  `Setup-RDGateway.ps1`'s own parameter default stays `ThisServerOnly`, because a bare
+  invocation with no arguments should not quietly open the LAN.
+- The custom-script category names (`System`, `DefaultUser`, `FirstLogon`, `UserOnce`)
+  are deliberately the schneegans.de generator's names, with the same timing and the
+  same accepted extensions. The operator asked for it in those terms. Do not rename them
+  to something tidier.
+- Custom scripts can be written in the TUI or imported from disk, and both routes feed
+  one staging tree (`CUSTOM_STAGE`, a `mktemp -d` the exit trap removes) laid out as
+  `<category>/<filename>`. Everything downstream - the count in the menu title, the
+  decision to register `FirstLogon`, the ISO staging, the closing summary - reads that
+  tree rather than asking where a file came from. Keep it that way; it is what let the
+  editor route be added without touching any of them.
+- **Anything that came from a prompt and lands in a generated file goes through
+  `xml_escape` or `psd1_quote` first.** Both files are built by string interpolation
+  and neither format forgives a stray character: `Tr0ub4dor&3` is an ordinary Windows
+  password that makes `autounattend.xml` malformed, and an account named `O'Brien`
+  makes `rdgw-config.psd1` throw before `Invoke-GatewaySetup.ps1` can log why. If you
+  add a new prompt whose answer reaches either file, escape it at the interpolation
+  site. There is an `xmllint --noout` check after generation as a backstop.
+- **The backslashes in `xml_escape` are load-bearing.** bash 5.2 turned on
+  `patsub_replacement`, which makes an unquoted `&` in a `${var//pat/repl}` replacement
+  mean "the text that matched" - so `${s//</&lt;}` produces `<lt;` on a Proxmox VE 8
+  host, and the escaping silently does nothing useful. `\&` is correct on 5.1 too,
+  where quote removal just drops the backslash. This was caught by a smoke test, not
+  by reading, and it would have made the fix above worthless.
+- **`press_a_key` runs on the unattended path only.** It is gated on
+  `UNATTEND == yes`, not just `START_VM == yes`. With no answer file driving Setup,
+  Windows is a live wizard within that first minute and Enter every two seconds walks
+  through the language screen, Install now, the edition list and the EULA - the exact
+  screens the shell-only path exists to let the operator drive.
+- **A bare `whiptail --msgbox` aborts the script.** Under `set -Eeuo pipefail`,
+  whiptail returns non-zero when a box is dismissed with Esc, the `ERR` trap fires, and
+  every answer already typed is gone. Every informational box ends `|| true`. Every box
+  whose answer matters ends `|| exit_script` or `|| return`.
+- **`Invoke-Child` must quote its `ArgumentList`.** `Start-Process` joins the array
+  with plain spaces and quotes nothing, so a script at `...\install cert.ps1` reaches
+  `powershell.exe` as `-File ...\install` and dies with "does not have a '.ps1'
+  extension" (reproduced: exit `-196608`). `custom_safe_name` also turns spaces into
+  hyphens on the way in, so both ends are covered.
+- **In `Configure-Guest.ps1`, the Default User hive block stays above the
+  `ApplyTweaks` gate.** That gate is answered by a prompt that calls itself cosmetic and
+  not security relevant, and it ends in `exit 0`. The hive block runs the operator's
+  `DefaultUser` scripts and registers `UserOnce`, which have nothing to do with taskbar
+  layout, so only the cosmetic writes inside it are conditional. Moving it back below
+  the gate silently disables a feature.
+- Two traps in that code, both found by the dry-run suite rather than by reading:
+  `custom_stage_dir` **sets** `CUSTOM_STAGE` and prints nothing, because calling it as
+  `stage="$(custom_stage_dir)"` runs the assignment in a subshell and the global comes
+  back empty on the other side. And `custom_have_tty` probes `/dev/tty` by opening it,
+  because `[[ -r /dev/tty ]]` passes on a node that then fails with "No such device or
+  address" when there is no controlling terminal - which is exactly what happens under
+  a test runner, and would silently skip the editor.
 - The security toggles in the unattended path (UAC, Defender, Core Isolation, lockout, blank
   passwords, Ctrl+Alt+Del) all default to leaving Windows as it ships. They exist because the
   operator explicitly asked to be able to loosen them. State the consequence once in the
