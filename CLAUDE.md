@@ -17,6 +17,7 @@ behind one public hostname, using stock RD clients.
 | `Configure-Guest.ps1` | The Windows guest, SYSTEM | Written, parse/lint verified, **never run for real** |
 | `Invoke-GatewaySetup.ps1` | The Windows guest, SYSTEM | Written, parse/lint verified, **never run for real** |
 | `Invoke-CustomScripts.ps1` | The Windows guest | **Executed for real** on Windows PowerShell 5.1, see below |
+| `Get-RDGWStatus.ps1` | The Windows guest, elevated | Read-only. Reports what the build actually did against what it was asked to do |
 | `sample-autounattend.xml` | — | Committed sample of generated output. Not read by anything |
 | `vps-relay-setup.sh` | A public VPS | Optional path. Written, dry-run verified, **never run for real** |
 | `proxmox-relay-peer.sh` | Proxmox host, root | Optional path. Written, dry-run verified, **never run for real** |
@@ -102,6 +103,20 @@ the browser path already rejected. There is no stock-client entry.
 
 **Cloudflare Spectrum.** The only Cloudflare product that proxies arbitrary TCP. Business
 plan and up, roughly $200/month.
+
+**Disabling Defender by writing `Start=4` over the WinDefend service keys.** This is
+what every snippet on the internet does and it does not work here. Tamper Protection
+is on by default on Server 2025 and denies those writes even to SYSTEM, and Microsoft
+documents against the approach directly: *"Don't disable, stop, or modify any of the
+associated services that are used by Microsoft Defender Antivirus... Manually modifying
+these services can cause severe instability on your devices and can make your network
+vulnerable."* The repo did this for a while, failed silently on all six keys, and then
+printed a success line regardless. On Windows **Server** Defender is an installable
+feature and the documented route is `Uninstall-WindowsFeature Windows-Defender` plus a
+reboot, which is what `Configure-Guest.ps1` does now. That reboot is taken by
+`Invoke-GatewaySetup.ps1` before the role install, because handing a pending reboot to
+`Install-WindowsFeature` is how you get "a system reboot is required" instead of a
+gateway. Source: [Microsoft Defender Antivirus compatibility](https://learn.microsoft.com/en-us/defender-endpoint/microsoft-defender-antivirus-compatibility).
 
 **Rebuilding the Windows ISO around `efisys_noprompt.bin` to kill the boot prompt.**
 The no-prompt boot image really does ship on the media, next to `efisys.bin`, and
@@ -333,11 +348,20 @@ dgw-setup.log` and stays
   host, and the escaping silently does nothing useful. `\&` is correct on 5.1 too,
   where quote removal just drops the backslash. This was caught by a smoke test, not
   by reading, and it would have made the fix above worthless.
-- **`press_a_key` runs on the unattended path only.** It is gated on
-  `UNATTEND == yes`, not just `START_VM == yes`. With no answer file driving Setup,
-  Windows is a live wizard within that first minute and Enter every two seconds walks
-  through the language screen, Install now, the edition list and the EULA - the exact
-  screens the shell-only path exists to let the operator drive.
+- **`press_a_key` runs on the unattended path only, and stops as soon as the DVD
+  starts streaming.** Two separate lessons, both learned from real runs. The first: it
+  is gated on `UNATTEND == yes`, not just `START_VM == yes`, because with no answer file
+  driving Setup, Windows is a live wizard within that first minute. The second, from the
+  operator's first successful boot: **keystrokes are not harmless during unattended
+  Setup either.** The original comment claimed "Setup is driven by the answer file, so a
+  key that lands early or late does nothing". It does not. Setup shows a Cancel button
+  that takes focus, and a fixed sixty seconds of Enter hammered it, opening and closing
+  a confirmation dialog for the rest of the minute. It stayed harmless only because that
+  dialog also defaults to Cancel. So the loop now stops on evidence rather than a timer:
+  `qm_bytes_read ide0` via the QEMU monitor tells the difference between "OVMF is looking
+  at the DVD" and "Setup is streaming boot.wim off it", and `BOOT_KEY_SECONDS` is only a
+  backstop for when the monitor cannot be read. Do not raise it back to a long fixed
+  window.
 - **A bare `whiptail --msgbox` aborts the script.** Under `set -Eeuo pipefail`,
   whiptail returns non-zero when a box is dismissed with Esc, the `ERR` trap fires, and
   every answer already typed is gone. Every informational box ends `|| true`. Every box

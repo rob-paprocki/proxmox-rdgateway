@@ -69,6 +69,7 @@ function Get-State {
     $state = [pscustomobject]@{
         Boots = 0
         GuestConfigured = $false
+        GuestRebootDone = $false
         SystemScriptsRun = $false
         RoleInstalled = $false
         GatewayConfigured = $false
@@ -192,6 +193,17 @@ if (-not $state.GuestConfigured) {
     }
 } else {
     Write-Line "Guest configuration already applied on an earlier boot"
+}
+
+# Removing the Windows-Defender feature leaves a reboot pending, and handing a
+# pending reboot to Install-WindowsFeature is how you get "a system reboot is
+# required" instead of a gateway. Take it here, at most once.
+if (-not $state.GuestRebootDone -and (Test-PendingReboot)) {
+    $state.GuestRebootDone = $true
+    Save-State $state
+    Write-Line "Guest configuration left a reboot pending. Rebooting before the role install."
+    Restart-Computer -Force
+    exit 0
 }
 
 # --- 2. Your own System scripts ----------------------------------------------

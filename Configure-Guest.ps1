@@ -124,10 +124,40 @@ if ($cfg.DisableUac) {
 # ------------------------------------------------------------------------------
 Write-Step "Microsoft Defender"
 if ($cfg.DisableDefender) {
-    foreach ($svc in 'WinDefend', 'Sense', 'WdBoot', 'WdFilter', 'WdNisDrv', 'WdNisSvc') {
-        Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Services\$svc" 'Start' 4
+    # This used to write Start=4 over the six WinDefend service keys, which is
+    # what most "disable Defender" snippets do and which Microsoft documents
+    # against in as many words: "Don't disable, stop, or modify any of the
+    # associated services that are used by Microsoft Defender Antivirus ...
+    # Manually modifying these services can cause severe instability". Tamper
+    # Protection is on by default on Server 2025 and denies those writes even to
+    # SYSTEM, so the old code failed on every key and then printed success
+    # anyway.
+    #
+    # On Windows Server, Defender is an installable feature, and removing it is
+    # the documented route. It needs a reboot to finish, which the first-boot
+    # task takes before it installs the gateway role.
+    $removed = $false
+    try {
+        Import-Module ServerManager -ErrorAction SilentlyContinue
+        $feature = Get-WindowsFeature -Name Windows-Defender -ErrorAction Stop
+        if (-not $feature -or -not $feature.Installed) {
+            Write-Skip "The Windows-Defender feature is not installed - nothing to remove"
+            $removed = $true
+        } else {
+            $result = Uninstall-WindowsFeature -Name Windows-Defender -ErrorAction Stop
+            if ($result.Success) {
+                $removed = $true
+                Write-Good "Windows-Defender feature removed - chosen at build time. Finishes at the next reboot."
+            } else {
+                Write-Bad "Uninstall-WindowsFeature returned exit code $($result.ExitCode)"
+            }
+        }
+    } catch {
+        Write-Bad "Could not remove the Windows-Defender feature: $($_.Exception.Message)"
     }
-    Write-Good "Defender services set to disabled - chosen at build time. Takes effect after a reboot."
+    if (-not $removed) {
+        Write-Bad "Defender is still installed. By hand: Uninstall-WindowsFeature Windows-Defender -Restart"
+    }
 } else {
     Write-Skip "Left enabled"
 }

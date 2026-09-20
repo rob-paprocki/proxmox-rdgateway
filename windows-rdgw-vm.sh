@@ -27,8 +27,10 @@
 #
 #      REPO_REF           branch or tag to fetch the PowerShell files from
 #      REPO_RAW           a different raw URL prefix entirely, e.g. a fork
-#      BOOT_KEY_SECONDS   how long to keep answering the DVD's "press any key
-#                         to boot" prompt after the VM starts (default 60)
+#      BOOT_KEY_SECONDS   backstop for answering the DVD's "press any key to
+#                         boot" prompt; normally it stops as soon as the DVD
+#                         starts streaming (default 20)
+#      BOOT_KEY           the key to send for that prompt (default ret)
 #
 #  What it touches on the network:
 #
@@ -73,18 +75,20 @@ else
 fi
 unset _src
 
-# The unattend ISO carries four PowerShell files. Running from a checkout they
+# The unattend ISO carries five PowerShell files. Running from a checkout they
 # are already next to this script; running from the one-liner they have to be
 # fetched. Pin a different ref or point somewhere else entirely with:
 #   REPO_REF=some-branch bash -c "$(curl -fsSL .../windows-rdgw-vm.sh)"
 REPO_REF="${REPO_REF:-main}"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/${REPO_REF}}"
-SUPPORT_FILES=(Setup-RDGateway.ps1 Configure-Guest.ps1 Invoke-GatewaySetup.ps1 Invoke-CustomScripts.ps1)
+SUPPORT_FILES=(Setup-RDGateway.ps1 Configure-Guest.ps1 Invoke-GatewaySetup.ps1 Invoke-CustomScripts.ps1 Get-RDGWStatus.ps1)
 SUPPORT_DIR=""
 
-# How long to keep answering the Windows DVD's "press any key to boot" prompt
-# after the VM starts. See press_a_key for why that is necessary.
-BOOT_KEY_SECONDS="${BOOT_KEY_SECONDS:-60}"
+# Answering the Windows DVD's "press any key to boot" prompt. See press_a_key.
+# The cap is a backstop; normally it stops as soon as the DVD starts streaming.
+BOOT_KEY_SECONDS="${BOOT_KEY_SECONDS:-20}"
+BOOT_KEY="${BOOT_KEY:-ret}"
+BOOT_KEY_STOP_MB="${BOOT_KEY_STOP_MB:-24}"
 
 # Scripts of your own, in the four categories the schneegans.de generator uses.
 # CUSTOM_STAGE is a mktemp tree laid out as <category>/<filename>, created only
@@ -1419,20 +1423,62 @@ EOF
 # OVMF's startup and the prompt's own window without having to guess when it
 # appears. Enter is not bound to anything in the OVMF splash, and Setup is
 # driven by the answer file, so a key that lands early or late does nothing.
+# How many bytes QEMU has read from a drive, via the monitor. Best effort: it
+# prints nothing when the monitor is unavailable or the output does not parse,
+# and the caller copes.
+qm_bytes_read() {
+  local dev="$1"
+  printf 'info blockstats\n' \
+    | qm monitor "$VMID" 2>/dev/null \
+    | awk -v d="$dev" '$0 ~ d && match($0, /rd_bytes=[0-9]+/) {
+        print substr($0, RSTART + 9, RLENGTH - 9); exit }'
+}
+
+# Answer the DVD's "Press any key to boot from CD or DVD" prompt, once, then
+# stop.
+#
+# Stopping is the hard part, and the first version got it wrong. It pressed
+# Enter every two seconds for a fixed sixty on the theory that Setup is driven
+# by the answer file and would ignore the extras. It does not: Windows Setup
+# shows a Cancel button that takes focus, so the surplus keypresses hammered it
+# and the operator watched a confirmation dialog open and close for the rest of
+# the minute. It only stayed harmless because that dialog also defaults to
+# Cancel.
+#
+# So the keys have to stop as soon as the prompt has been answered, and the VM
+# will tell us: before the keypress the DVD has given up only a boot sector and
+# a loader, and after it Setup streams boot.wim off the same disc. A read count
+# past BOOT_KEY_STOP_MB means we are through and can stop pressing.
+#
+# BOOT_KEY_SECONDS is now only a backstop for when the monitor cannot be read,
+# and it is short for the same reason. Nothing here can rescue a VM that never
+# reached the prompt, so it says so rather than pressing on in silence.
 press_a_key() {
-  local deadline
-  msg_info "Answering the \"press any key to boot\" prompt for ${BOOT_KEY_SECONDS}s"
-  printf "   ${DIM}\$ qm sendkey %s ret${CL}   (every 2s until the window closes)\n" "$VMID"
+  local deadline bytes sent=0 stop_at
+  stop_at=$(( BOOT_KEY_STOP_MB * 1024 * 1024 ))
+
+  msg_info "Answering the \"press any key to boot\" prompt"
+  printf "   ${DIM}\$ qm sendkey %s %s${CL}   (once a second until the DVD starts streaming)\n" "$VMID" "$BOOT_KEY"
   if [[ "$DRY_RUN" == "1" ]]; then
     msg_ok "Skipped — DRY_RUN"
     return 0
   fi
+
   deadline=$((SECONDS + BOOT_KEY_SECONDS))
   while (( SECONDS < deadline )); do
-    qm sendkey "$VMID" ret >/dev/null 2>&1 || true
-    sleep 2
+    bytes="$(qm_bytes_read ide0)"
+    if [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes > stop_at )); then
+      msg_ok "Setup is reading the DVD - stopped after ${sent} keypress(es)"
+      return 0
+    fi
+    qm sendkey "$VMID" "$BOOT_KEY" >/dev/null 2>&1 || true
+    sent=$((sent + 1))
+    sleep 1
   done
-  msg_ok "Boot prompt answered"
+
+  msg_warn "Sent ${sent} keypress(es) in ${BOOT_KEY_SECONDS}s and never saw the DVD stream"
+  msg_warn "Open the console. If the VM is at the UEFI shell, type ${BL}exit${CL} and boot the DVD by hand."
+  return 0
 }
 
 ask() {  # ask <title> <default> -> ASK_RESULT
