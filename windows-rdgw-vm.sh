@@ -1875,9 +1875,10 @@ ${BOLD}What runs, in order${CL}
       ${BL}${IMAGE_NAME}${CL}.
    4. The specialize pass copies the scripts to
       ${BL}C:\\Windows\\Setup\\Scripts${CL} and registers a startup task.
-   5. That task applies your settings, installs the RD Gateway role, reboots
-      if Windows asks, then runs ${BL}Setup-RDGateway.ps1${CL} and verifies the
-      TSGateway service.
+   5. That task applies your settings, installs the VirtIO guest tools from
+      the CD still attached on ide2 (so Proxmox can read the IP and shut the
+      VM down cleanly), installs the RD Gateway role, reboots if Windows asks,
+      then runs ${BL}Setup-RDGateway.ps1${CL} and verifies the TSGateway service.
 
    Expect ${BL}two or three reboots${CL} and roughly 20-40 minutes depending on
    the disk underneath.

@@ -203,11 +203,37 @@ $cfg = Import-PowerShellDataFile -LiteralPath $ConfigPath
 # ------------------------------------------------------------------------------
 if ($ShellForCurrentUser) {
     Write-Step "Shell settings (current user: $env:USERNAME)"
+
+    # Belt and braces on the automatic logon. The answer file sets LogonCount 1
+    # and Windows decrements it, so this should already be zero - but if that
+    # decrement ever does not happen, a gateway that logs itself in on every
+    # boot is a gateway with a permanently unlocked console. Safe to do here
+    # and nowhere earlier: by the time this runs the one automatic logon has
+    # already happened, so it cannot suppress the logon the RunOnce values
+    # below depend on. cschneegans/unattend-generator does this in the same
+    # phase, for the same reason.
+    #
+    # Needs elevation, which a RunOnce value does not always have, so a failure
+    # here is logged and shrugged off rather than treated as a problem.
+    try {
+        Set-ItemProperty -LiteralPath 'Registry::HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' `
+            -Name 'AutoLogonCount' -Type DWord -Value 0 -Force -ErrorAction Stop
+        Write-Good "AutoLogonCount set to 0"
+    } catch {
+        Write-Skip "Could not clear AutoLogonCount (needs elevation): $($_.Exception.Message)"
+    }
+
     if ($cfg.ApplyTweaks) {
         Set-ShellSetting -Root 'HKCU:'
+        # The Edge shortcut this user inherited from the Default User desktop.
+        $lnk = Join-Path $env:USERPROFILE 'Desktop\Microsoft Edge.lnk'
+        if (Test-Path -LiteralPath $lnk) {
+            Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue
+            Write-Good "Removed the Edge desktop shortcut"
+        }
         Restart-ExplorerHere
     } else {
-        Write-Skip "Skipped - housekeeping was not requested at build time"
+        Write-Skip "Shell settings skipped - housekeeping was not requested at build time"
     }
     Write-Step "Done"
     exit 0
@@ -418,6 +444,51 @@ if (-not $loaded) {
     }
 }
 
+# ------------------------------------------------------------------------------
+# 7b. VirtIO guest tools
+#
+#     Above the ApplyTweaks gate on purpose. The gate answers a prompt that
+#     calls itself cosmetic and not security relevant; the QEMU guest agent is
+#     neither. Without it Proxmox cannot read the VM's IP, cannot shut it down
+#     gracefully, and cannot quiesce the filesystem for a backup - so a gateway
+#     built with housekeeping declined would silently be the worse machine.
+#
+#     The runbook used to tell the operator to run this by hand after first
+#     boot. It is the one step of that list a script can simply do, and doing
+#     it here means it happens while the VirtIO CD is still attached, before
+#     anyone is told to detach the CDs.
+#
+#     Not fatal if missing: the drivers are already installed from
+#     $WinPEDriver$, so a box without the tools still boots, networks and uses
+#     its disk. Only the agent is lost, and the log says so.
+# ------------------------------------------------------------------------------
+Write-Step "VirtIO guest tools"
+
+$guestTools = $null
+foreach ($d in [char[]]'DEFGHIJKLMNOPQRSTUVWXYZ') {
+    $candidate = "${d}:\virtio-win-guest-tools.exe"
+    if (Test-Path -LiteralPath $candidate) { $guestTools = $candidate; break }
+}
+
+if (-not $guestTools) {
+    Write-Skip "virtio-win-guest-tools.exe not found on any drive - is the VirtIO CD still attached? Install it by hand later"
+} else {
+    try {
+        $p = Start-Process -FilePath $guestTools -ArgumentList '/passive', '/norestart' `
+            -Wait -PassThru -ErrorAction Stop
+        # Same reason as Invoke-CustomScripts.ps1: without touching Handle,
+        # ExitCode reads back empty once the child is gone.
+        $null = $p.Handle
+        if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) {
+            Write-Good "Installed $guestTools (exit $($p.ExitCode))"
+        } else {
+            Write-Bad "$guestTools exited $($p.ExitCode)"
+        }
+    } catch {
+        Write-Bad "Could not run ${guestTools}: $($_.Exception.Message)"
+    }
+}
+
 if (-not $cfg.ApplyTweaks) {
     Write-Step "Server housekeeping"
     Write-Skip "Skipped - not requested at build time"
@@ -466,6 +537,19 @@ Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\Recommended' 'BackgroundModeEnab
 # Do not reboot out from under a logged-on administrator. A gateway that
 # reboots mid-session during Windows Update is a gateway nobody trusts.
 Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'NoAutoRebootWithLoggedOnUsers' 1
+
+# The Windows startup chime, which is separate from the system sounds silenced
+# below and survives them.
+Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI\BootAnimation' 'DisableStartupSound' 1
+Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\EditionOverrides' 'UserSetting_DisableStartupSound' 1
+
+# The Edge shortcut on the all-users desktop. The per-user copy is removed by
+# -ShellForCurrentUser, because by the time this runs the profile already has
+# its own inherited copy.
+if (Test-Path -LiteralPath 'C:\Users\Public\Desktop\Microsoft Edge.lnk') {
+    Remove-Item -LiteralPath 'C:\Users\Public\Desktop\Microsoft Edge.lnk' -Force -ErrorAction SilentlyContinue
+    Write-Good "Removed the all-users Edge desktop shortcut"
+}
 
 # NumLock on at the logon screen. .DEFAULT is the hive the logon UI uses.
 Set-Reg 'Registry::HKEY_USERS\.DEFAULT\Control Panel\Keyboard' 'InitialKeyboardIndicators' '2' 'String'

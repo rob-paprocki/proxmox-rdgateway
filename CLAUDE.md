@@ -346,6 +346,18 @@ bug will surface.
   bring-your-own-answer-file path, where the operator generates the XML themselves and this
   script injects only `rdgw/` and `$WinPEDriver$`, is a reasonable future option and has
   been discussed but not built.
+- **The VirtIO guest tools are installed by `Configure-Guest.ps1`, above the `ApplyTweaks`
+  gate.** That gate answers a prompt describing itself as cosmetic and not security
+  relevant; the QEMU guest agent is neither. Without it Proxmox cannot read the VM's IP,
+  cannot shut it down gracefully and cannot quiesce the filesystem for a backup, so a
+  gateway built with housekeeping declined would quietly be the worse machine. It scans
+  D: to Z: for `virtio-win-guest-tools.exe` and runs it `/passive /norestart`, which works
+  because the VirtIO CD is still on ide2 at first boot - before the runbook tells the
+  operator to detach the CDs. Exit code 3010 counts as success; it means "restart
+  required", and a restart is coming anyway. Missing tools are a `[skip]`, not a failure:
+  the drivers themselves came from `$WinPEDriver$`, so the box still boots, networks and
+  uses its disk. The **shell-only** path still tells the operator to run it by hand,
+  correctly, because `Configure-Guest.ps1` never runs there.
 - **Edge first-run is suppressed by machine-wide policy, deliberately.**
   `HKLM\SOFTWARE\Policies\Microsoft\Edge\HideFirstRunExperience = 1`, plus
   `StartupBoostEnabled` and `BackgroundModeEnabled` off under `...\Edge\Recommended`, all
