@@ -17,7 +17,7 @@ behind one public hostname, using stock RD clients.
 | `Configure-Guest.ps1` | The Windows guest, SYSTEM | **Run for real** in both phases. The guest-tools step is the one that has failed |
 | `Invoke-GatewaySetup.ps1` | The Windows guest, SYSTEM | **Run for real.** Registers in specialize, drives the first boot to the end |
 | `Invoke-CustomScripts.ps1` | The Windows guest | **Executed for real** on Windows PowerShell 5.1, see below |
-| `Get-RDGWStatus.ps1` | The Windows guest, elevated | Read-only. Reports what the build actually did against what it was asked to do |
+| `Get-RDGWStatus.ps1` | The Windows guest, elevated | Read-only. **Run for real** through `qm guest exec` on the 2026-09-21 build; reported every check `[ ok ]` |
 | `sample-autounattend.xml` | — | Committed sample of generated output. Not read by anything |
 | `vps-relay-setup.sh` | A public VPS | Optional path. Written, dry-run verified, **never run for real** |
 | `proxmox-relay-peer.sh` | Proxmox host, root | Optional path. Written, dry-run verified, **never run for real** |
@@ -232,6 +232,11 @@ answers "QEMU guest agent is not running" with the VM config reading
 `agent: enabled=1` - so the Proxmox side was never the problem. `follow_build` spent that
 entire build blind. Note that `return value 3` does **not** appear in the main MSI log, so
 this is not a custom action failing; the install is refused earlier than that.
+**The fix was then confirmed on the same hardware the same day.** Moved to the top of the
+first-boot pass and run again - same installer, same media, same `/passive /norestart`
+command line - it reports `[ ok ] Installed F:\virtio-win-guest-tools.exe (exit 0)`, the
+agent answers about a minute later, and `follow_build` streams the log for the rest of the
+build including across the post-Defender reboot. The phase is the whole difference.
 Microsoft's [Audit mode overview](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/audit-mode-overview)
 puts application installs in audit mode precisely because they are changes "that require
 the Windows installation to be running", which specialize is not. This is the boundary of
@@ -348,6 +353,33 @@ bug will surface.
   with two ESPs; `HideLocalAccountScreen` is Server-only and is what stops OOBE asking for an
   Administrator password; `Administrators` is the correct language-neutral `Group` name.
 
+- **A complete build, watched from `qm start` to `First-boot setup finished.` on
+  2026-09-21.** This is the one to point at when something regresses, because every stage
+  reported itself and nothing had to be inspected by hand. Measured, first boot to done,
+  21m36s:
+
+  | | |
+  |---|---|
+  | `press_a_key` | answered the DVD prompt, install began |
+  | specialize | `every setting applied without error`; System script ran here; task registered and read back |
+  | first boot 11:46:55 | VirtIO guest tools `exit 0`, agent up ~1 min later |
+  | 11:57:42 | Defender feature removed (10m46s), reboot taken |
+  | 11:58:51 | pass 2 of 5, `custom/System already ran in specialize` |
+  | 12:02:22 | RDS-Gateway role, pulling in IIS and NPS |
+  | 12:08:31 | certificate bound, listening on 443, CAP readback correct, task unregistered |
+
+  `Get-RDGWStatus.ps1` then ran through the guest agent and returned `[ ok ]` on every
+  line with no `[ NO ]`: Defender absent (`WinDefend=absent`, `AMRunningMode=n/a`), UAC,
+  Ctrl+Alt+Del, Core Isolation (`HVCI running=False`), blank password, lockout 10, tweaks,
+  the `rdgadmin` account, the role, the service, and both policies. `RAP 'RDG_RAP_Default'
+  type=ALL group=` is the empty-`ResourceGroupName` convention working, which was a guess
+  until this run. `follow_build` streamed the whole thing, including across the reboot, and
+  exited 0.
+- **A known cosmetic wart in the log, not yet fixed.** The specialize entries are stamped
+  `08:43` and everything from first boot on is stamped `11:46`, because specialize runs
+  before the timezone is applied. The build is continuous; the log just looks like it
+  jumped three hours. Worth normalising to UTC or stamping the offset.
+
 **Checked and deliberately NOT added to the answer file** - don't re-derive these:
 
 - `OOBE\NetworkLocation` - deprecated in Windows 10, documented for reference only.
@@ -391,15 +423,22 @@ bug will surface.
   Get-CimInstance -Namespace root/cimv2/TerminalServices `
     -ClassName Win32_TSGatewayConnectionAuthorizationPolicy | Select-Object UserGroupNames
   ```
-- `Set-Item RDS:\GatewayServer\SSLCertificate\Thumbprint` matches what win-acme's
-  `ImportRDGateway.ps1` does, but hasn't been run here. There's a WMI fallback
-  (`SetCertificate` then `Configure`, both instance methods on the singleton) and, failing
-  both, the script tells the operator to do it in `tsgateway.msc`.
-- **The custom-script categories have not been watched on a real build.** The runner
-  itself has (above), but the four registration points have not: the `FirstLogon`
-  `RunOnce` value written by a specialize `RunSynchronousCommand`, and the `UserOnce`
-  `RunOnce` value written into the mounted Default User hive. The known interaction is
-  that `AutoLogon` with `LogonCount 1` creates the first profile at roughly the moment
+- `Set-Item RDS:\GatewayServer\SSLCertificate\Thumbprint` - **verified 2026-09-21.** It
+  bound the self-signed certificate on the first attempt and the log printed the thumbprint
+  back plus `[ ok ] Listening on TCP 443`, so the WMI fallback (`SetCertificate` then
+  `Configure`) and the `tsgateway.msc` advice have still never been needed. What remains
+  untested is binding a **real** certificate, which is a different code path only in that
+  the thumbprint comes from somewhere else.
+- **`System` is confirmed; the other three custom-script categories are not.** On the
+  2026-09-21 build the log reads `08:43:17 custom/System: running 1 script(s)`,
+  `08:44:41 custom/System: 010-script.ps1 ok`, both **in specialize**, before any desktop
+  existed - which is exactly the claim that used to be false, and the reason the phase
+  moved. The first-boot pass then correctly logged `custom/System already ran in
+  specialize, before any desktop existed` instead of running it twice. What still has not
+  been watched is `DefaultUser`, `FirstLogon` and `UserOnce`: the `FirstLogon` `RunOnce`
+  value written by a specialize `RunSynchronousCommand`, and the `UserOnce` `RunOnce` value
+  written into the mounted Default User hive. The known interaction is that `AutoLogon`
+  with `LogonCount 1` creates the first profile at roughly the moment
   `Configure-Guest.ps1` is writing that hive, so `UserOnce` may miss the first account.
   `FirstLogon` is registered in specialize precisely so it cannot lose that race, and
   the README says to put anything the first account needs there.
