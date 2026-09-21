@@ -1639,13 +1639,31 @@ qm_bytes_written() {
 qm_blockstat() {
   local dev="$1" field="$2"
   timeout 10 qm status "$VMID" --verbose 2>/dev/null | awk -v d="$dev" -v f="$field" '
-    /^blockstat:/            { inb = 1; next }
-    inb && /^[^[:space:]]/   { inb = 0 }
-    inb && NF == 1 && $1 ~ /:$/ { cur = substr($1, 1, length($1) - 1); next }
-    inb && $1 == f {
-      any = 1
-      total += $2
-      if (cur == d) { named = $2; found = 1 }
+    /^blockstat:/          { inb = 1; next }
+    inb && /^[^[:space:]]/ { inb = 0 }
+    inb {
+      # Device names sit at one tab, their fields at two. Confirmed with cat -A
+      # against a running VM:
+      #
+      #     ^Iscsi0:$
+      #     ^I^Iaccount_failed: 1$
+      #
+      # The indent test is not decoration. Each stanza also holds a bare
+      # "timed_stats:" at field level - one field, ending in a colon, shaped
+      # exactly like a device name - and matching on shape alone made that the
+      # current device. rd_bytes is listed before it and survived; wr_bytes
+      # comes after it and never matched, so the progress line read
+      # "written 0 MiB" through an entire install.
+      ind = match($0, /^\t+/) ? RLENGTH : 0
+      if (NF == 1 && $1 ~ /:$/) {
+        if (ind == 1) { cur = substr($1, 1, length($1) - 1) }
+        next
+      }
+      if ($1 == f) {
+        any = 1
+        total += $2
+        if (cur == d) { named = $2; found = 1 }
+      }
     }
     END { if (found) print named; else if (any) print total }'
 }
