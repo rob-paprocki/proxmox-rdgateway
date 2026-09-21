@@ -22,13 +22,10 @@
                      prepare something the gateway later uses - importing a
                      certificate, say.
 
-                     This description used to say "on the first boot, before
-                     anyone logs on" and that was not true: these ran from the
-                     startup task, which on a measured build was eleven minutes
-                     AFTER the desktop appeared. If a script here needs the
-                     network, note that specialize is early - the NIC driver is
-                     in, but nothing guarantees DHCP has finished. Put anything
-                     that needs the internet in FirstLogon instead.
+                     Specialize is early, so a script here cannot count on the
+                     network: the NIC driver is in, but nothing guarantees DHCP
+                     has finished. Put anything that needs the internet in
+                     FirstLogon instead.
 
         DefaultUser  as SYSTEM with C:\Users\Default\NTUSER.DAT mounted.
                      Configure-Guest.ps1 calls this while it has the hive open.

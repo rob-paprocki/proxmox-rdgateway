@@ -5,13 +5,14 @@ the wizard twice and without guessing at the WMI calls.
 
 | File | Runs on | Does |
 |---|---|---|
-| [`windows-rdgw-vm.sh`](windows-rdgw-vm.sh) | Proxmox host, as root | Interactive VM builder — q35 + OVMF, Secure Boot, TPM 2.0, VirtIO SCSI. Optionally builds an unattend ISO so the whole thing installs itself |
+| [`windows-rdgw-vm.sh`](windows-rdgw-vm.sh) | Proxmox host, as root | Interactive VM builder: q35 + OVMF, Secure Boot, TPM 2.0, VirtIO SCSI. Optionally builds an unattend ISO so the whole thing installs itself |
 | [`Setup-RDGateway.ps1`](Setup-RDGateway.ps1) | Inside the guest, elevated | Installs the RDS-Gateway role, binds a certificate, writes the CAP and RAP, opens the firewall |
 | [`Configure-Guest.ps1`](Configure-Guest.ps1) | Inside the guest, as SYSTEM | Applies the security and housekeeping answers given during the build |
-| [`Invoke-GatewaySetup.ps1`](Invoke-GatewaySetup.ps1) | Inside the guest, as SYSTEM | First-boot orchestrator — survives the role-install reboot and runs the two above |
+| [`Invoke-GatewaySetup.ps1`](Invoke-GatewaySetup.ps1) | Inside the guest, as SYSTEM | Drives the build from inside. Registers the first-boot task, then survives the role-install reboot |
 | [`Invoke-CustomScripts.ps1`](Invoke-CustomScripts.ps1) | Inside the guest | Runs scripts of your own, in the four categories, at the right moment |
+| [`Get-RDGWStatus.ps1`](Get-RDGWStatus.ps1) | Inside the guest, elevated | Read-only. Prints what the build was asked to do next to what the machine actually has |
 | [`vps-relay-setup.sh`](vps-relay-setup.sh) | A small public VPS | *Optional.* Layer 4 front door so nothing has to be open at home |
-| [`proxmox-relay-peer.sh`](proxmox-relay-peer.sh) | Proxmox host, as root | *Optional.* Home end of that relay — outbound WireGuard, forwarding, NAT |
+| [`proxmox-relay-peer.sh`](proxmox-relay-peer.sh) | Proxmox host, as root | *Optional.* Home end of that relay: outbound WireGuard, forwarding, NAT |
 
 On the Proxmox host, as root:
 
@@ -26,16 +27,16 @@ DRY_RUN=1 bash windows-rdgw-vm.sh   # print every command, write nothing
 bash windows-rdgw-vm.sh             # actually build it
 ```
 
-That one script asks whether you want an unattended build. Say yes and it answers a
-short set of questions — account name, password, lockout policy, external FQDN, which
-machines to reach — then writes a third CD holding an answer file, the VirtIO drivers and
-the setup scripts. Windows installs itself, a startup task installs the RD Gateway role and
-runs `Setup-RDGateway.ps1`, and you come back to a working gateway after two or three
-reboots and twenty to forty minutes.
+That one script asks whether you want an unattended build. Say yes and it puts a short set
+of questions to you (account name, password, lockout policy, external FQDN, which machines
+to reach), then writes a third CD holding an answer file, the VirtIO drivers and the setup
+scripts. Windows installs itself, a startup task installs the RD Gateway role and runs
+`Setup-RDGateway.ps1`, and you come back to a working gateway after two or three reboots and
+twenty to forty minutes.
 
-Say no and you get the original behaviour: a correctly configured VM shell with both ISOs
-attached, and you drive Setup yourself. That path is still documented below in full, and it
-is the one to fall back on when something in the automated build misbehaves.
+Say no and you get a correctly configured VM shell with both ISOs attached, and you drive
+Setup yourself. That path is documented below in full, and it is the one to fall back on
+when something in the automated build misbehaves.
 
 ```powershell
 # the manual path, inside the guest, in Windows PowerShell (not pwsh), elevated
@@ -44,44 +45,39 @@ is the one to fall back on when something in the automated build misbehaves.
                       -TargetMachines 'DESKTOP-01','NAS01','192.168.1.60'
 ```
 
-One public hostname, many machines behind it — that's what `-TargetMachines` is for. The
+One public hostname, many machines behind it. That is what `-TargetMachines` is for. The
 targets install nothing: they need Remote Desktop on, your account in their Remote Desktop
 Users group, and a name the gateway can resolve. Windows Pro is fine as a target; only the
 gateway itself has to be Server.
 
 **Cloudflare Tunnel cannot carry this.** RD Gateway's transport uses the custom HTTP methods
 `RDG_IN_DATA` and `RDG_OUT_DATA`, and Cloudflare's edge answers both with `501` before the
-request reaches your origin — so a proxied hostname breaks the gateway outright. Grey-cloud
+request reaches your origin, so a proxied hostname breaks the gateway outright. Grey-cloud
 any DNS record pointing at it. [`RELAY.md`](RELAY.md) explains the failure, has the one-line
 test to confirm it, and sets up a VPS relay as the alternative for people who don't want an
 open port. Client devices install nothing either way.
 
-The rest of this file is the runbook: the decisions to make first, the manual install, the
-certificate, and the DNS and port-forwarding work that has to happen around the scripts.
-
 MIT licensed. Built with Claude.
-
----
 
 ## Runbook
 
-A VM, not an LXC. The gateway has to be Windows, and a Proxmox container shares the host kernel — Windows can't live in one.
+The rest of this file is the runbook: the decisions to make first, the manual install, the
+certificate, and the DNS and port-forwarding work that has to happen around the scripts.
 
----
+A VM, not an LXC. The gateway has to be Windows, and a Proxmox container shares the host
+kernel, so Windows cannot live in one.
 
-## Phase 0 — Decide two things before you touch anything
+## Phase 0: decide two things before you touch anything
 
-**The hostname clients will type.** Something like `rdg.yourdomain.tld`. It has to resolve from the public internet to wherever you terminate — your WAN address if you forward a port, or a relay's address if you use the one in [`RELAY.md`](RELAY.md) — and the certificate has to match it. If your ISP gives you a dynamic address, point it at a DDNS record. Pick this name now; it gets baked into the certificate and into every client profile.
+**The hostname clients will type.** Something like `rdg.yourdomain.tld`. It has to resolve from the public internet to wherever you terminate, which is your WAN address if you forward a port or a relay's address if you use the one in [`RELAY.md`](RELAY.md), and the certificate has to match it. If your ISP gives you a dynamic address, point it at a DDNS record. Pick this name now; it gets baked into the certificate and into every client profile.
 
-**Where the certificate comes from.** This is the one decision that determines whether the thing is pleasant or annoying to use.
+**Where the certificate comes from.** This is what decides whether the thing is pleasant or annoying to use.
 
-A real certificate from Let's Encrypt is free and every client trusts it silently. [win-acme](https://www.win-acme.com/) is the standard ACME client for Windows, it's open source (Apache 2.0), and it ships a script that binds the cert to the gateway and restarts the service on every renewal (Phase 4 has the wiring). Since you already run domains on Cloudflare, the clean path is win-acme with the Cloudflare DNS-01 validation plugin — no inbound port 80 needed, and it works even when the name points at a dynamic address.
+A real certificate from Let's Encrypt is free and every client trusts it silently. [win-acme](https://www.win-acme.com/) is the standard ACME client for Windows, it's open source (Apache 2.0), and it ships a script that binds the cert to the gateway and restarts the service on every renewal (Phase 4 has the wiring). If your domain is already on Cloudflare, the clean path is win-acme with the Cloudflare DNS-01 validation plugin. No inbound port 80 is needed, and it works even when the name points at a dynamic address.
 
 A self-signed certificate works technically, but every client has to be told to trust it. On Windows that's an MMC import into Trusted Root; on Android it's fiddly and on iOS it involves a profile. The script will generate one and export the public half so you can test end to end, but treat it as scaffolding.
 
----
-
-## Phase 1 — Build the VM
+## Phase 1: build the VM
 
 Copy `windows-rdgw-vm.sh` to the Proxmox host and run it as root:
 
@@ -95,9 +91,9 @@ Read-only first pass, if you want to see the `qm` commands without anything happ
 DRY_RUN=1 bash windows-rdgw-vm.sh
 ```
 
-It asks default-or-advanced, then walks you through picking the Windows ISO, the VirtIO driver ISO, and the storage. It will find your `en-us_windows_server_2025_updated_aug_2026_x64_dvd_b0833651.iso` on `local`. If there's no `virtio-win.iso` in any storage it offers to download one (~700 MB from fedorapeople.org).
+It asks default-or-advanced, then walks you through picking the Windows ISO, the VirtIO driver ISO, and the storage. It lists the Windows ISOs already sitting in your storages, so something like `en-us_windows_server_2025_updated_aug_2026_x64_dvd_b0833651.iso` on `local` shows up as a menu entry. If there's no `virtio-win.iso` in any storage it offers to download one (~700 MB from fedorapeople.org).
 
-The defaults are 4 cores, 6 GiB RAM, 80 GiB disk, q35 + OVMF, Secure Boot with the Microsoft keys pre-enrolled, TPM 2.0, VirtIO SCSI single with writeback and discard, and a VirtIO NIC. Server 2025 doesn't *require* a TPM to install — that's a Windows 11 client thing — but BitLocker and Credential Guard do, and it costs 4 MiB, so it's on by default.
+The defaults are 4 cores, 6 GiB RAM, 80 GiB disk, q35 + OVMF, Secure Boot with the Microsoft keys pre-enrolled, TPM 2.0, VirtIO SCSI single with writeback and discard, and a VirtIO NIC. Server 2025 doesn't *require* a TPM to install, which is a Windows 11 client requirement rather than a server one, but BitLocker and Credential Guard both want one and it costs 4 MiB, so it's on by default.
 
 Every command it runs is printed before it runs, so you can follow along or lift them out and do it by hand.
 
@@ -109,9 +105,9 @@ The one-liner at the top works for both paths:
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/main/windows-rdgw-vm.sh)"
 ```
 
-The unattended path needs four more files — `Setup-RDGateway.ps1`, `Configure-Guest.ps1`, `Invoke-GatewaySetup.ps1` and `Invoke-CustomScripts.ps1` — to put on the ISO it builds. Each is resolved on its own: a local copy always wins, and only the ones actually missing are fetched. From a checkout nothing is downloaded and your edits are used. Every URL is printed before it is touched.
+The unattended path needs five more files to put on the ISO it builds: `Setup-RDGateway.ps1`, `Configure-Guest.ps1`, `Invoke-GatewaySetup.ps1`, `Invoke-CustomScripts.ps1` and `Get-RDGWStatus.ps1`. Each is resolved on its own: a local copy always wins, and only the ones actually missing are fetched. From a checkout nothing is downloaded and your edits are used. Every URL is printed before it is touched.
 
-Those four are copied to the unattend CD and run *inside the guest*. They are never executed on the Proxmox host, and neither is anything you add through the custom-scripts menu.
+Those files are copied to the unattend CD and run *inside the guest*. They are never executed on the Proxmox host, and neither is anything you add through the custom-scripts menu.
 
 Pin a branch or tag if you don't want to track `main`:
 
@@ -128,21 +124,24 @@ Say yes to "unattended install" and it asks the following. Nothing here has a sa
 | Question | Default | Notes |
 |---|---|---|
 | Local administrator account name | `rdgadmin` | Deliberately not `admin`. Type whatever you want. |
-| Password | — | Asked twice. Leave it empty for a blank password; it will confirm that you meant it. |
+| Password | none | Asked twice. Leave it empty for a blank password; it will confirm that you meant it. |
 | External FQDN | `rdg.example.com` | Passed straight to `Setup-RDGateway.ps1 -ExternalFqdn`. |
 | Windows time zone ID | `Eastern Standard Time` | The Windows name, not the IANA one. `tzutil /l` lists them. |
 | What clients may reach | Any machine the gateway can reach | Three options. "Only machines I name" then asks for a space separated list. See [what the two policies mean](#what-the-two-policies-mean). |
-| Edition | Standard (Desktop Experience) | Picks the image name **and** the matching GVLK together so they can't drift apart. There are Evaluation entries, which correctly send no key at all. |
+| Edition | Standard (Desktop Experience) | Picks the image name and the matching GVLK together so they can't drift apart. There are Evaluation entries, which correctly send no key at all. |
 | Lockout threshold | `10` | `0` disables lockout entirely. |
 | Lockout window | `15` minutes | Used for both the window and the duration. |
 | Disable UAC | no | |
 | Disable Defender | no | |
 | Disable Core Isolation | no | |
+| Disable IPv6 | no | See below. |
 | Require Ctrl+Alt+Del | no | The one that defaults to the *less* strict answer, because sending Ctrl+Alt+Del to a Proxmox console is a menu trip rather than a keystroke. |
 | Housekeeping settings | yes | 8.3 names off, fast startup off, long paths on, WPBT off, no Windows Update auto-reboot, system sounds off, NumLock on, and Explorer/taskbar/theme defaults suited to RDP. |
 | Custom scripts | no | Opens a menu: write scripts of your own here, or import files you already have. |
 
-The four security toggles all default to leaving Windows exactly as it ships. They exist because the operator asked for them; each prompt states what it costs, and then does what you picked without arguing further.
+The four security toggles all default to leaving Windows exactly as it ships. They are there so you can loosen them deliberately; each prompt states what it costs, and then does what you picked without arguing further.
+
+IPv6 is the odd one out, because the reason to keep it is this project's rather than Windows'. Most ISPs hand out a routable v6 prefix even when v4 is carrier-graded, so an AAAA record and a firewall rule reach the gateway with no relay, no port forward and no spend. Turning v6 off gives that up, and Microsoft advises against turning it off anyway. It defaults to on.
 
 **Check your media before you pick an edition.** The image name has to match the ISO exactly, and Evaluation media names its images differently:
 
@@ -151,7 +150,7 @@ The four security toggles all default to leaving Windows exactly as it ships. Th
 dism /Get-WimInfo /WimFile:<mount>\sources\install.wim
 ```
 
-A retail or volume-licence ISO reports `Windows Server 2025 Standard (Desktop Experience)`. The free Evaluation ISO reports `Windows Server 2025 Standard Evaluation (Desktop Experience)`, and a GVLK cannot activate it — evaluation has to be converted with `DISM /online /Set-Edition` first. Pick the matching entry from the menu, or the "type the image name myself" option.
+A retail or volume-licence ISO reports `Windows Server 2025 Standard (Desktop Experience)`. The free Evaluation ISO reports `Windows Server 2025 Standard Evaluation (Desktop Experience)`, and a GVLK cannot activate it: evaluation has to be converted with `DISM /online /Set-Edition` first. Pick the matching entry from the menu, or the "type the image name myself" option.
 
 ### Custom scripts
 
@@ -170,8 +169,8 @@ Custom scripts (2 so far)
 
 | Phase | When it runs | As whom |
 |---|---|---|
-| `System` | First boot, before anyone logs on, ahead of the RD Gateway role install | SYSTEM |
-| `DefaultUser` | First boot, with `C:\Users\Default\NTUSER.DAT` mounted | SYSTEM |
+| `System` | During the specialize pass, before any profile, desktop or logon exists | SYSTEM |
+| `DefaultUser` | Also in specialize, with `C:\Users\Default\NTUSER.DAT` mounted | SYSTEM |
 | `FirstLogon` | The first interactive logon | That user, elevated |
 | `UserOnce` | Each new user's first logon | That user |
 
@@ -183,7 +182,7 @@ Custom scripts (2 so far)
 
 It suggests a filename numbered in tens: `010-script.ps1`, then `020-`, then `030-`, leaving room to slot something in between later. The number comes from the highest one already in that phase rather than a count, so removing a script does not hand you a name that is still in use, and it is zero padded because the guest sorts on that number. Spaces become hyphens on the way in.
 
-Then it opens `$VISUAL`, `$EDITOR`, `nano`, `vim` or `vi` — whichever it finds first — on a file already seeded with a header saying where the script will run and what will run it:
+Then it opens the first of `$VISUAL`, `$EDITOR`, `nano`, `vim` or `vi` that it finds, on a file already seeded with a header saying where the script will run and what will run it:
 
 ```powershell
 # FirstLogon script for this RD Gateway build.
@@ -212,42 +211,40 @@ Save with nothing added and it tells you so and throws the file away. If the box
 
 Both routes end in the same place, so you can write one script by hand, import a directory of others, and ship them together. Within a phase they run in order of that leading number, so `020-` follows `010-` and `100-` comes last; anything unnumbered runs after everything that is numbered. `.ps1`, `.cmd`, `.bat` and `.reg` are recognised; anything else is ignored.
 
-`System` runs before the gateway role is installed, so a script there can put something in place that the gateway then uses — importing a real certificate into `LocalMachine\My`, for instance, which saves you the self-signed one. A script that fails, or that runs longer than fifteen minutes, is logged and skipped rather than stopping the build; everything lands in the same `rdgw-setup.log`, prefixed `custom/<category>`.
+`System` runs long before the gateway role is installed, so a script there can put something in place that the gateway later uses. Importing a real certificate into `LocalMachine\My`, for instance, saves you the self-signed one. Specialize is early enough that the NIC driver is loaded but DHCP may not have finished, so put anything that needs the internet in `FirstLogon` instead. A script that fails, or that runs longer than fifteen minutes, is logged and skipped rather than stopping the build; everything lands in the same `rdgw-setup.log`, prefixed `custom/<category>`.
 
 A `.reg` file in `DefaultUser` is rewritten before import: the bracketed key headers naming `HKEY_CURRENT_USER` are retargeted at the mounted hive, because there is no current user at that point. Write it as though you were the logged-on user and it will land in every profile created afterwards.
 
 A `.ps1` or `.cmd` in `DefaultUser` gets no such rewrite, and it matters more than it sounds: with nobody logged on, `HKCU:` is SYSTEM's own profile, so a write there succeeds, logs `ok`, and reaches nothing. The mounted hive is in `$env:RDGW_HIVE_PATH`, and the seeded header says so.
 
-The answer file logs the new account on automatically, exactly once, and that profile is created from the Default User hive at roughly the same moment `Configure-Guest.ps1` is writing to it. `FirstLogon` catches that first automatic logon reliably because the answer file registers it during the specialize pass, ahead of any logon. `UserOnce` is registered in the Default User hive and may not reach that very first profile, so put anything the first account must have in `FirstLogon`.
+The answer file logs the new account on automatically, exactly once, and that profile is created from the Default User hive. `FirstLogon` catches that first automatic logon reliably because the answer file registers it during the specialize pass, ahead of any logon. `UserOnce` is registered in the Default User hive and may not reach that very first profile, so put anything the first account must have in `FirstLogon`.
 
 ### What lands on the unattend CD
 
 Five things, and `DRY_RUN=1` prints the generated answer file in full so you can read it before anything is written:
 
-- `autounattend.xml` — Windows Setup finds this by itself. It scans the root of every removable drive looking for exactly that filename, so no boot-order change is needed.
-- `$WinPEDriver$\` — `vioscsi`, `viostor` and `NetKVM` from `2k25\amd64`. Windows Server scans every drive letter from C upward for a directory with this name during the windowsPE pass and stages every INF underneath it. That is what removes the **Load driver** step.
-- `rdgw\*.ps1` — copied to `C:\Windows\Setup\Scripts` during the specialize pass.
-- `rdgw\rdgw-config.psd1` — every answer you gave, as plain data.
-- `rdgw\custom\` — your own scripts, if you supplied any. Carried across by the same copy step, so no extra answer-file command is needed to place them.
+- `autounattend.xml`. Windows Setup finds this by itself. It scans the root of every removable drive looking for exactly that filename, so no boot-order change is needed.
+- `$WinPEDriver$\`, holding `vioscsi`, `viostor` and `NetKVM` from `2k25\amd64`. Windows Server scans every drive letter from C upward for a directory with this name during the windowsPE pass and stages every INF underneath it. That is what removes the **Load driver** step.
+- `rdgw\*.ps1`, copied to `C:\Windows\Setup\Scripts` during the specialize pass.
+- `rdgw\rdgw-config.psd1`, every answer you gave, as plain data.
+- `rdgw\custom\`, your own scripts if you supplied any. Carried across by the same copy step, so no extra answer-file command is needed to place them.
 
 [`sample-autounattend.xml`](sample-autounattend.xml) is a committed copy of what a default run produces, so the shape is reviewable without running anything.
 
-The CD is attached on `sata0` — q35 gives you only `ide0` and `ide2`, and both are already holding the Windows and VirtIO ISOs. It is written mode 600 because the answer file carries the account password in clear text. Base64 in an answer file is obfuscation, not encryption, so this doesn't pretend otherwise: delete the ISO once the build is done.
+The CD is attached on `sata0`, because q35 gives you only `ide0` and `ide2` and both are already holding the Windows and VirtIO ISOs. It is written mode 600 because the answer file carries the account password in clear text. Base64 in an answer file is obfuscation rather than encryption, so nothing here pretends otherwise: a build that finishes deletes the ISO itself, and [Undo](#undo) covers the cases where it could not.
 
----
-
-## Phase 2 — Install Windows
+## Phase 2: install Windows
 
 ### If you chose the unattended path
 
 Nothing to do. It is here so you know what is happening and where to look if it stalls.
 
-1. The script answers the DVD's "Press any key to boot from CD or DVD" prompt from the host with `qm sendkey`, repeatedly for the first minute after `qm start`. See [the boot prompt](#the-boot-prompt) for why the prompt is answered rather than removed.
+1. The script answers the DVD's "Press any key to boot from CD or DVD" prompt from the host with `qm sendkey`, watching the DVD's byte counter to know when the prompt is actually on screen. See [the boot prompt](#the-boot-prompt) for why the prompt is answered rather than removed.
 2. Windows Setup finds `autounattend.xml` on the unattend CD and stages the VirtIO drivers from `$WinPEDriver$`.
-3. It wipes disk 0 — the only disk this VM has — and partitions it EFI 300 MiB, MSR 16 MiB, then NTFS for the rest. There is deliberately no explicit recovery partition: Windows creates the WinRE partition itself on an NTFS boot volume by shrinking the OS volume on first boot.
+3. It wipes disk 0, the only disk this VM has, and partitions it EFI 300 MiB, MSR 16 MiB, then NTFS for the rest. There is deliberately no explicit recovery partition: Windows creates the WinRE partition itself on an NTFS boot volume by shrinking the OS volume on first boot.
 4. It installs the edition you chose.
-5. The specialize pass copies the scripts to `C:\Windows\Setup\Scripts` and registers a startup task called `RDGW-FirstBoot`.
-6. That task applies your answers, runs any `System` scripts of yours, installs the RD Gateway role, reboots if Windows asks for one, then runs `Setup-RDGateway.ps1` and checks that the `TSGateway` service came up.
+5. The specialize pass copies the scripts to `C:\Windows\Setup\Scripts`, applies your answers, writes the Default User hive, runs any `System` scripts of yours, and registers a startup task called `RDGW-FirstBoot`.
+6. That task installs the VirtIO guest tools, removes the Defender feature if you asked for that and takes the reboot it needs, installs the RD Gateway role, then runs `Setup-RDGateway.ps1` and checks that the `TSGateway` service came up.
 
 Expect two or three reboots and roughly twenty to forty minutes. Everything is timestamped in:
 
@@ -257,7 +254,13 @@ C:\Windows\Setup\Scripts\rdgw-setup.log
 
 It's finished when that log ends with `First-boot setup finished.` Windows Setup's own log, for failures before any of the above runs, is `C:\Windows\Panther\setupact.log`.
 
-That role-install reboot is why `Invoke-GatewaySetup.ps1` exists. `Setup-RDGateway.ps1` stops and asks you to reboot and re-run with `-SkipRoleInstall` when `Install-WindowsFeature` reports `RestartNeeded`, and `SetupComplete.cmd` is not allowed to reboot and resume. So the work is split across boots and the task keeps the place in a small state file. It stops after five boots rather than looping, leaves itself registered, and writes why to the log — so a plain reboot retries.
+You do not have to go and read that log yourself while it builds, though. The script follows the build instead of returning as soon as the VM starts: first by watching the DVD and disk byte counters, then, once the QEMU guest agent is up, by reading `rdgw-setup.log` out of the guest and printing each new line as it appears. It exits non-zero if the log reports an error. `NO_WAIT=1` turns that off and returns at `qm start`; `FOLLOW_SECONDS` caps how long it waits, at an hour by default.
+
+When the log says the gateway is finished, the script detaches all three CDs, sets the boot order to the disk, and deletes the unattend ISO, since that ISO holds the account password in clear text. `KEEP_MEDIA=1` leaves all of it in place. A build that *failed* also keeps its media, deliberately: the first-boot task stays registered, so a reboot retries, and the retry needs the VirtIO CD to install the guest tools from.
+
+One thing not to do while any of this is running: type into the guest's console. Setup reboots two or three times, the DVD is still first in the boot order at every one of them, and the only thing stopping the machine reinstalling itself is that boot prompt timing out unanswered. A single stray Enter at the wrong moment answers it, and `WillWipeDisk` does what it says to the build you were waiting on. Read the log from the host and leave the console alone until it's done.
+
+That role-install reboot is why `Invoke-GatewaySetup.ps1` exists. `Setup-RDGateway.ps1` stops and asks you to reboot and re-run with `-SkipRoleInstall` when `Install-WindowsFeature` reports `RestartNeeded`, and `SetupComplete.cmd` is not allowed to reboot and resume. So the work is split across boots and the task keeps the place in a small state file. It stops after five boots rather than looping, leaves itself registered, and writes why to the log, so a plain reboot retries.
 
 Then skip to Phase 4. Phase 3 lists what the automated path already did.
 
@@ -265,7 +268,7 @@ Then skip to Phase 4. Phase 3 lists what the automated path already did.
 
 The Windows DVD's EFI loader prints "Press any key to boot from CD or DVD" and gives up after about five seconds. On an unattended build nobody is there to answer it, the firmware falls through to an empty disk, and the VM stops at the UEFI shell. That is the first thing that will go wrong if you build this by hand.
 
-The prompt has to stay, though. Setup reboots two or three times before it finishes, the DVD is still first in the boot order each time, and the prompt timing out is exactly what lets those reboots fall through to the disk instead of restarting the install. Rebuilding the media around `efisys_noprompt.bin` — which does ship on the ISO, next to `efisys.bin` — would fix the first boot and buy an endless reinstall loop in exchange.
+The prompt has to stay, though. Setup reboots two or three times before it finishes, the DVD is still first in the boot order each time, and the prompt timing out is exactly what lets those reboots fall through to the disk instead of restarting the install. Rebuilding the media around `efisys_noprompt.bin`, which does ship on the ISO next to `efisys.bin`, would fix the first boot and buy an endless reinstall loop in exchange.
 
 So the prompt stays and the host answers it once, with [`qm sendkey`](https://pve.proxmox.com/pve-docs/qm.1.html):
 
@@ -306,13 +309,19 @@ Open the console from the Proxmox web UI. Two things trip people up:
 
 Pick a **(Desktop Experience)** edition unless you genuinely want to run this from Server Core.
 
----
+## Phase 3: post-install housekeeping
 
-## Phase 3 — Post-install housekeeping
+The unattended path has already done items 1, 3, 5 and 6 below, plus the housekeeping settings if you accepted them. What it cannot do for you is item 2, pinning the address, and item 4, Windows Update. Do those, then go to Phase 4.
 
-The unattended path has already done items 1, 3, 5 and 6 below, plus the housekeeping settings if you accepted them. What it cannot do for you is item 2 — pinning the address — and item 4, Windows Update. Do those, then go to Phase 4.
+On an unattended build, the fastest way to find out whether everything took is the status script, which is on the CD and gets copied in with the rest:
 
-One thing to check on an unattended build, because it is the likeliest thing in this repo to be wrong: the `UserGroupNames` readback. `Invoke-GatewaySetup.ps1` prints it into the log for exactly this reason, and `Administrators@BUILTIN` on a non-domain-joined gateway comes from a published workgroup example rather than from a run against real hardware.
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Windows\Setup\Scripts\Get-RDGWStatus.ps1
+```
+
+It is read-only. It checks that the CD's files arrived, that the first-boot task was created and ran, how far it got, and then, for each setting you chose during the build, whether the machine is actually in that state. A mismatch there with a healthy log above it means the setting was applied and something undid it.
+
+The one thing worth reading by eye is the `UserGroupNames` readback, because it is the likeliest thing in this repo to be wrong. `Invoke-GatewaySetup.ps1` prints it into the log for exactly that reason.
 
 ```powershell
 Get-CimInstance -Namespace root/cimv2/TerminalServices `
@@ -331,32 +340,28 @@ On the shell-only path, inside Windows, before you configure anything:
    ```
 6. **Set a serious password** on whatever account you'll use. You are about to put an authentication endpoint on the public internet. Also worth setting a lockout policy: `secpol.msc` → Account Policies → Account Lockout Policy, 10 attempts / 15 minutes is a reasonable floor.
 
----
-
-## Phase 4 — Certificate
+## Phase 4: the certificate
 
 If you're going the Let's Encrypt route, do it before running the setup script so the script can just bind the result.
 
 Download win-acme, unzip it somewhere permanent like `C:\win-acme`, and run `wacs.exe` as admin. Choose the full options menu, pick a manual certificate for your FQDN, and choose **DNS-01** validation with the Cloudflare plugin (it will ask for an API token scoped to `Zone:DNS:Edit` on that zone).
 
-At the installation step there is no "RD Gateway" plugin — win-acme only ships two, **IIS bindings** and **Script**. Choose **Script**, and point it at the one win-acme bundles for exactly this job:
+At the installation step there is no "RD Gateway" plugin. win-acme ships two, **IIS bindings** and **Script**. Choose **Script**, and point it at the one win-acme bundles for exactly this job:
 
 ```
 Script:     C:\win-acme\Scripts\ImportRDGateway.ps1
 Arguments:  {CertThumbprint}
 ```
 
-That script copies the certificate into `LocalMachine\My` if it isn't there, sets `RDS:\GatewayServer\SSLCertificate\Thumbprint`, and restarts `TSGateway` — the same binding call `Setup-RDGateway.ps1` makes. win-acme registers a scheduled task that runs **daily** and renews whenever the certificate falls inside its renewal window (55 days after issue, by default), re-running the script each time.
+That script copies the certificate into `LocalMachine\My` if it isn't there, sets `RDS:\GatewayServer\SSLCertificate\Thumbprint`, and restarts `TSGateway`, which is the same binding call `Setup-RDGateway.ps1` makes. win-acme registers a scheduled task that runs **daily** and renews whenever the certificate falls inside its renewal window (55 days after issue, by default), re-running the script each time.
 
-Then run the setup script with `-CertificateSource Existing -Thumbprint <the thumbprint win-acme reported>`, or just skip the certificate entirely — win-acme will already have bound it.
+Then run the setup script with `-CertificateSource Existing -Thumbprint <the thumbprint win-acme reported>`, or just skip the certificate entirely, since win-acme will already have bound it.
 
 If you're testing first, let the script make a self-signed one and import the exported `.cer` into **Trusted Root Certification Authorities** on your client machine.
 
----
+## Phase 5: configure the gateway
 
-## Phase 5 — Configure the gateway
-
-Copy `Setup-RDGateway.ps1` into the VM. Run it from an **elevated Windows PowerShell** prompt (not `pwsh` — the WMI fallback path wants Windows PowerShell 5.1, which is what ships in the box).
+Copy `Setup-RDGateway.ps1` into the VM. Run it from an **elevated Windows PowerShell** prompt (not `pwsh`, because the WMI fallback path wants Windows PowerShell 5.1, which is what ships in the box).
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass -Force
@@ -379,7 +384,7 @@ RD Gateway has two gates and a connection has to pass both.
 
 The **CAP** (connection authorization policy) answers *who may use this gateway at all*. The script creates one allowing the local `Administrators` and `Remote Desktop Users` groups, with password authentication.
 
-The **RAP** (resource authorization policy) answers *what they may reach through it*. This is the one you care about, because it's what makes a gateway a gateway: **one public hostname, many machines behind it.**
+The **RAP** (resource authorization policy) answers *what they may reach through it*. This is the one you care about, because it is what buys you one public hostname with many machines behind it.
 
 List the machines you want to reach and the script builds the policy around them:
 
@@ -389,7 +394,7 @@ List the machines you want to reach and the script builds the policy around them
                       -TargetMachines 'DESKTOP-01','NAS01','192.168.1.60'
 ```
 
-The gateway box itself is always included, so you keep a way in even when the machine you were actually after is powered off. For each name you give it, the script also resolves and adds the FQDN and IP, because the RAP matches on the exact string the client asks for — and it warns you about anything that didn't resolve, since the gateway has to resolve the target again at connect time or you get event 301.
+The gateway box itself is always included, so you keep a way in even when the machine you were actually after is powered off. For each name you give it, the script also resolves and adds the FQDN and IP, because the RAP matches on the exact string the client asks for. It warns you about anything that didn't resolve, since the gateway has to resolve the target again at connect time or you get event 301.
 
 Three scopes are available, and the unattended build asks which one you want. `AnyResource` skips the list entirely and permits anything the gateway can reach; it is what the unattended path offers first, because it is what most people mean by "a gateway for my LAN". `Listed` is this server plus the machines you name, and `-TargetMachines` selects it automatically. `ThisServerOnly` is the default when you run `Setup-RDGateway.ps1` by hand with no arguments.
 
@@ -408,49 +413,47 @@ Note the `@` suffix convention: built-in groups are `Administrators@BUILTIN`, gr
 
 ### What the other machines need
 
-Nothing installed. No gateway role, no certificate, no agent. Each target needs only:
+Nothing installed: no gateway role, no certificate, no agent. Each target needs only:
 
 - Remote Desktop enabled
 - your account in its local **Remote Desktop Users** group
 - its firewall permitting 3389 from the gateway
-- a name the gateway can resolve — a DHCP reservation, a DNS record, or just list it by IP
+- a name the gateway can resolve, which can be a DHCP reservation, a DNS record, or just listing it by IP
 
-Windows **Pro** editions work fine as targets; only the gateway itself has to be Server. Home editions can't accept RDP at all. In the client you change one field — **Computer** — to switch machines; the gateway name stays the same for all of them.
+Windows **Pro** editions work fine as targets; only the gateway itself has to be Server. Home editions can't accept RDP at all. In the client you change one field, **Computer**, to switch machines; the gateway name stays the same for all of them.
 
 To add a machine later, re-run the script with the full list. It removes and recreates its own CAP and RAP, so re-running is safe and the result is the same as if you'd listed them all the first time.
 
-The script uses the documented `Win32_TSGateway*` WMI classes rather than the `RDS:` PowerShell provider for the policies, because the WMI method signatures spell out what each flag means. The certificate binding is the exception — that goes through `RDS:\GatewayServer\SSLCertificate\Thumbprint`, which is the well-trodden path, with a WMI fallback and, failing both, instructions for doing it in `tsgateway.msc`.
+The script uses the documented `Win32_TSGateway*` WMI classes rather than the `RDS:` PowerShell provider for the policies, because the WMI method signatures spell out what each flag means. The certificate binding is the exception. That goes through `RDS:\GatewayServer\SSLCertificate\Thumbprint`, which is the well-trodden path, with a WMI fallback and, failing both, instructions for doing it in `tsgateway.msc`.
 
----
-
-## Phase 6 — Getting to it from outside
+## Phase 6: getting to it from outside
 
 Two ways. Pick one.
 
-### Option A — forward the port
+### Option A: forward the port
 
 On your router, forward to the VM's LAN address:
 
-- **TCP 443** — required. This is the HTTPS tunnel the whole thing rides on.
-- **UDP 3391** — optional but worth it. RD Gateway uses it for the graphics stream, and it makes a high-latency link feel dramatically better.
+- **TCP 443**, required. This is the HTTPS tunnel the whole thing rides on.
+- **UDP 3391**, optional but worth it. RD Gateway uses it for the graphics stream, and it makes a high-latency link feel dramatically better.
 
-**Do not forward 3389.** The entire point of the gateway is that raw RDP never faces the internet.
+**Do not forward 3389.** Keeping raw RDP off the internet is what you built the gateway for.
 
-Point `rdg.yourdomain.tld` at your WAN address. If that name is on Cloudflare, it has to be **DNS only (grey cloud)** — see the note below.
+Point `rdg.yourdomain.tld` at your WAN address. If that name is on Cloudflare, it has to be **DNS only (grey cloud)**, per the note below.
 
 Costs nothing and works today. The trade is one open port, so spend ten minutes on the hardening below.
 
 #### Hardening the open port
 
-**Restrict the source.** The single most effective lever. In UniFi, scope the WAN-in rule for 443 to the countries or address ranges you actually connect from. Anything you cut here never reaches Windows at all.
+**Restrict the source.** In UniFi, scope the WAN-in rule for 443 to the countries or address ranges you actually connect from. Anything you cut here never reaches Windows at all, which makes this the cheapest lever on the list.
 
-**Put the gateway on its own VLAN.** Restricting the source narrows who can reach the gateway; this narrows what the gateway can reach if it falls. It is by design a machine that accepts connections from the internet and then reaches into your LAN, so assume for a moment that someone is on it and ask what that buys them. In UniFi, give it its own network and write firewall rules that let it reach only 3389 on the specific machines you pass to `-TargetMachines` — not the NAS, not your other VMs, not the Proxmox management interface. This one applies whichever of the two options you pick, because it concerns the gateway itself rather than how traffic gets to it.
+**Put the gateway on its own VLAN.** Restricting the source narrows who can reach the gateway; this narrows what the gateway can reach if it falls. It is by design a machine that accepts connections from the internet and then reaches into your LAN, so assume for a moment that someone is on it and ask what that buys them. In UniFi, give it its own network and write firewall rules that let it reach only 3389 on the specific machines you pass to `-TargetMachines`, and not the NAS, your other VMs, or the Proxmox management interface. This one applies whichever of the two options you pick, because it concerns the gateway itself rather than how traffic gets to it.
 
 **Lock accounts out.** `secpol.msc` → Account Policies → Account Lockout Policy. Ten attempts per fifteen minutes is a reasonable floor.
 
-**Don't use obvious account names,** and give whatever you do use a long password. This is an authentication endpoint on the public internet; that's the whole threat model.
+**Don't use obvious account names,** and give whatever you do use a long password. An authentication endpoint on the public internet is the whole threat model here.
 
-**Keep the hostname out of Certificate Transparency logs.** Every certificate a public CA issues is published to CT logs, permanently and publicly, so `rdg.yourdomain.tld` becomes a searchable fact the moment win-acme first runs — and people scrape those logs for exactly the names you would guess: `rdg.`, `vpn.`, `remote.`. Phase 4 already validates over DNS-01, so ask win-acme for a wildcard (`*.yourdomain.tld`) instead and the specific name never appears. Be clear about what this does and doesn't buy: it hides nothing from anyone sweeping IPv4 for an open 443, and it substitutes for none of the rest of this list. It only stops you being handed to people hunting gateways by name. It applies to the relay too, where what gets found is the VPS.
+**Keep the hostname out of Certificate Transparency logs.** Every certificate a public CA issues is published to CT logs, permanently and publicly, so `rdg.yourdomain.tld` becomes a searchable fact the moment win-acme first runs, and people scrape those logs for exactly the names you would guess: `rdg.`, `vpn.`, `remote.`. Phase 4 already validates over DNS-01, so ask win-acme for a wildcard (`*.yourdomain.tld`) instead and the specific name never appears. Be clear about what this does and doesn't buy: it hides nothing from anyone sweeping IPv4 for an open 443, and it substitutes for none of the rest of this list. It only stops you being handed to people hunting gateways by name. It applies to the relay too, where what gets found is the VPS.
 
 **Watch for guessing.** Event 4625 in the Security log, and the gateway's own operational log:
 
@@ -461,33 +464,31 @@ Get-WinEvent -LogName Microsoft-Windows-TerminalServices-Gateway/Operational -Ma
 
 **Keep it patched.** RD Gateway has had pre-auth RCEs before (CVE-2020-0609/0610). Windows Update is not optional on this box.
 
-One thing *not* to bother with: moving the gateway off 443. It's possible — `HttpsPort` under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\TerminalServerGateway\Config\Core` — but it requires disabling the UDP transport, and clients need `RDGClientTransport` set in `HKCU\Software\Microsoft\Terminal Server Client` before they'll connect to a non-standard port. A registry edit on every device is exactly what a gateway is supposed to spare you.
+One thing *not* to bother with: moving the gateway off 443. It's possible, via `HttpsPort` under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\TerminalServerGateway\Config\Core`, but it requires disabling the UDP transport, and clients need `RDGClientTransport` set in `HKCU\Software\Microsoft\Terminal Server Client` before they'll connect to a non-standard port. A registry edit on every device is exactly what a gateway is supposed to spare you.
 
-### Option B — a public relay, nothing open at home
+### Option B: a public relay, nothing open at home
 
-If you'd rather not have an open port, or you're behind CGNAT and can't forward one anyway, [`RELAY.md`](RELAY.md) sets up a small VPS as a layer 4 front door with a WireGuard link back to your Proxmox host. TLS still terminates on the Windows box, so the certificate work in Phase 4 is unchanged, and **client devices install nothing** — they see a normal hostname on 443.
+If you'd rather not have an open port, or you're behind CGNAT and can't forward one anyway, [`RELAY.md`](RELAY.md) sets up a small VPS as a layer 4 front door with a WireGuard link back to your Proxmox host. TLS still terminates on the Windows box, so the certificate work in Phase 4 is unchanged, and **client devices install nothing**. They see a normal hostname on 443.
 
 Two scripts: `vps-relay-setup.sh` on the VPS, then `proxmox-relay-peer.sh` on the Proxmox host.
 
-**This does not have to cost anything.** Oracle Cloud's Always Free tier includes two `VM.Standard.E2.1.Micro` instances, each with a public IPv4 and 50 Mbps, plus 10 TB/month of egress, and the resources don't expire. The relay scripts run on one unmodified. The catch, stated in Oracle's own documentation: idle Always Free instances get reclaimed when CPU *and* network sit below 20% across a seven-day window — and a relay you use a few times a week is idle by definition. Plenty of people run one anyway and just rebuild it if it disappears; decide whether that's a tolerable failure mode for the thing you use to get back into your house.
+**This does not have to cost anything.** Oracle Cloud's Always Free tier includes two `VM.Standard.E2.1.Micro` instances, each with a public IPv4 and 50 Mbps, plus 10 TB/month of egress, and the resources don't expire. The relay scripts run on one unmodified. The catch, stated in Oracle's own documentation: idle Always Free instances get reclaimed when CPU *and* network sit below 20% across a seven-day window, and a relay you use a few times a week is idle by definition. Plenty of people run one anyway and just rebuild it if it disappears; decide whether that's a tolerable failure mode for the thing you use to get back into your house.
 
-Most of the hardening under Option A still applies here. The relay changes which address is listed and narrows what faces the internet to a layer 4 proxy — it does not make the gateway any harder to authenticate against, so the lockout policy, the account naming, the patching and especially the VLAN isolation are all still yours to do. What you can drop is the WAN-in source restriction, since there is no longer a WAN rule to scope; the equivalent lives in the relay's own firewall.
+Most of the hardening under Option A still applies here. The relay changes which address is listed and narrows what faces the internet to a layer 4 proxy. It does not make the gateway any harder to authenticate against, so the lockout policy, the account naming, the patching and especially the VLAN isolation are all still yours to do. What you can drop is the WAN-in source restriction, since there is no longer a WAN rule to scope; the equivalent lives in the relay's own firewall.
 
 ### Cloudflare Tunnel is not an option here, and it's worth knowing why
 
-RD Gateway's transport uses two custom HTTP methods, `RDG_IN_DATA` and `RDG_OUT_DATA`. Cloudflare's edge runs a method allowlist and answers both with `501` before the request reaches your origin — so a proxied (orange-cloud) hostname breaks the gateway outright, whether the traffic arrives over a tunnel or a port-forward. Grey-cloud any DNS record pointing at this service. `RELAY.md` has the test you can run to confirm it for yourself.
+RD Gateway's transport uses two custom HTTP methods, `RDG_IN_DATA` and `RDG_OUT_DATA`. Cloudflare's edge runs a method allowlist and answers both with `501` before the request reaches your origin, so a proxied (orange-cloud) hostname breaks the gateway outright, whether the traffic arrives over a tunnel or a port-forward. Grey-cloud any DNS record pointing at this service. `RELAY.md` has the test you can run to confirm it for yourself.
 
 ### Then test it properly
 
-Confirm the name resolves and connects **from cellular data, not from inside your LAN.** A lot of consumer routers don't hairpin, so an inside test can fail while the outside one works fine — and vice versa, which is worse, because it looks like success.
+Confirm the name resolves and connects **from cellular data, not from inside your LAN.** A lot of consumer routers don't hairpin, so an inside test can fail while the outside one works fine. It can also go the other way, which is worse, because that one looks like success.
 
----
-
-## Phase 7 — Connect
+## Phase 7: connect
 
 **From Windows**, the built-in `mstsc.exe` is the reliable client. Advanced tab → *Connect from anywhere* → Settings → "Use these RD Gateway server settings", server name `rdg.yourdomain.tld`, logon method "Ask for password (NTLM)", and tick **"Use my RD Gateway credentials for the remote computer"**. Then on the General tab, the computer is the server's own name (`RDGW01`), not the gateway name.
 
-**An `.rdp` file** saves the fiddling and works across clients — save this as `rdgw01.rdp` and double-click it:
+An `.rdp` file saves the fiddling and works across clients. Save this as `rdgw01.rdp` and double-click it:
 
 ```
 full address:s:RDGW01
@@ -501,7 +502,7 @@ authentication level:i:2
 
 `gatewayusagemethod:i:1` means always use the gateway; `gatewayprofileusagemethod:i:1` means use these explicit settings rather than any admin-pushed profile; `promptcredentialonce:i:1` reuses the gateway credentials for the target so you only type them once.
 
-**On Android**, the Windows App is the current client, and it inherits the Gateways screen from the old Remote Desktop app — add the gateway there first, then attach it to the PC connection. Note that the Windows App **cannot import `.rdp` files**; that capability was dropped, so connections have to be recreated by hand on each device. Microsoft documents the Windows App's gateway settings for macOS and iOS/iPadOS explicitly; Android isn't covered in that article, so if the Gateways screen isn't where you expect it, that's the thing to go looking for.
+**On Android**, the Windows App is the current client, and it inherits the Gateways screen from the old Remote Desktop app. Add the gateway there first, then attach it to the PC connection. Note that the Windows App **cannot import `.rdp` files**; that capability was dropped, so connections have to be recreated by hand on each device. Microsoft documents the Windows App's gateway settings for macOS and iOS/iPadOS explicitly; Android isn't covered in that article, so if the Gateways screen isn't where you expect it, that's the thing to go looking for.
 
 ### Watching it work
 
@@ -512,21 +513,17 @@ Get-WinEvent -LogName Microsoft-Windows-TerminalServices-Gateway/Operational -Ma
     Format-Table TimeCreated, Id, Message -AutoSize
 ```
 
-Event **200** means the client reached the gateway. **300** means the RAP authorized the target. **302** means traffic is flowing through to it. If you see 200 but never 300, your RAP doesn't list the name the client asked for — check what name you put in "Computer" against the resource group the script built.
-
----
+Event **200** means the client reached the gateway. **300** means the RAP authorized the target. **302** means traffic is flowing through to it. If you see 200 but never 300, your RAP doesn't list the name the client asked for; check what name you put in "Computer" against the resource group the script built.
 
 ## Things worth knowing
 
-**Sessions.** Windows Server allows two concurrent administrative RDP sessions with no RDS licensing and no license server. That's the mode you're in. Going beyond two means the RD Session Host role and paid RDS CALs.
+Windows Server allows two concurrent administrative RDP sessions with no RDS licensing and no license server. That's the mode you're in. Going beyond two means the RD Session Host role and paid RDS CALs.
 
-**Licensing, honestly.** Microsoft's terms call for an RDS CAL for connections made *through* an RD Gateway, even in the two-admin-session case. There is no technical enforcement — the 120-day grace period timer belongs to RD Session Host, not RD Gateway, so nothing will stop working. It's a compliance question, not a functional one, and for a personal home lab you can weigh it accordingly. I'm not a lawyer and this isn't legal advice.
+On licensing, honestly: Microsoft's terms call for an RDS CAL for connections made *through* an RD Gateway, even in the two-admin-session case. There is no technical enforcement, because the 120-day grace period timer belongs to RD Session Host rather than RD Gateway, so nothing will stop working. It's a compliance question rather than a functional one, and for a personal home lab you can weigh it accordingly. I'm not a lawyer and this isn't legal advice.
 
-**You are putting an auth endpoint on the internet.** RD Gateway is a mature, well-audited piece of software, but it has had remote code execution bugs before (CVE-2020-0609/0610 were pre-auth). Keep the VM patched, keep passwords strong, keep the RAP scoped to this server, and watch event 4625 in the Security log for credential stuffing. If you want a second factor, the supported route is installing the NPS Extension for Microsoft Entra MFA on this box and pointing the CAP at a central NPS store — that's a bigger project and it drags you into Entra.
+You are putting an auth endpoint on the internet. RD Gateway is a mature, well-audited piece of software, but it has had remote code execution bugs before (CVE-2020-0609/0610 were pre-auth). Keep the VM patched, keep passwords strong, keep the RAP scoped to this server, and watch event 4625 in the Security log for credential stuffing. If you want a second factor, the supported route is installing the NPS Extension for Microsoft Entra MFA on this box and pointing the CAP at a central NPS store. That's a bigger project and it drags you into Entra.
 
-**The FOSS alternative, stated once.** Everything above exists because you asked for a real RD Gateway. If the goal is just "reach my Windows box from anywhere", WireGuard or Tailscale on the Proxmox host gets you there with no roles, no certificates, no ports open to the world, and no CAL question — and you'd RDP to the LAN address once you're on the tunnel. Worth keeping in your back pocket if the gateway turns into a maintenance burden.
-
----
+The FOSS alternative, stated once: everything above is for people who want a real RD Gateway, with stock clients and nothing installed on the far end. If the goal is only "reach my Windows box from anywhere", WireGuard or Tailscale on the Proxmox host gets you there with no roles, no certificates, no ports open to the world and no CAL question, and you'd RDP to the LAN address once you're on the tunnel. Worth keeping in your back pocket if the gateway turns into a maintenance burden.
 
 ## Undo
 
@@ -534,32 +531,30 @@ Event **200** means the client reached the gateway. **300** means the RAP author
 qm stop <VMID> && qm destroy <VMID> --destroy-unreferenced-disks 1 --purge
 ```
 
-A build that ran to completion has already deleted its unattend ISO and detached the CDs —
-that happens automatically once the gateway reports itself finished. You only need the
-command below if the build failed part way, if you set `KEEP_MEDIA=1`, or if you are
-tearing down a VM built before that was the behaviour. It matters because destroying the VM
-does not remove the ISO, which lives in ISO storage and holds the account password in clear
-text:
+A build that ran to completion has already deleted its unattend ISO and detached the CDs, as
+soon as the gateway reported itself finished. You only need the command below if the build
+failed part way, if you set `KEEP_MEDIA=1`, or if you are tearing down a VM built before
+that was the behaviour. It matters because destroying the VM does not remove the ISO, which
+lives in ISO storage and holds the account password in clear text:
 
 ```bash
 rm /var/lib/vz/template/iso/unattend-<VMID>.iso
 ```
 
----
-
 ## Sources
 
-- [Windows 2025 guest best practices — Proxmox VE wiki](https://pve.proxmox.com/wiki/Windows_2025_guest_best_practices)
-- [qm(1) — Proxmox VE](https://pve.proxmox.com/pve-docs/qm.1.html)
-- [Hardware requirements for Windows Server — Microsoft Learn](https://learn.microsoft.com/en-us/windows-server/get-started/hardware-requirements)
-- [Remote Desktop Services — Access from anywhere](https://learn.microsoft.com/windows-server/remote/remote-desktop-services/rds-plan-access-from-anywhere)
+- [Windows 2025 guest best practices, Proxmox VE wiki](https://pve.proxmox.com/wiki/Windows_2025_guest_best_practices)
+- [qm(1), Proxmox VE](https://pve.proxmox.com/pve-docs/qm.1.html)
+- [Hardware requirements for Windows Server, Microsoft Learn](https://learn.microsoft.com/en-us/windows-server/get-started/hardware-requirements)
+- [Remote Desktop Services, access from anywhere](https://learn.microsoft.com/windows-server/remote/remote-desktop-services/rds-plan-access-from-anywhere)
 - [Win32_TSGatewayConnectionAuthorizationPolicy.Create](https://learn.microsoft.com/windows/win32/termserv/create-win32-tsgatewayconnectionauthorizationpolicy)
 - [Win32_TSGatewayResourceAuthorizationPolicy.Create](https://learn.microsoft.com/windows/win32/termserv/create-win32-tsgatewayresourceauthorizationpolicy)
 - [Win32_TSGatewayResourceGroup.Create](https://learn.microsoft.com/windows/win32/termserv/create-win32-tsgatewayresourcegroup)
 - [License Remote Desktop Services with CALs](https://learn.microsoft.com/en-us/windows-server/remote/remote-desktop-services/rds-client-access-license)
-- [Remote Desktop client — supported configuration](https://learn.microsoft.com/en-us/windows-server/remote/remote-desktop-services/remotepc/remote-desktop-supported-config)
+- [Remote Desktop client, supported configuration](https://learn.microsoft.com/en-us/windows-server/remote/remote-desktop-services/remotepc/remote-desktop-supported-config)
 - [Supported RDP properties](https://learn.microsoft.com/azure/virtual-desktop/rdp-properties)
 - [Integrate RD Gateway with the NPS extension and Microsoft Entra ID](https://learn.microsoft.com/entra/identity/authentication/howto-mfa-nps-extension-rdg)
-- [community-scripts/ProxmoxVE](https://github.com/community-scripts/ProxmoxVE/tree/main/vm) — the script style this follows
+- [Audit mode overview](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/audit-mode-overview), which is why an installer bundle runs at first boot rather than in specialize
+- [community-scripts/ProxmoxVE](https://github.com/community-scripts/ProxmoxVE/tree/main/vm), the script style this follows
 - [win-acme](https://www.win-acme.com/), its [installation plugins](https://www.win-acme.com/reference/plugins/installation/) and [ImportRDGateway.ps1](https://github.com/win-acme/win-acme/blob/master/dist/Scripts/ImportRDGateway.ps1)
 - [Win32_TSGatewayServerSettings.Configure](https://learn.microsoft.com/windows/win32/termserv/configure-win32-tsgatewayserversettings)

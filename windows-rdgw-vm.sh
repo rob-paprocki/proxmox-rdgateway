@@ -7,13 +7,13 @@
 #
 #  It can do one of two things, and asks which one you want:
 #
-#    Unattended  — builds a third CD carrying an answer file, the VirtIO
+#    Unattended  builds a third CD carrying an answer file, the VirtIO
 #                  drivers and the setup scripts, so Windows installs itself
 #                  and a startup task configures the RD Gateway role. Nobody
 #                  needs to be at the console.
-#    Shell only  — the original behaviour: a correctly configured VM with both
-#                  ISOs attached and the boot order set. You run Windows Setup
-#                  from the console and Setup-RDGateway.ps1 inside the guest.
+#    Shell only  leaves you a correctly configured VM with both ISOs attached
+#                  and the boot order set. You run Windows Setup from the
+#                  console and Setup-RDGateway.ps1 inside the guest.
 #
 #  Usage, on the Proxmox host as root:
 #
@@ -49,7 +49,7 @@
 #      Invoke-CustomScripts.ps1, only on the unattended path and only when they
 #      are not already sitting next to this script. Local copies always win, so
 #      from a checkout nothing is fetched. Those four are copied to the unattend
-#      ISO and run inside the guest — they are never executed on the Proxmox
+#      ISO and run inside the guest. They are never executed on the Proxmox
 #      host. Every URL is printed before it is fetched, and REPO_REF pins the
 #      branch or tag.
 #
@@ -70,12 +70,12 @@ CL=$'\033[m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
 RD=$'\033[01;31m'; GN=$'\033[1;92m'; YW=$'\033[33m'; BL=$'\033[36m'; DGN=$'\033[32m'
 CM=" ${GN}✔${CL}"; CROSS=" ${RD}✘${CL}"; INFO=" ${BL}ℹ${CL}"
 
-APP="Windows Server 2025 — RD Gateway"
+APP="Windows Server 2025 RD Gateway"
 VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
 DRY_RUN="${DRY_RUN:-0}"
 
-# Where this script is running from. When it is piped straight into bash — the
-# one-liner in the usage block above — there is no BASH_SOURCE to work from, so
+# Where this script is running from. When it is piped straight into bash, as the
+# one-liner in the usage block above does, there is no BASH_SOURCE to work from, so
 # fall back to the working directory.
 _src="${BASH_SOURCE[0]:-}"
 if [[ -n "$_src" && -f "$_src" ]]; then
@@ -116,9 +116,9 @@ BOOT_KEY_STREAM_MB="${BOOT_KEY_STREAM_MB:-64}"
 BOOT_KEY_MAX="${BOOT_KEY_MAX:-10}"
 
 # Stay and watch the build instead of exiting the moment the VM starts. On by
-# default because the alternative is what this script used to do: print a
-# success summary and leave, while everything that could actually go wrong was
-# still ahead of it. NO_WAIT=1 restores the old behaviour.
+# default, because a script that exits at qm start is reporting success with
+# everything that can actually go wrong still ahead of it. NO_WAIT=1 exits at
+# qm start and prints the summary without following anything.
 NO_WAIT="${NO_WAIT:-0}"
 FOLLOW_SECONDS="${FOLLOW_SECONDS:-3600}"
 
@@ -126,7 +126,7 @@ FOLLOW_SECONDS="${FOLLOW_SECONDS:-3600}"
 # with them. On by default, and the ISO is the reason: it carries the account
 # password in clear text and `qm destroy` does not remove it, so leaving it for
 # the operator to tidy up later means leaving a password on disk for exactly as
-# long as they forget. KEEP_MEDIA=1 keeps the old behaviour.
+# long as they forget. KEEP_MEDIA=1 leaves the CDs attached and the ISO on disk.
 KEEP_MEDIA="${KEEP_MEDIA:-0}"
 
 # Scripts of your own, in the four categories the schneegans.de generator uses.
@@ -241,7 +241,7 @@ run() {
 }
 
 # Write a file, showing what goes into it. Honours DRY_RUN, which prints the
-# whole body rather than writing it — the same contract vps-relay-setup.sh uses.
+# whole body rather than writing it, the same contract vps-relay-setup.sh uses.
 write_file() {
   local path="$1" mode="${2:-644}" content
   content="$(cat)"
@@ -255,7 +255,7 @@ write_file() {
   chmod "$mode" "$path"
 }
 
-exit_script() { clear; printf "%s Cancelled — nothing was created.\n" "${CROSS}"; exit 0; }
+exit_script() { clear; printf "%s Cancelled. Nothing was created.\n" "${CROSS}"; exit 0; }
 
 # ------------------------------------------------------------------------------
 # Preflight
@@ -406,7 +406,7 @@ fetch_virtio() {
 
 # The four stock Server 2025 images, each with the GVLK that matches it. The
 # key here selects the edition; it does not activate anything. Evaluation media
-# carries its own licensing and must not be given a key at all — the two are
+# carries its own licensing and must not be given a key at all. The two are
 # mutually exclusive and mixing them fails the install.
 pick_edition() {
   local choice
@@ -521,7 +521,7 @@ count_scripts() {
 # and the timing come from the schneegans.de unattend generator, because that
 # is the vocabulary most people arrive with:
 #
-#   System       as SYSTEM on the first boot, before anyone logs on
+#   System       as SYSTEM in the specialize pass, before any desktop exists
 #   DefaultUser  as SYSTEM with C:\Users\Default\NTUSER.DAT mounted, so what
 #                you write lands in every profile created afterwards
 #   FirstLogon   at the first interactive logon, elevated
@@ -554,7 +554,7 @@ custom_total() {
 
 custom_when_text() {
   case "$1" in
-    System)      printf 'before anyone logs on, as SYSTEM' ;;
+    System)      printf 'in specialize, before any desktop exists' ;;
     DefaultUser) printf 'Default User hive mounted, as SYSTEM' ;;
     FirstLogon)  printf 'the first interactive logon, elevated' ;;
     UserOnce)    printf "each new user's first logon, as them" ;;
@@ -916,7 +916,7 @@ pick_custom_scripts() {
   local choice total
 
   whiptail --backtitle "$APP" --title "Custom scripts" --yesno \
-    "Run scripts of your own on the new machine?\n\nWrite them here, or import files already sitting on this host. Each one is tagged with when it should run:\n\n  System        before anyone logs on, as SYSTEM\n  DefaultUser   with the Default User hive mounted\n  FirstLogon    the first interactive logon, elevated\n  UserOnce      each new user's first logon\n\nPowerShell, batch and .reg files are all supported." 21 76 --defaultno || return 0
+    "Run scripts of your own on the new machine?\n\nWrite them here, or import files already sitting on this host. Each one is tagged with when it should run:\n\n  System        in specialize, before any desktop exists\n  DefaultUser   with the Default User hive mounted\n  FirstLogon    the first interactive logon, elevated\n  UserOnce      each new user's first logon\n\nPowerShell, batch and .reg files are all supported." 21 76 --defaultno || return 0
 
   while true; do
     total="$(custom_total)"
@@ -1026,8 +1026,8 @@ unattend_settings() {
 
 # Find the three PowerShell files the unattend ISO needs, or fetch them.
 #
-# Local copies always win, so a checkout — or a directory where you have edited
-# them — behaves exactly as before and nothing is downloaded. Only the one-liner
+# Local copies always win, so a checkout, or a directory where you have edited
+# them, uses those and downloads nothing. Only the one-liner
 # path reaches the network, and it prints every URL before fetching it.
 resolve_support_files() {
   local f fetched=0 local_count=0
@@ -1050,7 +1050,7 @@ resolve_support_files() {
     fi
 
     if [[ "$fetched" -eq 0 ]]; then
-      msg_warn "Not every PowerShell file is next to this script — fetching what is missing"
+      msg_warn "Not every PowerShell file is next to this script; fetching what is missing"
       printf "     %sThey are copied to the unattend ISO and run inside the guest, not here.%s
 " "$DIM" "$CL"
     fi
@@ -1096,7 +1096,7 @@ require_iso_tool() {
 }
 
 # Copy the three drivers Setup needs out of the VirtIO ISO into $WinPEDriver$.
-# Pinned to the 2k25 directories on purpose — the w10/w11 trees exist too and
+# Pinned to the 2k25 directories on purpose. The w10/w11 trees exist too and
 # carry the same driver generation, but this is a Server build.
 stage_drivers() {
   local stage="$1" src mnt d
@@ -1125,7 +1125,7 @@ stage_drivers() {
   run umount "$mnt"
   rmdir "$mnt" 2>/dev/null || true
   UNATTEND_MOUNT=""
-  msg_ok "Drivers staged (vioscsi, viostor, NetKVM — 2k25/amd64)"
+  msg_ok "Drivers staged (vioscsi, viostor, NetKVM from 2k25/amd64)"
 }
 
 generate_answer_file() {
@@ -1369,7 +1369,7 @@ generate_config_psd1() {
 # Every answer given to windows-rdgw-vm.sh, as plain data. Read by
 # Configure-Guest.ps1 and Invoke-GatewaySetup.ps1 on the first boot.
 #
-# Generated for VM ${VMID} (${HN}). No secrets live here — the account password
+# Generated for VM ${VMID} (${HN}). No secrets live here. The account password
 # is in autounattend.xml.
 #
 @{
@@ -1536,7 +1536,7 @@ PYEOF
 " "$DIM"         "$(find "${stage}/\$WinPEDriver\$" -type f 2>/dev/null | wc -l)" "$CL"
     fi
   else
-    printf "     %s(nothing on disk — DRY_RUN printed the copies instead of making them)%s
+    printf "     %s(nothing on disk: DRY_RUN printed the copies instead of making them)%s
 " "$DIM" "$CL"
   fi
 
@@ -1756,7 +1756,7 @@ press_a_key() {
   printf "   ${DIM}\$ qm sendkey %s %s${CL}   (up to %s, stopping the moment Setup streams)\n" \
     "$VMID" "$BOOT_KEY" "$BOOT_KEY_MAX"
   if [[ "$DRY_RUN" == "1" ]]; then
-    msg_ok "Skipped — DRY_RUN"
+    msg_ok "Skipped (DRY_RUN)"
     return 0
   fi
 
@@ -1861,7 +1861,7 @@ sys.stdout.write(d.get("out-data", ""))' 2>/dev/null
 # prints each new line as it appears, exactly what a person watching the
 # console would see.
 #
-# Set NO_WAIT=1 to get the old behaviour back.
+# Set NO_WAIT=1 to skip all of this and return as soon as the VM starts.
 follow_build() {
   local deadline agent=no printed=0 log line new finished=no failed=no
   local last_note=0 rd wr nagged=no
@@ -2019,7 +2019,7 @@ GEN_MAC="02:$(openssl rand -hex 5 | awk '{print toupper($0)}' | sed 's/\(..\)/\1
 
 preflight
 
-[[ "$DRY_RUN" == "1" ]] && msg_warn "DRY_RUN=1 — commands will be printed, not executed"
+[[ "$DRY_RUN" == "1" ]] && msg_warn "DRY_RUN=1: commands will be printed, not executed"
 
 if whiptail --backtitle "$APP" --title "$APP" \
     --yesno "Build a Windows Server 2025 VM ready for the RD Gateway role.\n\nUse default settings?" 12 62 --defaultno; then
@@ -2219,7 +2219,7 @@ ${RESOURCE_SUMMARY}
 
 ${BOLD}When it is finished${CL}
    This script detaches the CDs, sets the boot order to the disk, and deletes
-   the unattend ISO — it holds the account password in clear text, and
+   the unattend ISO. It holds the account password in clear text, and
    ${BL}qm destroy${CL} would not have removed it. Set ${BL}KEEP_MEDIA=1${CL} to keep them;
    then it is yours to run:
    ${DIM}\$ qm set ${VMID} --ide0 none --ide2 none --sata0 none --boot order=scsi0${CL}
@@ -2238,7 +2238,7 @@ EOF
 else
 cat <<EOF
 
-${BOLD}${GN}VM ${VMID} is built.${CL} Windows is not installed yet — do that next.
+${BOLD}${GN}VM ${VMID} is built.${CL} Windows is not installed yet; do that next.
 
 ${BOLD}1. Open the console${CL}
    Proxmox web UI -> VM ${VMID} -> Console. Press a key when it offers to

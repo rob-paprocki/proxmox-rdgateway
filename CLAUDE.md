@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Context for working on this repo. Read before proposing architecture changes — several
+Context for working on this repo. Read before proposing architecture changes: several
 obvious-looking approaches were tested and ruled out, with evidence, and re-deriving them
 wastes a session.
 
@@ -18,14 +18,14 @@ behind one public hostname, using stock RD clients.
 | `Invoke-GatewaySetup.ps1` | The Windows guest, SYSTEM | **Run for real.** Registers in specialize, drives the first boot to the end |
 | `Invoke-CustomScripts.ps1` | The Windows guest | **Executed for real** on Windows PowerShell 5.1, see below |
 | `Get-RDGWStatus.ps1` | The Windows guest, elevated | Read-only. **Run for real** through `qm guest exec` on the 2026-09-21 build; reported every check `[ ok ]` |
-| `sample-autounattend.xml` | — | Committed sample of generated output. Not read by anything |
+| `sample-autounattend.xml` | n/a | Committed sample of generated output. Not read by anything |
 | `vps-relay-setup.sh` | A public VPS | Optional path. Written, dry-run verified, **never run for real** |
 | `proxmox-relay-peer.sh` | Proxmox host, root | Optional path. Written, dry-run verified, **never run for real** |
-| `README.md` | — | Repo intro plus the full runbook |
-| `RELAY.md` | — | The optional relay: architecture, steps, caveats |
+| `README.md` | n/a | Repo intro plus the full runbook |
+| `RELAY.md` | n/a | The optional relay: architecture, steps, caveats |
 
 `windows-rdgw-vm.sh` has been run for real on the operator's Proxmox VE 9.2.20
-host three times, and the DVD boot prompt defeated the first two. On 2026-09-19
+host repeatedly, and the DVD boot prompt defeated the first two attempts. On 2026-09-19
 nobody was there to answer it. On 2026-09-20 the script was there and still
 failed, twice, for two different reasons - a twenty-second window that closed
 before OVMF reached the DVD, and then a `qm monitor` call that hung forever on
@@ -53,7 +53,7 @@ shell-only path is the documented fallback when the automated one misbehaves.
 These are hard. Solutions that violate them have already been rejected in conversation.
 
 - **No spend.** Not a few dollars a month. Free tier or nothing.
-- **Stock RD clients only.** Nothing may be installed on client devices — no WARP, no
+- **Stock RD clients only.** Nothing may be installed on client devices: no WARP, no
   WireGuard, no cloudflared, no browser client. He has devices he cannot install software on.
   This is the constraint that kills most of the obvious answers.
 - **Multiple target machines**, not just the gateway box. This is the entire reason for
@@ -61,12 +61,12 @@ These are hard. Solutions that violate them have already been rejected in conver
 - **Browser-rendered RDP was tried and disliked.** Don't re-suggest it.
 - Prefers FOSS and self-hostable tooling where there's a choice.
 
-## Ruled out, with evidence — do not re-propose
+## Ruled out, with evidence. Do not re-propose
 
 **Cloudflare Tunnel *public hostname* routing, Workers, any orange-clouded hostname.**
 RD Gateway's HTTP transport uses the custom methods `RDG_IN_DATA` and `RDG_OUT_DATA`
 (MS-TSGU). Cloudflare's edge runs an HTTP method allowlist and returns `501` for both,
-generated at the edge — the request never reaches the origin, and never reaches a Worker.
+generated at the edge, so the request never reaches the origin, and never reaches a Worker.
 Verified empirically, and re-verified 2026-09-18:
 
 ```bash
@@ -78,18 +78,18 @@ curl -s -o /dev/null -X PROPFIND    -w '%{http_code}\n' https://developers.cloud
 `PROPFIND` passes through and gets an origin-specific answer; the `RDG_*` verbs return `501`
 in ~0.15s with a `cf-ray` but **no `cf-cache-status`**, which is how you know it was the edge.
 Controls not behind Cloudflare (`httpbin.org`, `google.com`) return `405`, proving the method
-survives the network path intact. No tunnel setting reaches this — `disableChunkedEncoding`
+survives the network path intact. No tunnel setting reaches this. `disableChunkedEncoding`
 and the body-buffering controls are real and genuinely needed by RD Gateway behind a reverse
 proxy, but they all sit downstream of where the request already died. Cloudflare Tunnel also
 carries no UDP on public hostnames, so port 3391 was never going to work either.
 
 **Cloudflare Tunnel *private network* routing (CIDR routes, now branded Cloudflare Mesh).**
 Different thing, different reason, and the one most likely to look like a solution on a fresh
-read of the docs — because technically it *is* one. Private network routing never touches the
+read of the docs, because technically it *is* one. Private network routing never touches the
 HTTP edge, and carries arbitrary TCP, UDP and ICMP, so RDP rides it happily. The blocker is
 the client side. Cloudflare's own wording: every enrolled device receives a private Mesh IP
 and can reach any other participant over TCP, UDP or ICMP, where "client devices are laptops
-and phones running the Cloudflare One Client" — the product previously called WARP. That is
+and phones running the Cloudflare One Client", the product previously called WARP. That is
 an agent on every device, which is the constraint that rules it out. Keep this reason
 separate from the `501` above: one is a technical impossibility, this one is a constraint
 violation, and collapsing them into a single "Cloudflare doesn't work" line is what sends the
@@ -98,18 +98,37 @@ next reader back to the documentation to correctly discover that it does.
 **Workers VPC.** Points the wrong way. It gives a Worker outbound reach *into* a private
 network (HTTP via `fetch()`, raw TCP via `connect()`); it does not give external clients
 inbound reach to a private service. The client still has to arrive at the Worker over
-ordinary HTTP, which is the leg that already fails — `RDG_IN_DATA` is refused at the edge
+ordinary HTTP, which is the leg that already fails: `RDG_IN_DATA` is refused at the edge
 before any Worker code runs. It is also the wrong shape: RD Gateway holds two long-lived
 bidirectional streams open for the life of a session, and Workers are request/response with
 duration limits.
 
 **Fronting the relay with `cloudflared`.** The relay already publishes a public hostname on
-its own — the VPS has a public IPv4, and a grey-clouded A record points at it. Adding
+its own: the VPS has a public IPv4, and a grey-clouded A record points at it. Adding
 `cloudflared` or an orange cloud re-inserts the HTTP edge at the *front* of the path, which
 is upstream of the relay; the relay therefore never sees the request and cannot rescue it.
-Cloudflare's RDP documentation lists exactly three methods — browser-rendered, Cloudflare One
-Client, and client-side `cloudflared` — and each one either puts software on the client or is
+Cloudflare's RDP documentation lists exactly three methods, browser-rendered, Cloudflare One
+Client and client-side `cloudflared`, and each one either puts software on the client or is
 the browser path already rejected. There is no stock-client entry.
+
+**`cloudflared` as a bastion or jump host.** Asked directly on 2026-09-21, and worth
+answering rather than waving at the entries above, because the instinct is right and only
+the transport is wrong. A bastion helps only if the client can reach it, and `cloudflared`
+publishes in exactly two ways. A **public hostname** puts the HTTP edge in front, which is
+where `RDG_IN_DATA` already dies with `501`, and it carries no raw TCP for 3389 either, so a
+bastion behind that edge never sees the request at all. A **private network route** carries
+arbitrary TCP and a bastion there would work fine, but reaching it means the Cloudflare One
+Client on every device. The hop *behind* Cloudflare was never the problem, so adding one
+does not move the failure: the last mile from the client to Cloudflare is the leg that
+breaks, and it breaks identically with or without a jump host. The one shape that does fit
+is a bastion that terminates RDP and re-exports it as something the edge can carry.
+Guacamole or MeshCentral behind `cloudflared` is plain HTTPS plus WebSocket, no custom
+verbs, and needs nothing on the client but a browser. That is browser-rendered RDP,
+self-hosted, which the operator tried and disliked, so name it rather than propose it. Worth
+adding when this comes up: RD Gateway's RAP already gives the jump-host semantics the
+question is reaching for, one public hostname with many machines behind it, and `RELAY.md`
+is the same idea at layer 4, using nginx `stream` rather than `cloudflared` precisely
+because it does not parse HTTP.
 
 **Cloudflare Spectrum.** The only Cloudflare product that proxies arbitrary TCP. Business
 plan and up, roughly $200/month.
@@ -254,7 +273,7 @@ An RDP session exceeds that in under an hour.
 **Moving RD Gateway off port 443.** Technically possible (`HttpsPort` under
 `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\TerminalServerGateway\Config\Core`) but it
 requires disabling the UDP transport *and* setting `RDGClientTransport` in
-`HKCU\Software\Microsoft\Terminal Server Client` on **every client** — a per-device registry
+`HKCU\Software\Microsoft\Terminal Server Client` on **every client**, a per-device registry
 edit, which is exactly what the constraints forbid.
 
 ## The open question that decides the architecture
@@ -266,10 +285,10 @@ edit, which is exactly what the constraints forbid.
   including the hardening that path needs.
 - **CGNAT** → he needs something with a public IP. The relay scripts work unmodified on
   Oracle Cloud Always Free (2× `VM.Standard.E2.1.Micro`, public IPv4, 10 TB/month egress,
-  doesn't expire) — with the documented caveat that idle Always Free instances get reclaimed
+  doesn't expire), with the documented caveat that idle Always Free instances get reclaimed
   when CPU *and* network sit under 20% for seven days, and a relay is idle by nature.
   IPv6 is the other free angle: most ISPs hand out a routable v6 prefix even when v4 is
-  CGNAT'd, so an AAAA record plus a firewall rule needs no relay at all — but only works from
+  CGNAT'd, so an AAAA record plus a firewall rule needs no relay at all, but only works from
   v6-capable clients, which mobile networks generally are and hotel/corporate Wi-Fi often isn't.
 
 Check: `curl -s https://api.ipify.org` against the UniFi WAN address. A WAN address in
@@ -390,7 +409,7 @@ bug will surface.
   `Configure-Guest.ps1` must not duplicate it.
 - The three WMI `Create` signatures were checked against Microsoft's documentation and match
   in both count and order: CAP takes **18** parameters (an earlier 13-parameter version was a
-  real bug — the trailing `IdleTimeout`, `SessionTimeout`, `SessionTimeoutAction`,
+  real bug: the trailing `IdleTimeout`, `SessionTimeout`, `SessionTimeoutAction`,
   `AllowOnlySDRServers`, `CookieAuthentication` are required), RAP takes 8, resource group 3.
 - Scope auto-selection and the target-identity expansion are unit-tested.
 
@@ -641,7 +660,7 @@ bug will surface.
 - **RDP-over-UDP through nginx stream is the least certain thing in the repo.** Note that
   `proxy_responses 0` was removed from that block deliberately: `nginx -t` accepts it silently
   but it caps how many datagrams come back and would break the session at runtime. If UDP
-  misbehaves, delete the whole second `server` block — TCP 443 alone is complete.
+  misbehaves, delete the whole second `server` block. TCP 443 alone is complete.
 
 ## Next steps
 
@@ -667,11 +686,11 @@ bug will surface.
 
 ## Conventions used here
 
-- Shell scripts print every command before running it and honour `DRY_RUN=1`. Keep that —
+- Shell scripts print every command before running it and honour `DRY_RUN=1`. Keep that;
   the operator explicitly wants to follow along rather than be handed a black box.
 - `windows-rdgw-vm.sh` must keep working when piped into bash, community-scripts style:
   `bash -c "$(curl -fsSL .../windows-rdgw-vm.sh)"`. That means **never** dereference
-  `${BASH_SOURCE[0]}` unguarded — under `set -u` it is unbound in that form and the script
+  `${BASH_SOURCE[0]}` unguarded: under `set -u` it is unbound in that form and the script
   dies on line one. It falls back to `$PWD`. The three PowerShell files are resolved by
   `resolve_support_files`: local copies always win, and only the piped form reaches the
   network. Print every URL before fetching, and keep `REPO_REF` / `REPO_RAW` overridable so
@@ -810,9 +829,9 @@ bug will surface.
 - The security toggles in the unattended path (UAC, Defender, Core Isolation, lockout, blank
   passwords, Ctrl+Alt+Del) all default to leaving Windows as it ships. They exist because the
   operator explicitly asked to be able to loosen them. State the consequence once in the
-  prompt, then do what was picked — do not re-litigate it in the docs or the scripts.
+  prompt, then do what was picked. Do not re-litigate it in the docs or the scripts.
 - `Setup-RDGateway.ps1` must stay **pure ASCII** and must run under **Windows PowerShell 5.1**
-  (`powershell.exe`, not `pwsh` — the WMI fallback uses `[wmiclass]`, removed in PS 7).
+  (`powershell.exe`, not `pwsh`, because the WMI fallback uses `[wmiclass]`, removed in PS 7).
 - The RD authorization policies go through the documented `Win32_TSGateway*` WMI classes
   rather than the `RDS:` provider, because the WMI method signatures are explicit about what
   each flag means. Certificate binding is the one exception.
@@ -821,6 +840,6 @@ bug will surface.
 ## Licensing note
 
 Microsoft's terms call for an RDS CAL for connections made through an RD Gateway, even in
-the two-concurrent-admin-session case. Nothing enforces it technically — the 120-day grace
-period belongs to RD Session Host, not RD Gateway — so it's a compliance judgment, not a
-functional blocker. Stated in the runbook; don't quietly drop it.
+the two-concurrent-admin-session case. Nothing enforces it technically, because the 120-day
+grace period belongs to RD Session Host rather than RD Gateway, so it is a compliance
+judgment rather than a functional blocker. Stated in the runbook; don't quietly drop it.
