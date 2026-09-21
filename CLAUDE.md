@@ -18,7 +18,7 @@ behind one public hostname, using stock RD clients.
 | `Invoke-GatewaySetup.ps1` | The Windows guest, SYSTEM | **Run for real.** Registers in specialize, drives the first boot to the end |
 | `Invoke-CustomScripts.ps1` | The Windows guest | **Executed for real** on Windows PowerShell 5.1, see below |
 | `Get-RDGWStatus.ps1` | The Windows guest, elevated | Read-only. **Run for real** through `qm guest exec` on the 2026-09-21 build; reported every check `[ ok ]` |
-| `Invoke-WinAcme.ps1` | The Windows guest, SYSTEM | Installs win-acme, optionally runs it. **Never run for real yet** |
+| `Invoke-WinAcme.ps1` | The Windows guest, SYSTEM | **-Mode Stage run for real** on the 2026-09-21 gateway, exit 0 in 4.9s. `-Mode Run` still untried |
 | `sample-autounattend.xml` | n/a | Committed sample of generated output. Not read by anything |
 | `vps-relay-setup.sh` | A public VPS | Optional path. Written, dry-run verified, **never run for real** |
 | `proxmox-relay-peer.sh` | Proxmox host, root | Optional path. Written, dry-run verified, **never run for real** |
@@ -730,6 +730,13 @@ bug will surface.
   by `test-cert.sh`, along with an empty token degrading to `staged` rather than running
   win-acme with no credential.
 
+  **Prove the chain against staging before spending a production slot.** Verified against
+  the win-acme CLI reference: `--test` switches to the ACME test endpoint, omitting
+  `--installation` skips the binding step, and `--notaskscheduler` leaves no renewal task.
+  So the whole path, plugin load through token scope, DNS-01 propagation and issuance, can
+  be exercised without touching the 5-duplicate-certificates-per-week limit and without
+  replacing the working self-signed certificate on the gateway. Worth doing once per zone.
+
 ## Next steps
 
 1. Settle the CGNAT question. It decides everything downstream.
@@ -750,7 +757,15 @@ bug will surface.
    the account password in clear text and `qm destroy` does not remove it.
    With `CertMode = 'auto'` that ISO also holds a Cloudflare token, and a build that FAILED
    keeps its media on purpose. The script says so on that path; act on it.
-7. **Nothing in the win-acme path has been run against a real ACME server yet.** The build
+7. **`-Mode Stage` is confirmed on hardware; nothing has yet talked to a real ACME server.**
+   Pushed to the running gateway through `qm guest exec` on 2026-09-21 and run against the
+   live box: both downloads succeeded, `[ ok ] ImportRDGateway.ps1 present` closed the
+   assumption that it ships in the release zip, `FluentCloudflare.dll` and
+   `PKISharp.WACS.Plugins.ValidationPlugins.Cloudflare.dll` landed in the win-acme root
+   beside `wacs.exe` where the pluggable build loads them from, and the generated
+   `request-certificate.cmd` came out correct including the caret escaping cmd needs for
+   parentheses inside a parenthesised block. Exit 0 in 4.9 seconds.
+   What remains untested is the ACME conversation itself. The build
    that proved the rest of this repo out on 2026-09-21 predates it and ended on a
    self-signed certificate, which is the dialog that prompted the feature. What is verified
    is the shape: three modes round-trip through the psd1 with the right types, the wildcard
