@@ -1099,7 +1099,7 @@ stage_drivers() {
 }
 
 generate_answer_file() {
-  local stage="$1" product_key_block="" firstlogon_block="" shell_block=""
+  local stage="$1" product_key_block=""
   local x_user x_pass x_hn x_tz x_img x_key c_hn
 
   x_user="$(xml_escape "$ADMIN_USER")"
@@ -1123,48 +1123,30 @@ generate_answer_file() {
   # Server 2025 build, so Join-Path threw and the script died before
   # registering the task or writing one word to the log.
   #
-  # That explanation used to live in an XML comment next to the <Path> element
-  # it describes. It cost a whole build. Windows accepts comments at the
-  # document root, inside <settings> and inside <component>, but a comment
-  # inside <RunSynchronousCommand> makes the specialize pass fail outright:
-  # "Windows could not parse or process unattend answer file", error
-  # 0x80220005, and Setup stops at "The computer restarted unexpectedly".
-  # The file is still well-formed XML, so xmllint is happy and only a real
-  # install finds it. Keep prose about the answer file in this script, where
-  # it costs nothing, and emit no comments below <component>.
+  # There used to be an Order 3 and an Order 4 here, writing two HKLM RunOnce
+  # values with reg.exe. They are gone, and this is the reason: a
+  # RunSynchronousCommand <Path> has a maximum length of 259 characters, and
+  # those two commands were 273 and 266. Windows does not mention length. It
+  # deserializes the file happily, fails schema validation, and reports only
+  # "Windows could not parse or process unattend answer file" with
+  # 0x80220005 - twenty minutes into an install, at a dialog saying "The
+  # computer restarted unexpectedly". The giveaway is buried in setupact.log:
   #
-  # The cosmetic shell settings get applied twice, and the second time is this
-  # one. Configure-Guest.ps1 writes them into the Default User hive so later
-  # profiles inherit them, but the AutoLogon account's profile is copied out of
-  # that hive at about the moment the hive is being written, and on a real build
-  # the profile won: the operator asked for a left taskbar and dark theme and
-  # got neither. So the same settings are re-applied per user at the first
-  # interactive logon, against the real HKCU, and Explorer is restarted.
-  # cschneegans/unattend-generator does exactly this in its UserOnce phase.
+  #     CWcmScalarInstanceCore::Put ... 80220005
+  #     SMI data results dump: Source = Name: Microsoft-Windows-Deployment
+  #     SMI data results dump: Description = Value is invalid.
   #
-  # Registered unconditionally: Configure-Guest.ps1 reads ApplyTweaks from the
-  # config itself and writes a "skipped" line if it was not asked for, which is
-  # one more piece of evidence in the log than silence would be.
-  shell_block="
-                <RunSynchronousCommand wcm:action=\"add\">
-                    <Order>3</Order>
-                    <Description>Re-apply the shell settings for the first account</Description>
-                    <Path>reg.exe add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce /v RDGWShell /t REG_SZ /d \"powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Windows\\Setup\\Scripts\\Configure-Guest.ps1 -ShellForCurrentUser -ConfigPath C:\\Windows\\Setup\\Scripts\\rdgw-config.psd1\" /f</Path>
-                </RunSynchronousCommand>"
-
-  # FirstLogon scripts have to beat the single automatic logon below, so they
-  # are registered here in specialize rather than by the startup task, which
-  # races it. RunOnce under HKLM fires at the first interactive logon and the
-  # value deletes itself once it has run.
-  if [[ -n "$CUSTOM_STAGE" && "$(count_scripts "${CUSTOM_STAGE}/FirstLogon")" -gt 0 ]]; then
-    firstlogon_block="
-                <RunSynchronousCommand wcm:action=\"add\">
-                    <Order>4</Order>
-                    <Description>Register the first-logon custom scripts</Description>
-                    <Path>reg.exe add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce /v RDGWFirstLogon /t REG_SZ /d \"powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\\Windows\\Setup\\Scripts\\Invoke-CustomScripts.ps1 -Category FirstLogon -ScriptRoot C:\\Windows\\Setup\\Scripts\" /f</Path>
-                </RunSynchronousCommand>"
-  fi
-
+  # "Value is invalid" means one scalar was too long. Note that
+  # cschneegans/unattend-generator keeps every one of its 49 Path values at or
+  # under 255 characters, and builds X:\pe.cmd by appending 44 separate tiny
+  # commands rather than writing one long one - that is not style, it is this
+  # limit.
+  #
+  # So the two RunOnce values are written by Invoke-GatewaySetup.ps1 -Register
+  # instead, which already runs here as Order 2, already logs, and is a
+  # PowerShell script with no length limit on anything. Keep it that way: if
+  # you need the guest to do something at first logon, teach that script to
+  # register it, do not add a command here.
   write_file "${stage}/autounattend.xml" 644 <<XMLEOF
 <?xml version="1.0" encoding="utf-8"?>
 <!--
@@ -1289,7 +1271,7 @@ generate_answer_file() {
                     <Order>2</Order>
                     <Description>Register the first-boot task</Description>
                     <Path>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Setup\Scripts\Invoke-GatewaySetup.ps1 -Register -ScriptRoot C:\Windows\Setup\Scripts</Path>
-                </RunSynchronousCommand>${shell_block}${firstlogon_block}
+                </RunSynchronousCommand>
             </RunSynchronous>
         </component>
     </settings>
@@ -1448,6 +1430,23 @@ print(total)
 PYEOF
 )" || deep="malformed"
     fi
+  fi
+
+  # A RunSynchronousCommand <Path> longer than 259 characters is silently
+  # invalid: the file deserializes, schema validation fails, and Setup dies
+  # twenty minutes later saying only that it could not parse the answer file.
+  # 255 is the ceiling cschneegans/unattend-generator holds itself to across 49
+  # commands, so borrow it and leave a little room.
+  local longest
+  longest="$(awk 'match($0, /<Path>.*<\/Path>/) {
+      s = substr($0, RSTART + 6, RLENGTH - 13)
+      if (length(s) > m) { m = length(s) }
+    } END { print m + 0 }' "$xml_file" 2>/dev/null || echo 0)"
+  if [[ "$DRY_RUN" != "1" && "$longest" -gt 255 ]]; then
+    msg_error "The answer file has a RunSynchronousCommand <Path> of ${longest} characters."
+    msg_error "The limit is 259 and Windows will not say so - it fails the whole pass"
+    msg_error "with 0x80220005. Move the work into Invoke-GatewaySetup.ps1 -Register."
+    exit 1
   fi
 
   if [[ "$deep" == "malformed" ]]; then

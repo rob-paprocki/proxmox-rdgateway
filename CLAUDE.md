@@ -157,35 +157,58 @@ same counters under `blockstat:` as one indented stanza per device (`ide0:`, `id
 `efidisk0:`, each with `rd_bytes:`). Every call still goes through `timeout`, because
 nothing in that loop may be allowed to block forever again.
 
-**XML comments anywhere below `<component>` in the answer file.** They are legal XML,
-`xmllint --noout` is perfectly happy, every dry-run scenario passes, and Windows fails
-the entire pass. Observed: a comment placed between `<Description>` and `<Path>` inside a
-`<RunSynchronousCommand>` produced, twenty minutes into a real install,
+**A `RunSynchronousCommand` `<Path>` longer than 259 characters.** This is the real one,
+and it cost two builds plus a wrong diagnosis. Windows never mentions length. The file
+deserializes fine (`hrDeserialized = 0x0`), fails schema validation (`hrValidated = 0x1`),
+and Setup reports only "Windows could not parse or process unattend answer file",
+`0x80220005`, at a dialog saying "The computer restarted unexpectedly". The one line in
+`setupact.log` that actually identifies it:
 
 ```
-UnattendDumpSetting: Error code = 0x80220005
-UnattendDumpSetting: Pass = specialize
-UnattendErrorFromResults: Windows could not parse or process unattend answer file
-This installation is blocked from completing due to compliance failures or invalid input
+CSI  80220005 [Error,Facility=FACILITY_STATE_MANAGEMENT,Code=5] from CWcmScalarInstanceCore::Put
+[setup.exe] SMI data results dump: Source = Name: Microsoft-Windows-Deployment
+[setup.exe] SMI data results dump: Description = Value is invalid.
 ```
 
-and on screen only "The computer restarted unexpectedly or encountered an unexpected
-error." The same log also carried `CApplyDrivers::CopyToDriverStore ... 0x80070002` and a
-dozen `BFSVC: BfspCopyFile` failures, both of which are **red herrings** - the ESP was
-fully populated and the driver payload complete. Do not chase them. Comments at the
-document root, inside `<settings>` and as direct children of `<component>` are fine and
-have shipped since before the first successful build; it is nesting them deeper that
-breaks. `build_unattend_iso` now refuses to ship a file with any. Keep prose about the
-answer file in `windows-rdgw-vm.sh`, where it costs nothing.
+"Value is invalid" on a scalar means **too long**. Measured: our two `reg.exe` RunOnce
+commands were 273 and 266 characters. Corroboration - every one of the 49 `<Path>` values
+in the operator's known-good schneegans file is **at or under 255**, and that generator
+builds `X:\pe.cmd` by appending 44 separate tiny `cmd.exe /c >>X:\pe.cmd (...)` fragments
+rather than writing one long command. That is not a style choice, it is this limit.
+`build_unattend_iso` now refuses to ship any `<Path>` over 255, regression-tested against
+the exact file that failed (273 -> refused) and the one that replaced it (157 -> accepted).
+**Do not add long commands to the answer file.** If the guest needs to do something, teach
+`Invoke-GatewaySetup.ps1 -Register` to register it - that already runs in specialize, is a
+PowerShell script with no length limit, and logs what it did.
 
-That check nearly shipped useless, which is its own lesson: **`xmllint` is not installed
-on Proxmox VE 9.** The answer-file validation had always been written as
+**XML comments below `<component>`: suspected, then disproved.** Worth recording because
+a whole build was spent on it. A comment between `<Description>` and `<Path>` was the first
+suspect for the `0x80220005` above; removing it changed nothing, and the next build failed
+identically. The cause was the `<Path>` length, every time. Comments below `<component>`
+may well be harmless. The generator still emits none - prose about the answer file belongs
+in `windows-rdgw-vm.sh`, where it costs nothing - and the guard stays as cheap insurance,
+but do not repeat the claim that Windows rejects them, because that was never demonstrated.
+The genuine lesson is the diagnostic one: **`hrDeserialized` versus `hrValidated` in
+`setupact.log` tells you whether it is an XML problem or a schema problem, and reading that
+first would have skipped the wrong fix entirely.**
+
+**Two red herrings in that same log. Do not chase them.** A dozen
+`BFSVC: BfspCopyFile ... bootmgfw_EX.efi` errors and three
+`CApplyDrivers::CopyToDriverStore ... 0x80070002` appear right before the real failure and
+look far more alarming than it does. Both are innocent: the ESP was mounted afterwards and
+is fully populated with `bootmgfw.efi`, `bootmgr.efi` and `bootx64.efi`, and the
+`$WinPEDriver$` payload on the ISO is complete - all 17 files across vioscsi, viostor and
+NetKVM, including `netkvmco.exe`. Go straight to `UnattendDumpSetting` and the
+`SMI data results dump` lines instead.
+
+**`xmllint` is not installed on Proxmox VE 9**, which nearly made all of the above
+unenforceable. The answer-file validation had always been written as
 `command -v xmllint || skip`, so on the operator's host it silently did nothing, and had
 never once run where it mattered. Proxmox does guarantee `perl` with `XML::LibXML`
 (pve-manager depends on it) and ships `python3`, so the check now tries xmllint, then
 perl, then python3, and **says which one ran** - or warns loudly that none did. Verified
-on the host across all three cases: a comment inside `<RunSynchronousCommand>` returns 1,
-a comment directly under `<component>` returns 0, malformed XML is caught. Do not write
+on the host across all three cases: a nested comment returns 1, a comment directly under
+`<component>` returns 0, malformed XML is caught. Do not write
 another `command -v X || silently skip` check in this repo; a check nobody can see fail is
 not a check.
 

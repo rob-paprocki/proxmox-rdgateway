@@ -35,6 +35,11 @@ param(
     [string] $ConfigPath = '',
     [string] $LogPath = '',
 
+    # Where this script and its config live. Passed explicitly by whatever
+    # invokes it, because $PSScriptRoot came back empty on a real Server 2025
+    # build. Resolved defensively below either way.
+    [string] $ScriptRoot = '',
+
     # Apply only the cosmetic shell settings, to whoever is running this, then
     # restart Explorer and exit. The answer file registers this in HKLM RunOnce
     # so it fires at the first interactive logon - including the AutoLogon
@@ -54,6 +59,9 @@ $ErrorActionPreference = 'Continue'
 #
 # Resolving in the body instead means the worst case is a wrong path we can
 # report, not a script that vanishes.
+if ([string]::IsNullOrWhiteSpace($script:Root)) {
+    $script:Root = $ScriptRoot
+}
 if ([string]::IsNullOrWhiteSpace($script:Root)) {
     $script:Root = $PSScriptRoot
 }

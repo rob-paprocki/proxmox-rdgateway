@@ -90,6 +90,48 @@ if ($Register) {
     & schtasks.exe /Query /TN $TaskName 2>&1 | Out-Null
     $exists = ($LASTEXITCODE -eq 0)
 
+    # Two HKLM RunOnce values, which fire at the first interactive logon -
+    # including the AutoLogon account. They used to be two more
+    # RunSynchronousCommand entries in the answer file, and that broke a build:
+    # a <Path> is capped at 259 characters and those commands were 273 and 266.
+    # Windows does not report a length problem, it just refuses the whole
+    # specialize pass with 0x80220005. Here there is no limit, and a failure is
+    # visible in the log instead of being a dialog twenty minutes later.
+    #
+    # The shell one is unconditional: Configure-Guest.ps1 reads ApplyTweaks
+    # itself and writes a "skipped" line if it was not asked for, which is more
+    # evidence than silence. The custom-scripts one only goes in if there is
+    # something to run.
+    $runOnce = 'Registry::HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
+    $pwsh = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File'
+
+    $wanted = @{
+        RDGWShell = "$pwsh `"$ScriptRoot\Configure-Guest.ps1`" -ShellForCurrentUser -ScriptRoot `"$ScriptRoot`""
+    }
+    $firstLogonDir = Join-Path $ScriptRoot 'custom\FirstLogon'
+    if (Test-Path -LiteralPath $firstLogonDir) {
+        if (@(Get-ChildItem -LiteralPath $firstLogonDir -File -ErrorAction SilentlyContinue).Count -gt 0) {
+            $wanted['RDGWFirstLogon'] =
+                "$pwsh `"$ScriptRoot\Invoke-CustomScripts.ps1`" -Category FirstLogon -ScriptRoot `"$ScriptRoot`""
+        }
+    }
+
+    foreach ($name in $wanted.Keys) {
+        $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        try {
+            if (-not (Test-Path -LiteralPath $runOnce)) {
+                New-Item -Path $runOnce -Force -ErrorAction Stop | Out-Null
+            }
+            New-ItemProperty -LiteralPath $runOnce -Name $name -Value $wanted[$name] `
+                -PropertyType String -Force -ErrorAction Stop | Out-Null
+            "$stamp  [info] RunOnce '$name' registered for the first interactive logon" |
+                Tee-Object -FilePath $LogPath -Append | Write-Host
+        } catch {
+            "$stamp  [warn] RunOnce '$name' could not be registered: $($_.Exception.Message)" |
+                Tee-Object -FilePath $LogPath -Append | Write-Host
+        }
+    }
+
     $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     if ($exists) {
         "$stamp  [info] '$TaskName' registered and read back - first boot will run it" |
