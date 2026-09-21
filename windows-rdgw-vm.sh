@@ -1843,7 +1843,8 @@ sys.stdout.write(d.get("out-data", ""))' 2>/dev/null
 # Set NO_WAIT=1 to get the old behaviour back.
 follow_build() {
   local deadline agent=no printed=0 log line new finished=no failed=no
-  local last_note=0 rd wr
+  local last_note=0 rd wr nagged=no
+  local rd_last=0 rd_quiet_since=0 restarted=no
 
   if [[ "$NO_WAIT" == "1" ]]; then
     msg_warn "NO_WAIT=1 - not waiting. The build continues without supervision;"
@@ -1863,8 +1864,52 @@ follow_build() {
         last_note=$SECONDS
         rd="$(qm_bytes_read ide0)"; rd="${rd:-0}"
         wr="$(qm_bytes_written scsi0)"; wr="${wr:-0}"
-        printf "   ${DIM}%4ds  installing - read %s MiB from the DVD, written %s MiB to disk${CL}\n" \
+        # This used to say "installing". It was watched saying it for
+        # twenty-five minutes while Windows sat at a finished desktop running
+        # the first-boot task, because the guest agent had failed to install
+        # and this branch is all there was. The counters are the only thing
+        # this phase actually knows, so say only that.
+        printf "   ${DIM}%4ds  waiting for the guest agent - read %s MiB from the DVD, written %s MiB to disk${CL}\n" \
           "$SECONDS" "$(( rd / 1048576 ))" "$(( wr / 1048576 ))"
+
+        # Did the install start over? Setup reads the whole image off the DVD
+        # and then the counter goes flat for the rest of the build. If it wakes
+        # up and reads hundreds of megabytes again, the machine has booted the
+        # media a second time - somebody answered the boot prompt, or the boot
+        # order changed - and the new Setup has already wiped the disk out from
+        # under whatever was there. Observed: flat at 8053 MiB for eighteen
+        # minutes, then 9673, then 16104, which is the disc read exactly twice.
+        # Nothing said a word, and the heartbeat carried on for another ten
+        # minutes as if the first install were still going.
+        if (( rd == rd_last )); then
+          (( rd_quiet_since == 0 )) && rd_quiet_since=$SECONDS
+        else
+          if [[ "$restarted" == "no" ]] && (( rd_quiet_since > 0 )) \
+             && (( SECONDS - rd_quiet_since >= 300 )) && (( rd - rd_last >= 268435456 )); then
+            restarted=yes
+            msg_warn "The DVD went quiet for $(( (SECONDS - rd_quiet_since) / 60 )) minutes and is being read again."
+            msg_warn "${BL}Windows Setup has restarted${CL} - the machine booted the install media a"
+            msg_warn "second time and the answer file will have wiped the disk. Whatever the"
+            msg_warn "first install had built is gone. The usual cause is a keystroke reaching"
+            msg_warn "the console during one of the build's reboots and answering the DVD prompt."
+            msg_warn "This run will keep following; the new install is a fresh, valid build."
+          fi
+          rd_quiet_since=0
+        fi
+        rd_last=$rd
+        # A Windows install plus a first boot reaches the agent inside about
+        # twenty minutes. Past that, something is wrong and the counters will
+        # never say what, so stop implying patience is the answer.
+        if [[ "$nagged" == "no" ]] && (( SECONDS > 1500 )); then
+          nagged=yes
+          msg_warn "No guest agent after $((SECONDS / 60)) minutes. The build may be running fine and"
+          msg_warn "unreadable from here - the VirtIO guest tools carry the agent, and if they"
+          msg_warn "failed there is nothing left to ask. Open the VM console and read"
+          msg_warn "${BL}C:\\Windows\\Setup\\Scripts\\rdgw-setup.log${CL} directly."
+          msg_warn "Do not send keystrokes to that console: the build reboots several times,"
+          msg_warn "the DVD is still first in the boot order, and a stray Return answers the"
+          msg_warn "boot prompt and restarts the whole install over the top of it."
+        fi
       fi
     fi
 

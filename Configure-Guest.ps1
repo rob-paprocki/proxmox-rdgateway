@@ -367,6 +367,45 @@ function Invoke-DefenderRemoval {
     }
 }
 
+# The VirtIO guest tools, which carry the QEMU guest agent. This is what lets
+# the builder on the Proxmox host read rdgw-setup.log, so it wants to happen as
+# early as it possibly can - but "as early as it can" is the first boot, not
+# specialize, and that was measured rather than assumed. See CLAUDE.md.
+#
+# Defined above both callers on purpose: PowerShell resolves functions in script
+# order at run time, so one defined below its caller does not exist yet.
+function Invoke-GuestToolsInstall {
+    Write-Step "VirtIO guest tools"
+
+    $guestTools = $null
+    foreach ($d in [char[]]'DEFGHIJKLMNOPQRSTUVWXYZ') {
+        $candidate = "${d}:\virtio-win-guest-tools.exe"
+        if (Test-Path -LiteralPath $candidate) { $guestTools = $candidate; break }
+    }
+
+    if (-not $guestTools) {
+        Write-Skip "virtio-win-guest-tools.exe not found on any drive - is the VirtIO CD still attached? Install it by hand later"
+        return
+    }
+
+    try {
+        $p = Start-Process -FilePath $guestTools -ArgumentList '/passive', '/norestart' `
+            -Wait -PassThru -ErrorAction Stop
+        # Same reason as Invoke-CustomScripts.ps1: without touching Handle,
+        # ExitCode reads back empty once the child is gone.
+        $null = $p.Handle
+        if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) {
+            Write-Good "Installed $guestTools (exit $($p.ExitCode))"
+        } else {
+            Write-Bad "$guestTools exited $($p.ExitCode)"
+            Write-Line "         Windows Installer logs are in C:\Windows\Temp\Virtio-win-guest-tools_*.log"
+            Write-Line "         By hand: $guestTools"
+        }
+    } catch {
+        Write-Bad "Could not run ${guestTools}: $($_.Exception.Message)"
+    }
+}
+
 
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
     Write-Bad "No config file at $ConfigPath. Nothing to do."
@@ -383,6 +422,10 @@ $cfg = Import-PowerShellDataFile -LiteralPath $ConfigPath
 # ------------------------------------------------------------------------------
 if ($Phase -eq 'FirstBoot') {
     # Everything else already happened in specialize, before any desktop existed.
+    # These two are what is left, and the order is deliberate: the guest tools
+    # take about a minute and bring up the agent the builder needs to read this
+    # log, while Defender takes ten and produces nothing anyone can watch.
+    Invoke-GuestToolsInstall
     Invoke-DefenderRemoval
     Write-Step "Done"
     if ($script:Failures -gt 0) {
@@ -430,45 +473,27 @@ if ($ShellForCurrentUser) {
 }
 
 # ------------------------------------------------------------------------------
-# 0b. VirtIO guest tools - deliberately the very first thing
+# 0b. VirtIO guest tools - NOT here, and this line exists to say so
 #
-#     Order matters here for a reason that has nothing to do with Windows. The
-#     builder on the Proxmox host cannot read this log until the QEMU guest
-#     agent is answering, and the agent arrives with these tools. Install them
-#     last and the operator watches a blank progress heartbeat for a quarter of
-#     an hour before any of the real output appears; install them first and
-#     follow_build starts printing actual lines almost immediately.
+#     They were here for exactly one build, put first on purpose: the builder on
+#     the Proxmox host cannot read this log until the QEMU guest agent answers,
+#     the agent arrives with these tools, so the earlier they go in the sooner
+#     follow_build prints real lines instead of a byte counter.
 #
-#     Above the ApplyTweaks gate for the same reason it always was: that gate
-#     answers a prompt describing itself as cosmetic, and the guest agent is
-#     not cosmetic. Without it Proxmox cannot read the VM address, shut it down
-#     cleanly or quiesce it for a backup.
+#     Measured on that build: the installer starts, shows its progress bar, and
+#     then exits 1603 with every MSI rolled back. No qemu-ga service, no
+#     vioserial service, and follow_build spent the whole build blind. An
+#     installer bundle cannot run in specialize. See CLAUDE.md.
+#
+#     So it runs at the top of the first-boot pass instead, which is the
+#     earliest point it works. -Phase All still does it here, because a by-hand
+#     run is on a booted machine where it is fine.
 # ------------------------------------------------------------------------------
-Write-Step "VirtIO guest tools"
-
-$guestTools = $null
-foreach ($d in [char[]]'DEFGHIJKLMNOPQRSTUVWXYZ') {
-    $candidate = "${d}:\virtio-win-guest-tools.exe"
-    if (Test-Path -LiteralPath $candidate) { $guestTools = $candidate; break }
-}
-
-if (-not $guestTools) {
-    Write-Skip "virtio-win-guest-tools.exe not found on any drive - is the VirtIO CD still attached? Install it by hand later"
+if ($Phase -eq 'All') {
+    Invoke-GuestToolsInstall
 } else {
-    try {
-        $p = Start-Process -FilePath $guestTools -ArgumentList '/passive', '/norestart' `
-            -Wait -PassThru -ErrorAction Stop
-        # Same reason as Invoke-CustomScripts.ps1: without touching Handle,
-        # ExitCode reads back empty once the child is gone.
-        $null = $p.Handle
-        if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) {
-            Write-Good "Installed $guestTools (exit $($p.ExitCode))"
-        } else {
-            Write-Bad "$guestTools exited $($p.ExitCode)"
-        }
-    } catch {
-        Write-Bad "Could not run ${guestTools}: $($_.Exception.Message)"
-    }
+    Write-Step "VirtIO guest tools"
+    Write-Skip "Not in specialize - an installer bundle exits 1603 there. The first-boot pass does it first."
 }
 
 # ------------------------------------------------------------------------------

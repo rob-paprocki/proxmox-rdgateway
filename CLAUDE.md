@@ -12,10 +12,10 @@ behind one public hostname, using stock RD clients.
 
 | File | Runs on | Status |
 |---|---|---|
-| `windows-rdgw-vm.sh` | Proxmox host, root | **Run for real three times.** Boots and installs, see below |
-| `Setup-RDGateway.ps1` | The Windows guest, elevated | Written, parse/lint verified, **never run for real** |
-| `Configure-Guest.ps1` | The Windows guest, SYSTEM | Written, parse/lint verified, **never run for real** |
-| `Invoke-GatewaySetup.ps1` | The Windows guest, SYSTEM | Written, parse/lint verified, **never run for real** |
+| `windows-rdgw-vm.sh` | Proxmox host, root | **Run for real repeatedly.** Boots and installs, see below |
+| `Setup-RDGateway.ps1` | The Windows guest, elevated | **Run for real.** Installed the role and wrote the policies; the CAP readback was correct |
+| `Configure-Guest.ps1` | The Windows guest, SYSTEM | **Run for real** in both phases. The guest-tools step is the one that has failed |
+| `Invoke-GatewaySetup.ps1` | The Windows guest, SYSTEM | **Run for real.** Registers in specialize, drives the first boot to the end |
 | `Invoke-CustomScripts.ps1` | The Windows guest | **Executed for real** on Windows PowerShell 5.1, see below |
 | `Get-RDGWStatus.ps1` | The Windows guest, elevated | Read-only. Reports what the build actually did against what it was asked to do |
 | `sample-autounattend.xml` | — | Committed sample of generated output. Not read by anything |
@@ -212,6 +212,34 @@ on the host across all three cases: a nested comment returns 1, a comment direct
 another `command -v X || silently skip` check in this repo; a check nobody can see fail is
 not a check.
 
+**Running an installer bundle - specifically `virtio-win-guest-tools.exe` - during the
+specialize pass.** The operator asked for the VirtIO guest tools to go in first, so that
+the QEMU guest agent arrives early and `follow_build` starts printing real log lines
+instead of a byte counter. The reasoning was sound and the ordering worked; the install
+does not. Measured on the build of 2026-09-21: the bundle starts, paints its
+"Installing Windows Virtio-Win Drivers" progress bar on the console, and then
+
+```
+5:=== VirtIO guest tools ===
+6:    [fail] F:\virtio-win-guest-tools.exe exited 1603
+```
+
+1603 is `ERROR_INSTALL_FAILURE`. `C:\Windows\Temp` afterwards holds the bundle log, four
+MSI logs and **three rollback logs**, so the MSIs ran and were backed out. On the booted
+machine, `sc.exe query qemu-ga` and `sc.exe query vioserial` both return "The specified
+service does not exist as an installed service", and `qm agent 200 ping` on the host
+answers "QEMU guest agent is not running" with the VM config reading
+`agent: enabled=1` - so the Proxmox side was never the problem. `follow_build` spent that
+entire build blind. Note that `return value 3` does **not** appear in the main MSI log, so
+this is not a custom action failing; the install is refused earlier than that.
+Microsoft's [Audit mode overview](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/audit-mode-overview)
+puts application installs in audit mode precisely because they are changes "that require
+the Windows installation to be running", which specialize is not. This is the boundary of
+the specialize architecture below: registry writes, file copies, hive loading and task
+registration all belong there; **an installer does not.** The tools now go in at the top of
+`-Phase FirstBoot`, the earliest point they work, and specialize logs a `[skip]` saying so
+rather than staying silent about a step that moved.
+
 **WARP / Cloudflare One client, Tailscale, any client-side agent.** Violates the
 no-install-on-clients constraint.
 
@@ -336,10 +364,16 @@ bug will surface.
 
 **Assumed, never executed:**
 
-- No script has touched a real Proxmox host. `--efidisk0 <storage>:1,efitype=4m` and
-  `--tpmstate0 <storage>:1,version=v2.0` come from docs and forum usage, not from a run here.
-- The WMI calls have never run against a real RD Gateway. If something breaks first, expect
-  it here.
+- Everything about the **relay** path. `vps-relay-setup.sh` and `proxmox-relay-peer.sh`
+  are dry-run verified and have never touched a VPS.
+- `--efidisk0 <storage>:1,efitype=4m` and `--tpmstate0 <storage>:1,version=v2.0` came from
+  docs and forum usage rather than a run here, and have since built a VM that boots UEFI
+  with a TPM several times. They work; nothing about them is still assumed.
+- The WMI calls **have** now run against a real RD Gateway, and the one that was wrong is
+  the `BUILTIN\` entry below. The rest - the 18-parameter CAP `Create`, the 8-parameter RAP,
+  the resource group - went in and read back. Certificate binding
+  (`Set-Item RDS:\GatewayServer\SSLCertificate\Thumbprint`) is still untested, because no
+  real certificate has been installed yet.
 - **Settled on real hardware, and the guess was wrong.** `Administrators@BUILTIN` /
   `Remote Desktop Users@BUILTIN` came from a published workgroup example, and the gateway
   refuses it: `Win32_TSGatewayConnectionAuthorizationPolicy.Create returned 2147943732`,
@@ -377,12 +411,18 @@ bug will surface.
   `/IMAGE/NAME` value **did** match this retail/VL media, the `$WinPEDriver$` scan **did**
   load `vioscsi` (or Setup would have stopped with no disks to install to), and the
   `CreatePartition` layout **did** apply to a real disk. Do not re-list these as unverified.
-  What happens after the last Setup reboot has now been watched too, and it did not work:
-  the `RDGW-FirstBoot` task was never registered, because of the `$PSScriptRoot` bug
-  above. Fixed, but **the fix has not yet been through a clean build** - the first-boot
-  chain (Configure-Guest, the role install, the four custom-script registration points)
-  therefore remains the one part of this repo never observed working end to end. When it
-  fails it stays visible and recoverable: the task logs every step to
+  What happens after the last Setup reboot has now been watched too. It failed the first
+  time - the `RDGW-FirstBoot` task was never registered, because of the `$PSScriptRoot` bug
+  above - and then, with that fixed, **a complete build ran end to end**: the log finished
+  on `First-boot setup finished.`, the CAP read back
+  `BUILTIN\Administrators;BUILTIN\Remote Desktop Users`, the TSGateway service was running
+  and the task unregistered itself. The measured budget after first boot was 21m27s:
+  Defender 10m33s, the RDS-Gateway role 5m55s, the operator's own custom script 2m35s, the
+  rest seconds. So the chain works. What is **still** unobserved is narrower than it was:
+  the four custom-script registration points have each been seen firing at least once, but
+  not all four on one build, and `UserOnce` in particular has never been confirmed to reach
+  the auto-logon account rather than only later profiles. When any of it fails it stays
+  visible and recoverable: the task logs every step to
   `C:\Windows\Setup\Scripts\rdgw-setup.log` and stays registered so a reboot retries.
 - **Patterns borrowed from [cschneegans/unattend-generator](https://github.com/cschneegans/unattend-generator),
   which had already solved things this repo learned the hard way.** The operator pointed at
@@ -411,17 +451,21 @@ bug will surface.
   script injects only `rdgw/` and `$WinPEDriver$`, is a reasonable future option and has
   been discussed but not built.
 - **The VirtIO guest tools are installed by `Configure-Guest.ps1`, above the `ApplyTweaks`
-  gate.** That gate answers a prompt describing itself as cosmetic and not security
-  relevant; the QEMU guest agent is neither. Without it Proxmox cannot read the VM's IP,
-  cannot shut it down gracefully and cannot quiesce the filesystem for a backup, so a
-  gateway built with housekeeping declined would quietly be the worse machine. It scans
-  D: to Z: for `virtio-win-guest-tools.exe` and runs it `/passive /norestart`, which works
-  because the VirtIO CD is still on ide2 at first boot - before the runbook tells the
-  operator to detach the CDs. Exit code 3010 counts as success; it means "restart
-  required", and a restart is coming anyway. Missing tools are a `[skip]`, not a failure:
-  the drivers themselves came from `$WinPEDriver$`, so the box still boots, networks and
-  uses its disk. The **shell-only** path still tells the operator to run it by hand,
-  correctly, because `Configure-Guest.ps1` never runs there.
+  gate, at the top of the first-boot pass.** That gate answers a prompt describing itself
+  as cosmetic and not security relevant; the QEMU guest agent is neither. Without it
+  Proxmox cannot read the VM's IP, cannot shut it down gracefully and cannot quiesce the
+  filesystem for a backup, so a gateway built with housekeeping declined would quietly be
+  the worse machine. It scans D: to Z: for `virtio-win-guest-tools.exe` and runs it
+  `/passive /norestart`, which works because the VirtIO CD is still on ide2 at first boot -
+  before the runbook tells the operator to detach the CDs. Exit code 3010 counts as
+  success; it means "restart required", and a restart is coming anyway. Missing tools are a
+  `[skip]`, not a failure: the drivers themselves came from `$WinPEDriver$`, so the box
+  still boots, networks and uses its disk. The **shell-only** path still tells the operator
+  to run it by hand, correctly, because `Configure-Guest.ps1` never runs there.
+  It runs **first** within `-Phase FirstBoot`, ahead of the Defender removal, because it
+  takes about a minute and brings up the agent that `follow_build` needs, while Defender
+  takes ten and produces nothing anyone can watch. It does **not** run in specialize -
+  see the 1603 entry under "Ruled out".
 - **Edge first-run is suppressed by machine-wide policy, deliberately.**
   `HKLM\SOFTWARE\Policies\Microsoft\Edge\HideFirstRunExperience = 1`, plus
   `StartupBoostEnabled` and `BackgroundModeEnabled` off under `...\Edge\Recommended`, all
@@ -441,6 +485,37 @@ bug will surface.
   line. `NO_WAIT=1` restores the old behaviour, `FOLLOW_SECONDS` caps the wait. Do not make
   this opt-in: a script that reports success it has not verified is worse than one that
   says nothing.
+
+  Its first phase used to print `installing - read N MiB from the DVD, written N MiB to
+  disk`, and the operator watched it say that for twenty-five minutes while Windows sat at
+  a finished desktop running the first-boot task - because the guest tools had failed and
+  the agent was never coming. The counters are the only thing that phase knows, so it now
+  says `waiting for the guest agent` and nothing more, and past twenty-five minutes it says
+  once that the agent is not coming, where to read the log by hand, and not to type in that
+  console. Do not restore a word like "installing" to a branch that cannot tell.
+
+  The same phase now also notices the install **restarting**. Setup reads the image off
+  the DVD and the counter then goes flat for the rest of the build, so a counter that wakes
+  up after five quiet minutes and reads another 256 MiB means the machine booted the media
+  again and the new Setup has already wiped the disk. That is not hypothetical: the trace
+  from 2026-09-21 is flat at 8053 MiB for eighteen minutes, then 8691, 9673, and on to
+  16104 - the disc read exactly twice - while the heartbeat said "installing" throughout
+  and the operator had no way to know the build they were waiting on no longer existed.
+  The detector is regression-tested against that transcribed trace, with a normal
+  single-pass install as the control so it cannot fire on one.
+- **Do not send keystrokes to the guest console while a build is running.** Learned by
+  destroying one. The build reboots several times - after the Defender feature removal,
+  among others - the DVD is still first in the boot order at every one of them, and the
+  only thing that stops the machine reinstalling itself is the "Press any key to boot from
+  CD or DVD" prompt timing out unanswered. A single `Return`, sent to complete a filename
+  while reading a log on that console, landed on that prompt during the post-Defender
+  reboot; Windows Setup booted from the media, `WillWipeDisk` did what it says, and a build
+  that was eleven minutes from finishing became "Installing Windows Server, 16% complete".
+  This is the same fact `press_a_key` is built around, seen from the other end. The boot
+  order cannot simply be changed to disk-first either - see the `efisys_noprompt.bin` entry
+  under "Ruled out" for why those mid-install reboots need the DVD to stay bootable. Read
+  the guest's log through `qm guest exec` from the host; use the console read-only, and if
+  something must be typed there, do it when the build is finished.
 - **As much as possible happens in specialize, and that is a deliberate architecture, not
   an optimisation.** The operator watched a build and objected that the desktop appeared
   fully formed roughly twenty minutes before the machine was actually finished, and that
@@ -450,20 +525,23 @@ bug will surface.
   *after* the desktop was up. The phase name was a lie. cschneegans/unattend-generator
   runs its System phase in specialize, which is what makes the name honest.
   `Configure-Guest.ps1` now takes `-Phase`:
-  - **Specialize** - Default User hive, every machine setting, the VirtIO guest tools and
-    the operator's System scripts. Driven from `Invoke-GatewaySetup.ps1 -Register`, which
-    already runs in that pass, so no new answer-file command and no new `<Path>` to bust
-    the 259-character limit.
-  - **FirstBoot** - removing the Defender feature, and nothing else. It is the one piece
-    that genuinely cannot move: it is a CBS servicing operation, it needs a reboot, and
-    running it beside Setup's own servicing risks the image. It is also the single slowest
-    step in the build at 10m33s measured, about half of everything after first boot.
+  - **Specialize** - Default User hive, every machine setting and the operator's System
+    scripts. Driven from `Invoke-GatewaySetup.ps1 -Register`, which already runs in that
+    pass, so no new answer-file command and no new `<Path>` to bust the 259-character
+    limit.
+  - **FirstBoot** - the VirtIO guest tools, then removing the Defender feature. Both are
+    here because they cannot be anywhere else. Defender is a CBS servicing operation that
+    needs a reboot and must not run beside Setup's own servicing, and it is the single
+    slowest step in the build at 10m33s measured. The guest tools are an installer bundle,
+    and an installer bundle exits 1603 in specialize - the whole story is under "Ruled
+    out". They go first of the two so the agent arrives while Defender is still grinding.
   - **All** - both, for running the script by hand.
 
   Do not move work back to the first-boot task for convenience. The measured budget after
   first boot was 21m27s, of which Defender was 10m33s and the RDS-Gateway role install
   5m55s; everything else is seconds. Anything that is only registry writes belongs in
-  specialize.
+  specialize. The line is **registry writes, file copies, hive loading and task
+  registration go in specialize; anything that runs an installer does not.**
 - **The Default User hive is written during specialize, not by the first-boot task.** That
   is the only moment when it is unambiguously correct - no profile exists yet, so what goes
   in is genuinely inherited by the first account. `Invoke-GatewaySetup.ps1 -Register` calls
