@@ -2111,11 +2111,15 @@ ${BOLD}What runs, in order${CL}
    3. It wipes disk 0, partitions it (EFI / MSR / NTFS), and installs
       ${BL}${IMAGE_NAME}${CL}.
    4. The specialize pass copies the scripts to
-      ${BL}C:\\Windows\\Setup\\Scripts${CL} and registers a startup task.
-   5. That task applies your settings, installs the VirtIO guest tools from
-      the CD still attached on ide2 (so Proxmox can read the IP and shut the
-      VM down cleanly), installs the RD Gateway role, reboots if Windows asks,
-      then runs ${BL}Setup-RDGateway.ps1${CL} and verifies the TSGateway service.
+      ${BL}C:\\Windows\\Setup\\Scripts${CL} and then - before Windows creates a
+      profile or shows you a desktop - writes the Default User hive, applies
+      every machine setting, installs the VirtIO guest tools from the CD on
+      ide2, and runs your ${BL}System${CL} scripts. Then it registers a startup
+      task for the rest.
+   5. That task does only what could not be done earlier: removes Defender
+      (a servicing operation that needs its own reboot), installs the RD
+      Gateway role, reboots if Windows asks, then runs
+      ${BL}Setup-RDGateway.ps1${CL} and verifies the TSGateway service.
 
    Expect ${BL}two or three reboots${CL} and roughly 20-40 minutes depending on
    the disk underneath.

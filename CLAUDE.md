@@ -441,6 +441,29 @@ bug will surface.
   line. `NO_WAIT=1` restores the old behaviour, `FOLLOW_SECONDS` caps the wait. Do not make
   this opt-in: a script that reports success it has not verified is worse than one that
   says nothing.
+- **As much as possible happens in specialize, and that is a deliberate architecture, not
+  an optimisation.** The operator watched a build and objected that the desktop appeared
+  fully formed roughly twenty minutes before the machine was actually finished, and that
+  a script they had filed under the **System** category "only kicked in during the first
+  login". Both were true. `Invoke-CustomScripts.ps1` documented System as running "before
+  anyone logs on"; measured, it ran at 22:18:21 from the startup task, eleven minutes
+  *after* the desktop was up. The phase name was a lie. cschneegans/unattend-generator
+  runs its System phase in specialize, which is what makes the name honest.
+  `Configure-Guest.ps1` now takes `-Phase`:
+  - **Specialize** - Default User hive, every machine setting, the VirtIO guest tools and
+    the operator's System scripts. Driven from `Invoke-GatewaySetup.ps1 -Register`, which
+    already runs in that pass, so no new answer-file command and no new `<Path>` to bust
+    the 259-character limit.
+  - **FirstBoot** - removing the Defender feature, and nothing else. It is the one piece
+    that genuinely cannot move: it is a CBS servicing operation, it needs a reboot, and
+    running it beside Setup's own servicing risks the image. It is also the single slowest
+    step in the build at 10m33s measured, about half of everything after first boot.
+  - **All** - both, for running the script by hand.
+
+  Do not move work back to the first-boot task for convenience. The measured budget after
+  first boot was 21m27s, of which Defender was 10m33s and the RDS-Gateway role install
+  5m55s; everything else is seconds. Anything that is only registry writes belongs in
+  specialize.
 - **The Default User hive is written during specialize, not by the first-boot task.** That
   is the only moment when it is unambiguously correct - no profile exists yet, so what goes
   in is genuinely inherited by the first account. `Invoke-GatewaySetup.ps1 -Register` calls

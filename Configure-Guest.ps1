@@ -47,13 +47,21 @@ param(
     # See Set-ShellSetting.
     [switch] $ShellForCurrentUser,
 
-    # Do only the Default User hive work and exit. Called from the specialize
-    # pass by Invoke-GatewaySetup.ps1 -Register, which is the correct moment for
-    # it: Windows has not created a single profile yet, so what lands in the
-    # hive is genuinely inherited by the first account. Doing it from the
-    # first-boot task instead loses a race against AutoLogon, which is how a
-    # real build ended up with a centred taskbar and the light theme.
-    [switch] $DefaultUserOnly
+    # Which pass this is running in, because when the work happens matters as
+    # much as whether it happens.
+    #
+    #   Specialize - everything that can possibly be done before Windows creates
+    #                a profile or shows a desktop: the Default User hive, all the
+    #                machine-wide settings, the VirtIO guest tools and the
+    #                operator's System scripts. This is where the bulk of the
+    #                build belongs, and where cschneegans/unattend-generator puts
+    #                its equivalent work.
+    #   FirstBoot  - only what genuinely cannot run in specialize. Today that is
+    #                removing the Defender feature, which needs a reboot and must
+    #                not run alongside Setup's own servicing.
+    #   All        - both, for running this by hand.
+    [ValidateSet('Specialize', 'FirstBoot', 'All')]
+    [string] $Phase = 'All'
 )
 
 $ErrorActionPreference = 'Continue'
@@ -310,6 +318,56 @@ function Invoke-DefaultUserHive {
     }
 }
 
+# Removing the Defender feature, which is a CBS servicing operation and the
+# single slowest thing in the whole build - 10m33s on a measured run, half of
+# everything after first boot. It is also the one piece of guest configuration
+# that cannot move into specialize: it needs a reboot to finish, and running a
+# feature uninstall concurrently with Setup's own servicing is asking for a
+# corrupted image. So it stays in the first-boot task while everything else
+# moves earlier. See the -Phase parameter.
+function Invoke-DefenderRemoval {
+    Write-Step "Microsoft Defender"
+    if ($cfg.DisableDefender) {
+        # This used to write Start=4 over the six WinDefend service keys, which is
+        # what most "disable Defender" snippets do and which Microsoft documents
+        # against in as many words: "Don't disable, stop, or modify any of the
+        # associated services that are used by Microsoft Defender Antivirus ...
+        # Manually modifying these services can cause severe instability". Tamper
+        # Protection is on by default on Server 2025 and denies those writes even to
+        # SYSTEM, so the old code failed on every key and then printed success
+        # anyway.
+        #
+        # On Windows Server, Defender is an installable feature, and removing it is
+        # the documented route. It needs a reboot to finish, which the first-boot
+        # task takes before it installs the gateway role.
+        $removed = $false
+        try {
+            Import-Module ServerManager -ErrorAction SilentlyContinue
+            $feature = Get-WindowsFeature -Name Windows-Defender -ErrorAction Stop
+            if (-not $feature -or -not $feature.Installed) {
+                Write-Skip "The Windows-Defender feature is not installed - nothing to remove"
+                $removed = $true
+            } else {
+                $result = Uninstall-WindowsFeature -Name Windows-Defender -ErrorAction Stop
+                if ($result.Success) {
+                    $removed = $true
+                    Write-Good "Windows-Defender feature removed - chosen at build time. Finishes at the next reboot."
+                } else {
+                    Write-Bad "Uninstall-WindowsFeature returned exit code $($result.ExitCode)"
+                }
+            }
+        } catch {
+            Write-Bad "Could not remove the Windows-Defender feature: $($_.Exception.Message)"
+        }
+        if (-not $removed) {
+            Write-Bad "Defender is still installed. By hand: Uninstall-WindowsFeature Windows-Defender -Restart"
+        }
+    } else {
+        Write-Skip "Left enabled"
+    }
+}
+
+
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
     Write-Bad "No config file at $ConfigPath. Nothing to do."
     exit 1
@@ -323,15 +381,13 @@ $cfg = Import-PowerShellDataFile -LiteralPath $ConfigPath
 #    value the answer file writes. Everything here is cosmetic, so it touches
 #    nothing else and never fails the build.
 # ------------------------------------------------------------------------------
-if ($DefaultUserOnly) {
-    Invoke-DefaultUserHive
-    try {
-        Set-Content -LiteralPath (Join-Path $script:Root 'rdgw-defaultuser.done') `
-            -Value ((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')) -Encoding ASCII -ErrorAction Stop
-    } catch {
-        Write-Bad "Could not write the marker file, so the first-boot task will redo this: $($_.Exception.Message)"
-    }
+if ($Phase -eq 'FirstBoot') {
+    # Everything else already happened in specialize, before any desktop existed.
+    Invoke-DefenderRemoval
     Write-Step "Done"
+    if ($script:Failures -gt 0) {
+        Write-Line "    $($script:Failures) setting(s) could not be applied - see the [fail] lines above"
+    }
     exit 0
 }
 
@@ -427,46 +483,16 @@ if ($cfg.DisableUac) {
 #    Sets the service start type to 4 (disabled). Tamper Protection blocks this
 #    on a machine where it is switched on; that failure is logged, not fatal.
 # ------------------------------------------------------------------------------
-Write-Step "Microsoft Defender"
-if ($cfg.DisableDefender) {
-    # This used to write Start=4 over the six WinDefend service keys, which is
-    # what most "disable Defender" snippets do and which Microsoft documents
-    # against in as many words: "Don't disable, stop, or modify any of the
-    # associated services that are used by Microsoft Defender Antivirus ...
-    # Manually modifying these services can cause severe instability". Tamper
-    # Protection is on by default on Server 2025 and denies those writes even to
-    # SYSTEM, so the old code failed on every key and then printed success
-    # anyway.
-    #
-    # On Windows Server, Defender is an installable feature, and removing it is
-    # the documented route. It needs a reboot to finish, which the first-boot
-    # task takes before it installs the gateway role.
-    $removed = $false
-    try {
-        Import-Module ServerManager -ErrorAction SilentlyContinue
-        $feature = Get-WindowsFeature -Name Windows-Defender -ErrorAction Stop
-        if (-not $feature -or -not $feature.Installed) {
-            Write-Skip "The Windows-Defender feature is not installed - nothing to remove"
-            $removed = $true
-        } else {
-            $result = Uninstall-WindowsFeature -Name Windows-Defender -ErrorAction Stop
-            if ($result.Success) {
-                $removed = $true
-                Write-Good "Windows-Defender feature removed - chosen at build time. Finishes at the next reboot."
-            } else {
-                Write-Bad "Uninstall-WindowsFeature returned exit code $($result.ExitCode)"
-            }
-        }
-    } catch {
-        Write-Bad "Could not remove the Windows-Defender feature: $($_.Exception.Message)"
-    }
-    if (-not $removed) {
-        Write-Bad "Defender is still installed. By hand: Uninstall-WindowsFeature Windows-Defender -Restart"
-    }
+# Defender. In the normal build this does NOT run here: -Phase Specialize
+# skips it and the first-boot task calls -Phase FirstBoot for it alone,
+# because it is a servicing operation that needs a reboot and must not run
+# beside Setup's own. A by-hand run with -Phase All does it in place.
+if ($Phase -eq 'All') {
+    Invoke-DefenderRemoval
 } else {
-    Write-Skip "Left enabled"
+    Write-Step "Microsoft Defender"
+    Write-Skip "Left to the first boot - it needs a reboot and must not run during Setup"
 }
-
 # ------------------------------------------------------------------------------
 # 5. Core Isolation / virtualisation-based security
 # ------------------------------------------------------------------------------
@@ -495,13 +521,7 @@ if ($cfg.DisableCad) {
     Write-Good "Ctrl+Alt+Del required to log on (Proxmox console: the toolbar sends it)"
 }
 
-$dvMarker = Join-Path $script:Root "rdgw-defaultuser.done"
-if (Test-Path -LiteralPath $dvMarker) {
-    Write-Step "Shell settings (Default User hive)"
-    Write-Skip "Already done during specialize, before any profile existed - which is the point"
-} else {
-    Invoke-DefaultUserHive
-}
+Invoke-DefaultUserHive
 # ------------------------------------------------------------------------------
 # 7b. VirtIO guest tools
 #

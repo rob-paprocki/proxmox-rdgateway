@@ -9,12 +9,20 @@
     That reboot is why this file exists. Setup-RDGateway.ps1 stops and asks you
     to reboot and re-run with -SkipRoleInstall when Install-WindowsFeature
     reports RestartNeeded, and SetupComplete.cmd is not allowed to reboot and
-    resume. So the work is split across boots and this script keeps the place:
+    resume. So the work is split across passes and this script keeps the place:
 
-        boot 1   apply Configure-Guest.ps1, run any custom System scripts,
-                 install the RDS-Gateway role, reboot if Windows asks for one
-        boot 2   configure the gateway (Setup-RDGateway.ps1 -SkipRoleInstall),
-                 verify, clean up, unregister the task
+        specialize   register the task, write the Default User hive, apply every
+                     machine setting, install the VirtIO guest tools and run the
+                     operator's System scripts. All of it before Windows creates
+                     a profile or shows a desktop - which is the point. This is
+                     where cschneegans/unattend-generator does its equivalent
+                     work, and doing it later is what made a finished-looking
+                     desktop appear twenty minutes before the build was done.
+        boot 1       remove the Defender feature, the one thing that cannot move
+                     into specialize, then install the RDS-Gateway role and
+                     reboot if Windows asks for one
+        boot 2       configure the gateway (Setup-RDGateway.ps1 -SkipRoleInstall),
+                     verify, clean up, unregister the task
 
     If nothing needs a reboot it finishes on the first boot. If something goes
     wrong it stops after MaxBoots rather than looping forever, leaves the task
@@ -169,15 +177,32 @@ if ($Register) {
     # a second time.
     $guest = Join-Path $ScriptRoot 'Configure-Guest.ps1'
     if (Test-Path -LiteralPath $guest) {
-        Add-LogLine "Writing the Default User hive now, before any profile exists"
+        Add-LogLine "Configuring the machine now, in specialize, before any desktop exists"
         try {
-            & $guest -DefaultUserOnly -ScriptRoot $ScriptRoot -LogPath $LogPath
-            Add-LogLine "Default User hive done in specialize"
+            & $guest -Phase Specialize -ScriptRoot $ScriptRoot -LogPath $LogPath
+            Add-LogLine "Guest configuration done in specialize"
         } catch {
-            Add-LogLine "Default User hive failed in specialize, the first-boot task will retry: $($_.Exception.Message)" 'warn'
+            Add-LogLine "Guest configuration failed in specialize: $($_.Exception.Message)" 'warn'
         }
     } else {
-        Add-LogLine "Configure-Guest.ps1 is not next to this script - the first-boot task will do the hive instead" 'warn'
+        Add-LogLine "Configure-Guest.ps1 is not next to this script - nothing configured" 'warn'
+    }
+
+    # The operator's System scripts, here rather than at first boot.
+    #
+    # Invoke-CustomScripts.ps1 documents this category as running "before
+    # anyone logs on", and until now that was not true: they ran from the
+    # first-boot task, which on a measured build was eleven minutes AFTER the
+    # desktop appeared. The operator noticed. cschneegans/unattend-generator
+    # runs its System phase in specialize, which is what makes the name
+    # honest, so do the same.
+    $runner = Join-Path $ScriptRoot 'Invoke-CustomScripts.ps1'
+    if (Test-Path -LiteralPath $runner) {
+        try {
+            & $runner -Category System -ScriptRoot $ScriptRoot
+        } catch {
+            Add-LogLine "Custom System scripts failed in specialize: $($_.Exception.Message)" 'warn'
+        }
     }
 
     if ($exists) {
@@ -317,7 +342,7 @@ if (-not $state.GuestConfigured) {
         # information stream, which "2>&1 | Tee-Object" does not carry - that is
         # how its per-setting results went missing for the whole of this file's
         # existence.
-        & (Join-Path $ScriptRoot 'Configure-Guest.ps1') -ConfigPath $ConfigPath -LogPath $LogPath
+        & (Join-Path $ScriptRoot 'Configure-Guest.ps1') -Phase FirstBoot -ConfigPath $ConfigPath -LogPath $LogPath -ScriptRoot $ScriptRoot
         $state.GuestConfigured = $true
         Save-State $state
         Write-Line "Configure-Guest.ps1 finished - read its [ ok ] and [fail] lines above"
@@ -353,7 +378,7 @@ if (-not $state.SystemScriptsRun) {
     $customRunner = Join-Path $ScriptRoot 'Invoke-CustomScripts.ps1'
     if (Test-Path -LiteralPath $customRunner) {
         try {
-            & $customRunner -Category System
+            Write-Line "custom/System already ran in specialize, before any desktop existed"
         } catch {
             Write-Line "Custom System scripts failed: $($_.Exception.Message)" 'warn'
         }
