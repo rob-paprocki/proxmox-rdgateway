@@ -249,4 +249,45 @@ try {
     foreach ($r in $rap) { Write-Info "RAP '$($r.Name)' type=$($r.ResourceGroupType) group=$($r.ResourceGroupName)" }
 } catch { Write-Info "no RAP readable: $($_.Exception.Message)" }
 
+# The certificate is the one thing a working gateway can still get wrong in a
+# way nobody notices until a client refuses to connect, so report the issuer
+# rather than just "a certificate is bound". Self-signed shows up as issuer
+# equal to subject, which is exactly the dialog the operator would be seeing.
+Write-Head "7. The certificate clients will check"
+
+$mode = if ($cfg -and $cfg.CertMode) { $cfg.CertMode } else { 'selfsigned' }
+Write-Info "asked for: $mode$(if ($cfg -and $cfg.AcmeHostname) { " ($($cfg.AcmeHostname))" })"
+
+$bound = $null
+try {
+    Import-Module RemoteDesktopServices -ErrorAction Stop
+    $bound = (Get-Item 'RDS:\GatewayServer\SSLCertificate\Thumbprint' -ErrorAction Stop).CurrentValue
+} catch { Write-Info "could not read the bound thumbprint: $($_.Exception.Message)" }
+
+if ($bound) {
+    $c = Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
+         Where-Object { $_.Thumbprint -eq $bound } | Select-Object -First 1
+    if ($c) {
+        if ($c.Issuer -eq $c.Subject) {
+            Write-No "bound certificate is SELF-SIGNED ($($c.Subject)) - every client must import it"
+        } else {
+            Write-Ok "bound certificate issued by $($c.Issuer)"
+        }
+        Write-Info "subject $($c.Subject), expires $($c.NotAfter.ToString('yyyy-MM-dd'))"
+    } else {
+        Write-Info "thumbprint $bound is bound but not in LocalMachine\My"
+    }
+} else {
+    Write-No "no certificate is bound to the gateway"
+}
+
+$runner = 'C:\win-acme\request-certificate.cmd'
+if ($mode -ne 'selfsigned') {
+    if (Test-Path -LiteralPath $runner) {
+        Write-Ok "win-acme is installed; re-run it with $runner <token>"
+    } else {
+        Write-No "win-acme was asked for but $runner is missing - see section 4 for why"
+    }
+}
+
 Write-Host "`nDone. Lines marked [ NO ] are where what you asked for and what happened differ."

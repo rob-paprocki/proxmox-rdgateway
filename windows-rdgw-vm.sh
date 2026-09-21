@@ -41,6 +41,8 @@
 #                         ISO after a successful build (default 0 - they are
 #                         detached and the ISO is deleted, because it holds
 #                         the account password in clear text)
+#      WINACME_VERSION    which win-acme release the guest fetches when the
+#                         certificate mode asks for it (default 2.2.9.1701)
 #
 #  What it touches on the network:
 #
@@ -91,7 +93,7 @@ unset _src
 #   REPO_REF=some-branch bash -c "$(curl -fsSL .../windows-rdgw-vm.sh)"
 REPO_REF="${REPO_REF:-main}"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/${REPO_REF}}"
-SUPPORT_FILES=(Setup-RDGateway.ps1 Configure-Guest.ps1 Invoke-GatewaySetup.ps1 Invoke-CustomScripts.ps1 Get-RDGWStatus.ps1)
+SUPPORT_FILES=(Setup-RDGateway.ps1 Configure-Guest.ps1 Invoke-GatewaySetup.ps1 Invoke-CustomScripts.ps1 Get-RDGWStatus.ps1 Invoke-WinAcme.ps1)
 SUPPORT_DIR=""
 
 # Answering the Windows DVD's "press any key to boot" prompt. See press_a_key.
@@ -128,6 +130,13 @@ FOLLOW_SECONDS="${FOLLOW_SECONDS:-3600}"
 # the operator to tidy up later means leaving a password on disk for exactly as
 # long as they forget. KEEP_MEDIA=1 leaves the CDs attached and the ISO on disk.
 KEEP_MEDIA="${KEEP_MEDIA:-0}"
+
+# win-acme, fetched inside the guest when the certificate mode asks for it.
+# Pinned rather than resolved to "latest" so a build is reproducible and so the
+# Cloudflare plugin, which is a separate download, always matches the binary it
+# plugs into. The pluggable build is required: the trimmed one cannot load
+# external plugins, and every DNS provider is an external plugin.
+WINACME_VERSION="${WINACME_VERSION:-2.2.9.1701}"
 
 # Scripts of your own, in the four categories the schneegans.de generator uses.
 # CUSTOM_STAGE is a mktemp tree laid out as <category>/<filename>, created only
@@ -960,6 +969,65 @@ stage_custom_scripts() {
   msg_ok "Custom scripts staged (${staged})"
 }
 
+# The certificate decides whether this gateway is pleasant or annoying to use,
+# so it is asked for here rather than left to a manual phase afterwards.
+#
+# A self-signed certificate is generated and bound in every mode, because
+# TSGateway will not listen on 443 without one. win-acme then replaces it. That
+# ordering is load-bearing: an ACME run that fails for any reason - no DNS
+# propagation, a bad token, a rate limit - leaves a working gateway holding a
+# certificate nobody trusts, rather than a gateway that is down.
+pick_certificate() {
+  local choice cert_default dots zone
+
+  choice="$(whiptail --backtitle "$APP" --title "Certificate" --radiolist \
+    "How should this gateway get the certificate clients check?\n\nA self-signed one is generated either way, so the gateway is listening before anything else is attempted.\n" 20 78 3 \
+    "staged"     "win-acme installed, one command left for you" ON \
+    "selfsigned" "Self-signed only - every client must import it" OFF \
+    "auto"       "Let's Encrypt during the build, unattended" OFF \
+    3>&1 1>&2 2>&3)" || exit_script
+  CERT_MODE="$choice"
+
+  ACME_HOSTNAME=""
+  ACME_EMAIL=""
+  CLOUDFLARE_TOKEN=""
+  [[ "$CERT_MODE" == "selfsigned" ]] && return 0
+
+  # Default to a wildcard. A certificate naming the gateway itself publishes
+  # that name to the Certificate Transparency logs permanently, and rdg.,
+  # vpn. and remote. are exactly what gets scraped out of them; a wildcard
+  # costs nothing extra over DNS-01 and never names the host. Only when there
+  # is a subdomain to drop, though - "example.com" must not become "*.com".
+  dots="$(printf '%s' "$EXTERNAL_FQDN" | tr -cd '.' | wc -c)"
+  if [[ "$dots" -ge 2 ]]; then
+    zone="${EXTERNAL_FQDN#*.}"
+    cert_default="*.${zone}"
+  else
+    zone="$EXTERNAL_FQDN"
+    cert_default="$EXTERNAL_FQDN"
+  fi
+
+  ask "Certificate hostname (a wildcard keeps this host out of CT logs)" "$cert_default"
+  ACME_HOSTNAME="$ASK_RESULT"
+
+  ask "Email for the Let's Encrypt account (expiry notices)" "admin@${zone}"
+  ACME_EMAIL="$ASK_RESULT"
+
+  [[ "$CERT_MODE" == "auto" ]] || return 0
+
+  whiptail --backtitle "$APP" --title "What unattended issuance costs" --msgbox \
+    "This needs a Cloudflare API token scoped Zone:DNS:Edit, and it goes into rdgw-config.psd1 on the unattend CD in clear text.\n\nTwo things follow from that.\n\nA build that FAILS keeps its CD on purpose, so the retry can still use it. That leaves a token which can edit your entire DNS zone sitting in ISO storage until you delete it yourself.\n\nLet's Encrypt allows 5 duplicate certificates per week. Rebuilding this VM more than a few times will reach that limit, and the build will report it as a rate-limit failure.\n\nThe staged option has neither problem and costs you one command." 21 76 || true
+
+  ask_secret "Cloudflare API token (Zone:DNS:Edit)"
+  CLOUDFLARE_TOKEN="$ASK_RESULT"
+  if [[ -z "$CLOUDFLARE_TOKEN" ]]; then
+    whiptail --backtitle "$APP" --title "No token given" --msgbox \
+      "Without a token there is nothing to validate with, so this falls back to staging win-acme. You run one command after the build and it is done." 11 72 || true
+    CERT_MODE="staged"
+  fi
+  return 0
+}
+
 unattend_settings() {
   ask "Local administrator account name" "rdgadmin"
   ADMIN_USER="$ASK_RESULT"
@@ -967,6 +1035,8 @@ unattend_settings() {
 
   ask "External FQDN clients will connect to" "rdg.example.com"
   EXTERNAL_FQDN="$ASK_RESULT"
+
+  pick_certificate
 
   # Windows time zone ID, not an IANA name. "tzutil /l" inside Windows lists
   # them all; the mapping from Europe/London to "GMT Standard Time" is not
@@ -1358,19 +1428,30 @@ XMLEOF
 }
 
 generate_config_psd1() {
-  local stage="$1" targets="" m
+  local stage="$1" targets="" m secrets_note
+
   for m in $TARGET_MACHINES; do
     targets+="$(psd1_quote "$m"), "
   done
   targets="${targets%, }"
+
+  # Say plainly what is in this file. It used to be true that nothing secret
+  # lived here; with unattended issuance it is not, and a file that claims to
+  # be harmless while carrying a zone-edit token is worse than one that says so.
+  if [[ -n "$CLOUDFLARE_TOKEN" ]]; then
+    secrets_note="CONTAINS A CLOUDFLARE API TOKEN in clear text, plus the"
+    secrets_note+=$'\n# account password in autounattend.xml beside it. This CD is deleted when the'
+    secrets_note+=$'\n# build succeeds. A build that fails keeps it - delete it yourself.'
+  else
+    secrets_note="No secrets live here. The account password is in autounattend.xml."
+  fi
 
   write_file "${stage}/rdgw/rdgw-config.psd1" 644 <<PSDEOF
 #
 # Every answer given to windows-rdgw-vm.sh, as plain data. Read by
 # Configure-Guest.ps1 and Invoke-GatewaySetup.ps1 on the first boot.
 #
-# Generated for VM ${VMID} (${HN}). No secrets live here. The account password
-# is in autounattend.xml.
+# Generated for VM ${VMID} (${HN}). ${secrets_note}
 #
 @{
     ComputerName         = $(psd1_quote "$HN")
@@ -1379,6 +1460,14 @@ generate_config_psd1() {
     TargetMachines       = @(${targets})
     ResourceScope        = '${RESOURCE_SCOPE}'
     CertificateSource    = 'SelfSigned'
+
+    # A self-signed certificate is bound first in every mode, so the gateway is
+    # listening before win-acme is tried. CertMode decides what happens next.
+    CertMode             = '${CERT_MODE}'
+    AcmeHostname         = $(psd1_quote "$ACME_HOSTNAME")
+    AcmeEmail            = $(psd1_quote "$ACME_EMAIL")
+    CloudflareToken      = $(psd1_quote "$CLOUDFLARE_TOKEN")
+    WinAcmeVersion       = $(psd1_quote "$WINACME_VERSION")
 
     LockoutThreshold     = ${LOCKOUT_THRESHOLD}
     LockoutWindow        = ${LOCKOUT_WINDOW}
@@ -1970,6 +2059,13 @@ ask() {  # ask <title> <default> -> ASK_RESULT
   return 0
 }
 
+# Same as ask, with no default and no echo. An empty answer stays empty here,
+# because the caller has to be able to tell "nothing given" from a value.
+ask_secret() {  # ask_secret <title> -> ASK_RESULT
+  ASK_RESULT="$(whiptail --backtitle "$APP" --title "$1" --passwordbox "$1" 10 70 3>&1 1>&2 2>&3)" || exit_script
+  return 0
+}
+
 advanced_settings() {
   ask "VM ID" "$(get_valid_nextid)";              VMID="$ASK_RESULT"
   ask "Hostname / VM name" "rdgw01";              HN="$ASK_RESULT"
@@ -2293,6 +2389,10 @@ cleanup_media() {
   if [[ "$KEEP_MEDIA" == "1" ]]; then
     msg_warn "KEEP_MEDIA=1 - the CDs stay attached and ${BL}${UNATTEND_ISO_PATH}${CL}"
     msg_warn "stays on disk. It holds the account password in clear text; delete it yourself."
+    if [[ -n "${CLOUDFLARE_TOKEN:-}" ]]; then
+      msg_warn "It also holds your ${BL}Cloudflare API token${CL}, which can edit every record in"
+      msg_warn "that zone. Delete the ISO or revoke the token."
+    fi
     return 0
   fi
 
@@ -2306,6 +2406,16 @@ cleanup_media() {
 # it happen, rather than exiting on a promise - see follow_build.
 if [[ "$UNATTEND" == "yes" && "$START_VM" == "yes" && "$DRY_RUN" != "1" ]]; then
   printf "\n"
-  follow_build || exit 1
+  if ! follow_build; then
+    # The media stays on purpose so a retry has the VirtIO CD to install the
+    # guest tools from. Say what that leaves behind when it is more than a
+    # local password.
+    if [[ -n "${CLOUDFLARE_TOKEN:-}" ]]; then
+      msg_warn "The build did not finish, so the CDs stay attached for the retry."
+      msg_warn "${BL}${UNATTEND_ISO_PATH}${CL} holds your Cloudflare API token in clear"
+      msg_warn "text. Delete it or revoke the token if you are not retrying now."
+    fi
+    exit 1
+  fi
   cleanup_media
 fi

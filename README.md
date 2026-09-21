@@ -11,6 +11,7 @@ the wizard twice and without guessing at the WMI calls.
 | [`Invoke-GatewaySetup.ps1`](Invoke-GatewaySetup.ps1) | Inside the guest, as SYSTEM | Drives the build from inside. Registers the first-boot task, then survives the role-install reboot |
 | [`Invoke-CustomScripts.ps1`](Invoke-CustomScripts.ps1) | Inside the guest | Runs scripts of your own, in the four categories, at the right moment |
 | [`Get-RDGWStatus.ps1`](Get-RDGWStatus.ps1) | Inside the guest, elevated | Read-only. Prints what the build was asked to do next to what the machine actually has |
+| [`Invoke-WinAcme.ps1`](Invoke-WinAcme.ps1) | Inside the guest, as SYSTEM | Installs win-acme and, if you asked it to, gets the Let's Encrypt certificate |
 | [`vps-relay-setup.sh`](vps-relay-setup.sh) | A small public VPS | *Optional.* Layer 4 front door so nothing has to be open at home |
 | [`proxmox-relay-peer.sh`](proxmox-relay-peer.sh) | Proxmox host, as root | *Optional.* Home end of that relay: outbound WireGuard, forwarding, NAT |
 
@@ -73,9 +74,11 @@ kernel, so Windows cannot live in one.
 
 **Where the certificate comes from.** This is what decides whether the thing is pleasant or annoying to use.
 
-A real certificate from Let's Encrypt is free and every client trusts it silently. [win-acme](https://www.win-acme.com/) is the standard ACME client for Windows, it's open source (Apache 2.0), and it ships a script that binds the cert to the gateway and restarts the service on every renewal (Phase 4 has the wiring). If your domain is already on Cloudflare, the clean path is win-acme with the Cloudflare DNS-01 validation plugin. No inbound port 80 is needed, and it works even when the name points at a dynamic address.
+A real certificate from Let's Encrypt is free and every client trusts it silently. [win-acme](https://www.win-acme.com/) is the standard ACME client for Windows, it's open source (Apache 2.0), and it ships a script that binds the cert to the gateway and restarts the service on every renewal. If your domain is already on Cloudflare, the clean path is win-acme with the Cloudflare DNS-01 validation plugin: no inbound port 80, and it works even when the name points at a dynamic address. The build can install win-acme for you and can run it too, which is what Phase 4 covers.
 
-A self-signed certificate works technically, but every client has to be told to trust it. On Windows that's an MMC import into Trusted Root; on Android it's fiddly and on iOS it involves a profile. The script will generate one and export the public half so you can test end to end, but treat it as scaffolding.
+A self-signed certificate works technically, but every client has to be told to trust it. On Windows that's an MMC import into Trusted Root; on Android it's fiddly and on iOS it needs a configuration profile plus a separate full-trust toggle buried in Settings. The build generates one regardless and exports the public half, so you can prove the gateway works end to end, but treat it as scaffolding rather than the destination.
+
+One thing worth deciding now, because it is permanent: a certificate naming your gateway publishes that name to the Certificate Transparency logs, forever and publicly, and people scrape those logs for `rdg.`, `vpn.` and `remote.`. A wildcard costs nothing extra over DNS-01 validation and never names the host, so the build proposes one by default.
 
 ## Phase 1: build the VM
 
@@ -105,7 +108,7 @@ The one-liner at the top works for both paths:
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/rob-paprocki/proxmox-rdgateway/main/windows-rdgw-vm.sh)"
 ```
 
-The unattended path needs five more files to put on the ISO it builds: `Setup-RDGateway.ps1`, `Configure-Guest.ps1`, `Invoke-GatewaySetup.ps1`, `Invoke-CustomScripts.ps1` and `Get-RDGWStatus.ps1`. Each is resolved on its own: a local copy always wins, and only the ones actually missing are fetched. From a checkout nothing is downloaded and your edits are used. Every URL is printed before it is touched.
+The unattended path needs six more files to put on the ISO it builds: `Setup-RDGateway.ps1`, `Configure-Guest.ps1`, `Invoke-GatewaySetup.ps1`, `Invoke-CustomScripts.ps1`, `Get-RDGWStatus.ps1` and `Invoke-WinAcme.ps1`. Each is resolved on its own: a local copy always wins, and only the ones actually missing are fetched. From a checkout nothing is downloaded and your edits are used. Every URL is printed before it is touched.
 
 Those files are copied to the unattend CD and run *inside the guest*. They are never executed on the Proxmox host, and neither is anything you add through the custom-scripts menu.
 
@@ -126,6 +129,7 @@ Say yes to "unattended install" and it asks the following. Nothing here has a sa
 | Local administrator account name | `rdgadmin` | Deliberately not `admin`. Type whatever you want. |
 | Password | none | Asked twice. Leave it empty for a blank password; it will confirm that you meant it. |
 | External FQDN | `rdg.example.com` | Passed straight to `Setup-RDGateway.ps1 -ExternalFqdn`. |
+| Certificate | Install win-acme, leave one command | Three answers, covered below. A self-signed certificate is generated either way. |
 | Windows time zone ID | `Eastern Standard Time` | The Windows name, not the IANA one. `tzutil /l` lists them. |
 | What clients may reach | Any machine the gateway can reach | Three options. "Only machines I name" then asks for a space separated list. See [what the two policies mean](#what-the-two-policies-mean). |
 | Edition | Standard (Desktop Experience) | Picks the image name and the matching GVLK together so they can't drift apart. There are Evaluation entries, which correctly send no key at all. |
@@ -245,6 +249,7 @@ Nothing to do. It is here so you know what is happening and where to look if it 
 4. It installs the edition you chose.
 5. The specialize pass copies the scripts to `C:\Windows\Setup\Scripts`, applies your answers, writes the Default User hive, runs any `System` scripts of yours, and registers a startup task called `RDGW-FirstBoot`.
 6. That task installs the VirtIO guest tools, removes the Defender feature if you asked for that and takes the reboot it needs, installs the RD Gateway role, then runs `Setup-RDGateway.ps1` and checks that the `TSGateway` service came up.
+7. Last, it does whatever you chose for the certificate. That step is last because it needs the role to exist, and because the self-signed certificate is bound by then, so nothing it does can leave you without a working gateway.
 
 Expect two or three reboots and roughly twenty to forty minutes. Everything is timestamped in:
 
@@ -342,22 +347,92 @@ On the shell-only path, inside Windows, before you configure anything:
 
 ## Phase 4: the certificate
 
-If you're going the Let's Encrypt route, do it before running the setup script so the script can just bind the result.
+The build asked you this in Phase 1 and has already acted on it. What follows is what each
+answer left you with.
 
-Download win-acme, unzip it somewhere permanent like `C:\win-acme`, and run `wacs.exe` as admin. Choose the full options menu, pick a manual certificate for your FQDN, and choose **DNS-01** validation with the Cloudflare plugin (it will ask for an API token scoped to `Zone:DNS:Edit` on that zone).
+Whichever you picked, `Setup-RDGateway.ps1` generated a self-signed certificate and bound it,
+because `TSGateway` will not listen on 443 without one. Everything below replaces that. The
+ordering is deliberate: an ACME run that fails for any reason leaves you a working gateway
+holding a certificate nobody trusts, rather than a gateway that is down.
 
-At the installation step there is no "RD Gateway" plugin. win-acme ships two, **IIS bindings** and **Script**. Choose **Script**, and point it at the one win-acme bundles for exactly this job:
+### If you chose "self-signed only"
+
+Every client has to be told to trust it. The public half is exported to
+`C:\Users\Public\Documents\<your-fqdn>.cer`. To trust it on a Windows client without copying
+files around, pull it off the live endpoint and check it against the thumbprint the build
+logged, from an **elevated** PowerShell:
+
+```powershell
+$fqdn = 'rdg.yourdomain.tld'
+$tcp  = [Net.Sockets.TcpClient]::new($fqdn, 443)
+$ssl  = [Net.Security.SslStream]::new($tcp.GetStream(), $false, { $true })
+$ssl.AuthenticateAsClient($fqdn)
+$cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new($ssl.RemoteCertificate)
+$ssl.Dispose(); $tcp.Dispose()
+
+$cert.Thumbprint     # compare against the thumbprint in rdgw-setup.log
+Export-Certificate -Cert $cert -FilePath "$env:TEMP\rdgw.cer" | Out-Null
+Import-Certificate -FilePath "$env:TEMP\rdgw.cer" -CertStoreLocation Cert:\LocalMachine\Root
+```
+
+Check the thumbprint before you import. Trusting whatever an endpoint hands you is
+trust-on-first-use, and this is the one machine on your network that faces the internet.
+
+### If you chose "win-acme installed, one command left" (the default)
+
+win-acme is in `C:\win-acme`, the Cloudflare DNS plugin is beside it, and
+`request-certificate.cmd` is written with your hostname, your email and the RD Gateway
+install script already filled in. One command, from an elevated prompt on the gateway:
+
+```
+C:\win-acme\request-certificate.cmd <your-cloudflare-api-token>
+```
+
+The token needs `Zone:DNS:Edit` on the zone holding that hostname, and nothing else. It is
+passed as an argument rather than stored in the file, so this repo never writes it to disk.
+win-acme keeps its own copy afterwards so it can renew unattended.
+
+That one command requests the certificate over DNS-01, binds it through
+`ImportRDGateway.ps1`, restarts `TSGateway`, and registers a scheduled task that renews and
+re-binds from then on. Nothing further to do, on this or any other device.
+
+### If you chose "Let's Encrypt during the build"
+
+It already ran. `rdgw-setup.log` has the outcome, and `Get-RDGWStatus.ps1` section 7 reports
+the issuer of whatever is actually bound, so a self-signed certificate still sitting there
+shows up as `[ NO ]` rather than passing quietly. If it failed, the log says why and the same
+`request-certificate.cmd` is there to re-run once you have fixed the cause.
+
+Two failure modes are worth knowing in advance. The token has to carry `Zone:DNS:Edit` on a
+zone that actually covers the hostname you asked for. And Let's Encrypt allows **5 duplicate
+certificates per week**, so rebuilding this VM repeatedly with issuance in the build path
+will eventually fail on a rate limit rather than on anything you did wrong. That is the
+reason the staged option is the default.
+
+### Doing it by hand instead
+
+Download win-acme, unzip it to `C:\win-acme`, run `wacs.exe` as admin, choose the full
+options menu, pick a manual certificate for your FQDN, and choose **DNS-01** validation with
+the Cloudflare plugin. At the installation step there is no "RD Gateway" plugin; win-acme
+ships two, **IIS bindings** and **Script**. Choose **Script**:
 
 ```
 Script:     C:\win-acme\Scripts\ImportRDGateway.ps1
 Arguments:  {CertThumbprint}
 ```
 
-That script copies the certificate into `LocalMachine\My` if it isn't there, sets `RDS:\GatewayServer\SSLCertificate\Thumbprint`, and restarts `TSGateway`, which is the same binding call `Setup-RDGateway.ps1` makes. win-acme registers a scheduled task that runs **daily** and renews whenever the certificate falls inside its renewal window (55 days after issue, by default), re-running the script each time.
+Take the **pluggable** build, not the trimmed one. The trimmed build cannot load external
+plugins and every DNS provider is an external plugin, so `--validation cloudflare` will not
+resolve. The Cloudflare plugin is a separate download from the same release.
 
-Then run the setup script with `-CertificateSource Existing -Thumbprint <the thumbprint win-acme reported>`, or just skip the certificate entirely, since win-acme will already have bound it.
+That script copies the certificate into `LocalMachine\My` if it isn't there, sets
+`RDS:\GatewayServer\SSLCertificate\Thumbprint`, and restarts `TSGateway`, which is the same
+binding call `Setup-RDGateway.ps1` makes. win-acme registers a scheduled task that runs
+**daily** and renews whenever the certificate falls inside its renewal window (55 days after
+issue, by default), re-running the script each time.
 
-If you're testing first, let the script make a self-signed one and import the exported `.cer` into **Trusted Root Certification Authorities** on your client machine.
+Then run the setup script with `-CertificateSource Existing -Thumbprint <the thumbprint>`, or
+skip the certificate entirely, since win-acme will already have bound it.
 
 ## Phase 5: configure the gateway
 

@@ -493,4 +493,40 @@ try {
     Write-Line "Could not read the CAP back: $($_.Exception.Message)" 'warn'
 }
 
+# --- 5b. A certificate that clients will actually accept ---------------------
+#
+# Last on purpose, and after the verify above. ImportRDGateway.ps1 writes
+# RDS:\GatewayServer\SSLCertificate\Thumbprint, which does not exist until the
+# RDS-Gateway role does; and the self-signed certificate is already bound by
+# now, so anything that fails here leaves a gateway clients distrust rather
+# than a gateway that is down. An older config with no CertMode reads $null
+# and means self-signed, which is what those builds did.
+$certMode = if ($cfg.CertMode) { $cfg.CertMode } else { 'selfsigned' }
+if ($certMode -eq 'selfsigned') {
+    Write-Line "Certificate: self-signed, chosen at build time. Every client has to import it - README.md Phase 4."
+} else {
+    $acme = Join-Path $ScriptRoot 'Invoke-WinAcme.ps1'
+    if (-not (Test-Path -LiteralPath $acme)) {
+        Write-Line "Invoke-WinAcme.ps1 is not next to this script, so the certificate stays self-signed" 'warn'
+    } else {
+        # No pipe into Add-LogLine here. Invoke-WinAcme.ps1 writes to the log
+        # itself, the same as Configure-Guest.ps1; piping it as well is how you
+        # get every line twice.
+        $acmeArgs = @{
+            Mode            = $(if ($certMode -eq 'auto') { 'Run' } else { 'Stage' })
+            Hostname        = [string] $cfg.AcmeHostname
+            Email           = [string] $cfg.AcmeEmail
+            CloudflareToken = [string] $cfg.CloudflareToken
+            ScriptRoot      = $ScriptRoot
+            LogPath         = $LogPath
+        }
+        if ($cfg.WinAcmeVersion) { $acmeArgs['Version'] = $cfg.WinAcmeVersion }
+        try {
+            & $acme @acmeArgs
+        } catch {
+            Write-Line "Invoke-WinAcme.ps1 failed: $($_.Exception.Message). The self-signed certificate is still bound." 'warn'
+        }
+    }
+}
+
 Complete-Setup $state

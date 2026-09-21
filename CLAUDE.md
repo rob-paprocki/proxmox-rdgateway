@@ -18,6 +18,7 @@ behind one public hostname, using stock RD clients.
 | `Invoke-GatewaySetup.ps1` | The Windows guest, SYSTEM | **Run for real.** Registers in specialize, drives the first boot to the end |
 | `Invoke-CustomScripts.ps1` | The Windows guest | **Executed for real** on Windows PowerShell 5.1, see below |
 | `Get-RDGWStatus.ps1` | The Windows guest, elevated | Read-only. **Run for real** through `qm guest exec` on the 2026-09-21 build; reported every check `[ ok ]` |
+| `Invoke-WinAcme.ps1` | The Windows guest, SYSTEM | Installs win-acme, optionally runs it. **Never run for real yet** |
 | `sample-autounattend.xml` | n/a | Committed sample of generated output. Not read by anything |
 | `vps-relay-setup.sh` | A public VPS | Optional path. Written, dry-run verified, **never run for real** |
 | `proxmox-relay-peer.sh` | Proxmox host, root | Optional path. Written, dry-run verified, **never run for real** |
@@ -276,9 +277,20 @@ requires disabling the UDP transport *and* setting `RDGClientTransport` in
 `HKCU\Software\Microsoft\Terminal Server Client` on **every client**, a per-device registry
 edit, which is exactly what the constraints forbid.
 
-## The open question that decides the architecture
+## The CGNAT question, settled
 
-**Is he behind CGNAT?** Unresolved as of the last exchange.
+**He is not behind CGNAT.** Measured on the host 2026-09-21, after the gateway was up:
+`dig +short <the external FQDN>` and `curl -s https://api.ipify.org` returned the same
+address, in ordinary Comcast space rather than `100.64.0.0/10`. No mismatch and no
+carrier NAT, so the test below passes.
+
+What follows from it: **Option A is the path** and the relay is unnecessary. `RELAY.md`,
+`vps-relay-setup.sh` and `proxmox-relay-peer.sh` stay in the repo because the constraint
+they solve is common and the scripts are written, but they are not this deployment's
+problem. It also means disabling IPv6 on the gateway, which he chose at build time, costs
+nothing here - the v6 route existed as the CGNAT workaround.
+
+The original framing, kept because it is what the two branches mean:
 
 - **Not CGNAT** → forward TCP 443 (and optionally UDP 3391) to the gateway VM, grey-cloud the
   Cloudflare DNS record, done. Free, no extra infrastructure. `README.md` Phase 6 Option A,
@@ -662,6 +674,62 @@ bug will surface.
   but it caps how many datagrams come back and would break the session at runtime. If UDP
   misbehaves, delete the whole second `server` block. TCP 443 alone is complete.
 
+- **win-acme is built in, in three tiers, and the middle one is the default for a reason.**
+  The operator asked whether win-acme should be part of the script, having just hit the
+  self-signed dialog from a real client. It should, and `Invoke-WinAcme.ps1` does it, but
+  full unattended issuance is deliberately not the default:
+  1. **selfsigned** - what the build always did. Offline, no dependencies.
+  2. **staged** (default) - first boot downloads win-acme and writes
+     `C:\win-acme\request-certificate.cmd` with the hostname, the email and the RD Gateway
+     install script already filled in. The operator runs it with the token as argument 1.
+  3. **auto** - the same file, executed during the build with the token from the answer CD.
+
+  Both tiers write and run the *same* `request-certificate.cmd`, so the path taken by hand
+  is the path the automatic tier exercises. The token is argument 1 rather than baked into
+  the file, so nothing here writes it to disk.
+
+  Two facts decided the default, and neither is obvious from the docs. **Let's Encrypt
+  allows 5 duplicate certificates per week.** This repo's whole purpose is repeatable
+  rebuilds, and the operator rebuilt this VM five times in one afternoon; issuance in the
+  default build path would start failing on a rate limit that looks nothing like its cause.
+  And the Cloudflare token would have to live in `rdgw-config.psd1` on the unattend CD.
+  That is a smaller problem than it first appears, because win-acme keeps its own copy on
+  the gateway to renew with - the token is on that box either way. The sharp edge is
+  narrower and worse: **a failed build deliberately keeps its CD** so the retry can use it,
+  which leaves a zone-edit token in ISO storage indefinitely. So `cleanup_media` and the
+  `follow_build` failure branch both name the token specifically when one is present, the
+  psd1 header says outright that it carries one, and `Invoke-WinAcme.ps1` scrubs the field
+  after a successful run.
+
+- **The pluggable win-acme build, not the trimmed one, and the Cloudflare plugin is a
+  separate download.** Checked against the v2.2.9.1701 release rather than guessed at. The
+  trimmed build cannot load external plugins and *every* DNS provider is an external
+  plugin, so trimmed plus `--validation cloudflare` fails at run time with an unhelpful
+  message. Two downloads, both pinned to one version so they match:
+  `win-acme.v<ver>.x64.pluggable.zip` and `plugin.validation.dns.cloudflare.v<ver>.zip`.
+  `WINACME_VERSION` overrides it. `ImportRDGateway.ps1` does ship in the release zip and
+  takes the thumbprint **positionally** - its own header explains that dashes in a cmd
+  wrapper are why - which is what `--scriptparameters "{CertThumbprint}"` produces.
+
+- **The certificate step runs last, after the verify, and a failure there is a warning.**
+  `ImportRDGateway.ps1` writes `RDS:\GatewayServer\SSLCertificate\Thumbprint`, which does
+  not exist until the RDS-Gateway role does. More importantly the self-signed certificate
+  is already bound by then, so an ACME run that fails for any reason - no propagation, a
+  bad token, a rate limit - leaves a gateway clients distrust rather than a gateway that is
+  down. Do not "improve" this by skipping the self-signed step when win-acme is coming.
+  `Invoke-WinAcme.ps1` is also called **without** a pipe into `Add-LogLine`, because it
+  writes to `rdgw-setup.log` itself the way `Configure-Guest.ps1` does; piping it as well
+  prints every line twice.
+
+- **The certificate prompt defaults to a wildcard, and the guard is the point.**
+  `rdg.example.com` proposes `*.example.com`, which keeps the gateway's name
+  out of the Certificate Transparency logs - the same reasoning as the CT note in the
+  README's hardening section, applied at the moment it is actually decidable. The guard:
+  a two-label FQDN has no subdomain to drop, and naively stripping one would turn
+  `example.com` into `*.com`, which is a request to a public CA for an entire TLD. Covered
+  by `test-cert.sh`, along with an empty token degrading to `staged` rather than running
+  win-acme with no credential.
+
 ## Next steps
 
 1. Settle the CGNAT question. It decides everything downstream.
@@ -680,6 +748,17 @@ bug will surface.
    succeeds, so there is nothing to remember here any more - see `cleanup_media`. It still
    matters on the **shell-only** path, and whenever `KEEP_MEDIA=1` was set: that ISO holds
    the account password in clear text and `qm destroy` does not remove it.
+   With `CertMode = 'auto'` that ISO also holds a Cloudflare token, and a build that FAILED
+   keeps its media on purpose. The script says so on that path; act on it.
+7. **Nothing in the win-acme path has been run against a real ACME server yet.** The build
+   that proved the rest of this repo out on 2026-09-21 predates it and ended on a
+   self-signed certificate, which is the dialog that prompted the feature. What is verified
+   is the shape: three modes round-trip through the psd1 with the right types, the wildcard
+   guard holds, an empty token degrades to `staged`, and every file parses and lints. What
+   is not verified is a real issuance: DNS-01 propagation timing, whether the Cloudflare
+   plugin loads from the pluggable build as documented, and whether `ImportRDGateway.ps1`
+   binds a real certificate - that last one being the only remaining item in "Assumed,
+   never executed" that a real run would close.
 6. Each target machine needs only: RDP enabled, his account in its local Remote Desktop Users
    group, firewall allowing 3389 from the gateway, and a name the gateway can resolve.
    Windows Pro is fine as a target; only the gateway has to be Server.
