@@ -430,6 +430,48 @@ if ($ShellForCurrentUser) {
 }
 
 # ------------------------------------------------------------------------------
+# 0b. VirtIO guest tools - deliberately the very first thing
+#
+#     Order matters here for a reason that has nothing to do with Windows. The
+#     builder on the Proxmox host cannot read this log until the QEMU guest
+#     agent is answering, and the agent arrives with these tools. Install them
+#     last and the operator watches a blank progress heartbeat for a quarter of
+#     an hour before any of the real output appears; install them first and
+#     follow_build starts printing actual lines almost immediately.
+#
+#     Above the ApplyTweaks gate for the same reason it always was: that gate
+#     answers a prompt describing itself as cosmetic, and the guest agent is
+#     not cosmetic. Without it Proxmox cannot read the VM address, shut it down
+#     cleanly or quiesce it for a backup.
+# ------------------------------------------------------------------------------
+Write-Step "VirtIO guest tools"
+
+$guestTools = $null
+foreach ($d in [char[]]'DEFGHIJKLMNOPQRSTUVWXYZ') {
+    $candidate = "${d}:\virtio-win-guest-tools.exe"
+    if (Test-Path -LiteralPath $candidate) { $guestTools = $candidate; break }
+}
+
+if (-not $guestTools) {
+    Write-Skip "virtio-win-guest-tools.exe not found on any drive - is the VirtIO CD still attached? Install it by hand later"
+} else {
+    try {
+        $p = Start-Process -FilePath $guestTools -ArgumentList '/passive', '/norestart' `
+            -Wait -PassThru -ErrorAction Stop
+        # Same reason as Invoke-CustomScripts.ps1: without touching Handle,
+        # ExitCode reads back empty once the child is gone.
+        $null = $p.Handle
+        if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) {
+            Write-Good "Installed $guestTools (exit $($p.ExitCode))"
+        } else {
+            Write-Bad "$guestTools exited $($p.ExitCode)"
+        }
+    } catch {
+        Write-Bad "Could not run ${guestTools}: $($_.Exception.Message)"
+    }
+}
+
+# ------------------------------------------------------------------------------
 # 1. Account lockout
 #
 #    Threshold 0 disables lockout entirely. Anything else sets the threshold,
@@ -522,51 +564,6 @@ if ($cfg.DisableCad) {
 }
 
 Invoke-DefaultUserHive
-# ------------------------------------------------------------------------------
-# 7b. VirtIO guest tools
-#
-#     Above the ApplyTweaks gate on purpose. The gate answers a prompt that
-#     calls itself cosmetic and not security relevant; the QEMU guest agent is
-#     neither. Without it Proxmox cannot read the VM's IP, cannot shut it down
-#     gracefully, and cannot quiesce the filesystem for a backup - so a gateway
-#     built with housekeeping declined would silently be the worse machine.
-#
-#     The runbook used to tell the operator to run this by hand after first
-#     boot. It is the one step of that list a script can simply do, and doing
-#     it here means it happens while the VirtIO CD is still attached, before
-#     anyone is told to detach the CDs.
-#
-#     Not fatal if missing: the drivers are already installed from
-#     $WinPEDriver$, so a box without the tools still boots, networks and uses
-#     its disk. Only the agent is lost, and the log says so.
-# ------------------------------------------------------------------------------
-Write-Step "VirtIO guest tools"
-
-$guestTools = $null
-foreach ($d in [char[]]'DEFGHIJKLMNOPQRSTUVWXYZ') {
-    $candidate = "${d}:\virtio-win-guest-tools.exe"
-    if (Test-Path -LiteralPath $candidate) { $guestTools = $candidate; break }
-}
-
-if (-not $guestTools) {
-    Write-Skip "virtio-win-guest-tools.exe not found on any drive - is the VirtIO CD still attached? Install it by hand later"
-} else {
-    try {
-        $p = Start-Process -FilePath $guestTools -ArgumentList '/passive', '/norestart' `
-            -Wait -PassThru -ErrorAction Stop
-        # Same reason as Invoke-CustomScripts.ps1: without touching Handle,
-        # ExitCode reads back empty once the child is gone.
-        $null = $p.Handle
-        if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) {
-            Write-Good "Installed $guestTools (exit $($p.ExitCode))"
-        } else {
-            Write-Bad "$guestTools exited $($p.ExitCode)"
-        }
-    } catch {
-        Write-Bad "Could not run ${guestTools}: $($_.Exception.Message)"
-    }
-}
-
 if (-not $cfg.ApplyTweaks) {
     Write-Step "Server housekeeping"
     Write-Skip "Skipped - not requested at build time"
