@@ -340,10 +340,19 @@ bug will surface.
   `--tpmstate0 <storage>:1,version=v2.0` come from docs and forum usage, not from a run here.
 - The WMI calls have never run against a real RD Gateway. If something breaks first, expect
   it here.
-- `Administrators@BUILTIN` / `Remote Desktop Users@BUILTIN` for local groups on a
-  non-domain-joined gateway comes from a published workgroup example. Microsoft's own class
-  reference documents `UserGroupNames` as `Domain\UserGroupName`. **Verify after the first
-  run** — the script prints `UserGroupNames` back specifically so this is checkable:
+- **Settled on real hardware, and the guess was wrong.** `Administrators@BUILTIN` /
+  `Remote Desktop Users@BUILTIN` came from a published workgroup example, and the gateway
+  refuses it: `Win32_TSGatewayConnectionAuthorizationPolicy.Create returned 2147943732`,
+  which is `0x80070534`, **ERROR_NONE_MAPPED**. The provider resolves names through
+  `LookupAccountName`, which takes `DOMAIN\Name` or a bare `Name`, but not the UPN-style
+  `Name@Domain` unless it is a real domain principal. Measured: `Administrators@BUILTIN`
+  fails to translate, `BUILTIN\Administrators` gives `S-1-5-32-544`,
+  `BUILTIN\Remote Desktop Users` gives `S-1-5-32-555`. Microsoft's class reference
+  documented `Domain\UserGroupName` the whole time - an example someone got working is not
+  a specification. The default is now the `BUILTIN\` form, and `Setup-RDGateway.ps1`
+  translates every group to a SID **before** calling `Create`, so a name that cannot
+  resolve is reported by name instead of as a bare WMI number. The readback below is still
+  worth running:
   ```powershell
   Get-CimInstance -Namespace root/cimv2/TerminalServices `
     -ClassName Win32_TSGatewayConnectionAuthorizationPolicy | Select-Object UserGroupNames
