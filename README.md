@@ -534,8 +534,12 @@ Event **200** means the client reached the gateway. **300** means the RAP author
 qm stop <VMID> && qm destroy <VMID> --destroy-unreferenced-disks 1 --purge
 ```
 
-Destroying the VM does not remove the unattend ISO, which lives in ISO storage and holds the
-account password in clear text. Delete it separately:
+A build that ran to completion has already deleted its unattend ISO and detached the CDs —
+that happens automatically once the gateway reports itself finished. You only need the
+command below if the build failed part way, if you set `KEEP_MEDIA=1`, or if you are
+tearing down a VM built before that was the behaviour. It matters because destroying the VM
+does not remove the ISO, which lives in ISO storage and holds the account password in clear
+text:
 
 ```bash
 rm /var/lib/vz/template/iso/unattend-<VMID>.iso

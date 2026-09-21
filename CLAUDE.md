@@ -505,6 +505,41 @@ bug will surface.
   takes about a minute and brings up the agent that `follow_build` needs, while Defender
   takes ten and produces nothing anyone can watch. It does **not** run in specialize -
   see the 1603 entry under "Ruled out".
+- **The agent MSI goes in before the bundle, and that ordering is the feature.**
+  `virtio-win-guest-tools.exe` installs the balloon, serial, input and SPICE components and
+  takes a couple of minutes. The only part anybody is waiting on is `qemu-ga`, because until
+  it answers, `follow_build` cannot read a line of the guest log and prints a byte counter
+  instead. The VirtIO CD ships the agent separately as
+  `<drive>\guest-agent\qemu-ga-x86_64.msi` - confirmed present on the operator's
+  virtio-win-0.1.302 media alongside `qemu-ga-i386.msi` - and it installs in seconds. So
+  `Invoke-GuestToolsInstall` runs that first with `msiexec /i "<path>" /qn /norestart`, then
+  the full bundle. A failure on the agent MSI is a `[skip]`, not a `[fail]`: the bundle
+  installs the agent too, so the only cost is the host staying blind a minute or two longer.
+  The path is quoted inside the `ArgumentList` for the `Invoke-Child` reason - `Start-Process`
+  joins with plain spaces and quotes nothing.
+- **The builder takes the media away itself once the build succeeds, and the unattend ISO
+  is why.** That CD carries the account password in clear text and `qm destroy` does not
+  remove it, so the old advice - two commands in the closing summary for the operator to run
+  "when it is finished" - left a password on disk for however long it took someone to
+  remember. `cleanup_media` detaches `ide0`, `ide2` and `sata0`, sets `--boot order=scsi0`
+  and deletes the ISO. It runs **only** after `follow_build` returned 0, and the ordering in
+  the source is load-bearing: `follow_build || exit 1` comes first, so a failed build never
+  reaches it. That matters because the first-boot task stays registered and a reboot retries,
+  and the retry installs the guest tools off the VirtIO CD. `KEEP_MEDIA=1` opts out and says
+  plainly that the password is still sitting there. Covered by `test-cleanup.sh`, including
+  the structural check that a failed build cannot reach it.
+- **IPv6 is a prompt, and the consequence stated in it is this project's, not Windows'.**
+  The other toggles are security ones; this is not. `DisabledComponents = 0xFF` is the
+  documented switch for "disable IPv6 on all interfaces and tunnels" while leaving the
+  protocol installed - do not go looking for a way to remove it outright, Microsoft does not
+  support that and Windows components assume v6 is there. `Disable-NetAdapterBinding` on
+  `ms_tcpip6` goes in alongside it for anything that reads the binding rather than the
+  policy, and a failure there is a `[skip]` because the policy value is what decides.
+  The reason the prompt spells out is the CGNAT one above: most ISPs hand out a routable v6
+  prefix even when v4 is carrier-graded, so an AAAA record and a firewall rule reach the
+  gateway with no relay, no port forward and no spend. Turning v6 off gives that up. Default
+  is to leave it on. A config file that predates the key reads `$null`, which is falsy, so
+  an old `rdgw-config.psd1` means "leave enabled" rather than an error.
 - **Edge first-run is suppressed by machine-wide policy, deliberately.**
   `HKLM\SOFTWARE\Policies\Microsoft\Edge\HideFirstRunExperience = 1`, plus
   `StartupBoostEnabled` and `BackgroundModeEnabled` off under `...\Edge\Recommended`, all
@@ -622,8 +657,10 @@ bug will surface.
    (Setup shows **no disks** until `vioscsi\2k25\amd64` is loaded from the second CD, which
    is expected), then run `Setup-RDGateway.ps1` with `-TargetMachines` listing every machine
    he wants to reach and check the same readback.
-5. Delete the unattend ISO from Proxmox storage afterwards. It holds the account password in
-   clear text, and `qm destroy` does not remove it.
+5. The unattended path deletes the unattend ISO and detaches the CDs itself once the build
+   succeeds, so there is nothing to remember here any more - see `cleanup_media`. It still
+   matters on the **shell-only** path, and whenever `KEEP_MEDIA=1` was set: that ISO holds
+   the account password in clear text and `qm destroy` does not remove it.
 6. Each target machine needs only: RDP enabled, his account in its local Remote Desktop Users
    group, firewall allowing 3389 from the gateway, and a name the gateway can resolve.
    Windows Pro is fine as a target; only the gateway has to be Server.

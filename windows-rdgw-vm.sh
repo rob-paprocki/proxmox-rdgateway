@@ -37,6 +37,10 @@
 #      NO_WAIT            1 to exit as soon as the VM starts instead of
 #                         following the build to the end (default 0)
 #      FOLLOW_SECONDS     how long to follow before giving up (default 3600)
+#      KEEP_MEDIA         1 to leave the CDs attached and keep the unattend
+#                         ISO after a successful build (default 0 - they are
+#                         detached and the ISO is deleted, because it holds
+#                         the account password in clear text)
 #
 #  What it touches on the network:
 #
@@ -117,6 +121,13 @@ BOOT_KEY_MAX="${BOOT_KEY_MAX:-10}"
 # still ahead of it. NO_WAIT=1 restores the old behaviour.
 NO_WAIT="${NO_WAIT:-0}"
 FOLLOW_SECONDS="${FOLLOW_SECONDS:-3600}"
+
+# Take the CDs away once the build has finished, and delete the unattend ISO
+# with them. On by default, and the ISO is the reason: it carries the account
+# password in clear text and `qm destroy` does not remove it, so leaving it for
+# the operator to tidy up later means leaving a password on disk for exactly as
+# long as they forget. KEEP_MEDIA=1 keeps the old behaviour.
+KEEP_MEDIA="${KEEP_MEDIA:-0}"
 
 # Scripts of your own, in the four categories the schneegans.de generator uses.
 # CUSTOM_STAGE is a mktemp tree laid out as <category>/<filename>, created only
@@ -991,6 +1002,15 @@ unattend_settings() {
   whiptail --backtitle "$APP" --title "Core Isolation" \
     --yesno "Disable Core Isolation (VBS / HVCI)?\n\nYou are already paying for the TPM and Secure Boot this VM was given.\n\nDefault is to leave it at the Windows setting." 13 72 --defaultno && DISABLE_CORE_ISOLATION="true"
 
+  # Not a security toggle, and the consequence here is specific to this
+  # project rather than to Windows. The answer to CGNAT in CLAUDE.md is that
+  # most ISPs hand out a routable v6 prefix even when v4 is carrier-graded, so
+  # an AAAA record and a firewall rule reach this gateway with no relay, no
+  # port forward and no spend. Turning v6 off closes that door.
+  DISABLE_IPV6="false"
+  whiptail --backtitle "$APP" --title "IPv6" \
+    --yesno "Disable IPv6 on this machine?\n\nIf your ISP gives you a routable IPv6 prefix, an AAAA record plus a firewall rule reaches this gateway without a relay or a port forward - which is the free way around CGNAT. Disabling v6 gives that up.\n\nMicrosoft advises against disabling it; Windows expects v6 to be there.\n\nDefault is to leave IPv6 on." 17 72 --defaultno && DISABLE_IPV6="true"
+
   # The odd one out: defaults to ON, because sending Ctrl+Alt+Del to a Proxmox
   # console is a menu trip rather than a keystroke.
   DISABLE_CAD="true"
@@ -1368,6 +1388,7 @@ generate_config_psd1() {
     DisableDefender      = \$${DISABLE_DEFENDER}
     DisableCoreIsolation = \$${DISABLE_CORE_ISOLATION}
     DisableCad           = \$${DISABLE_CAD}
+    DisableIPv6          = \$${DISABLE_IPV6}
 
     ApplyTweaks          = \$${APPLY_TWEAKS}
 }
@@ -2197,8 +2218,10 @@ ${BOLD}Reachable through the gateway${CL}
 ${RESOURCE_SUMMARY}
 
 ${BOLD}When it is finished${CL}
-   Detach the media and delete the unattend CD — it holds the account password
-   in clear text:
+   This script detaches the CDs, sets the boot order to the disk, and deletes
+   the unattend ISO — it holds the account password in clear text, and
+   ${BL}qm destroy${CL} would not have removed it. Set ${BL}KEEP_MEDIA=1${CL} to keep them;
+   then it is yours to run:
    ${DIM}\$ qm set ${VMID} --ide0 none --ide2 none --sata0 none --boot order=scsi0${CL}
    ${DIM}\$ rm ${UNATTEND_ISO_PATH}${CL}
 
@@ -2254,9 +2277,35 @@ ${BOLD}6. Configure the gateway${CL}
 EOF
 fi
 
+# Take the media away, now that nothing needs it.
+#
+# This used to be two commands in the closing summary for the operator to run
+# later, and the unattend CD is not ordinary housekeeping: it carries the
+# account password in clear text, `qm destroy` does not remove it, and "later"
+# is however long it takes someone to remember. Doing it here means the
+# password stops existing at the moment it stops being needed.
+#
+# Only ever after follow_build returned 0. A build that failed wants its media
+# exactly where it is, because the first-boot task stays registered and a
+# reboot retries - and that retry needs the VirtIO CD it installs the guest
+# tools from. KEEP_MEDIA=1 opts out.
+cleanup_media() {
+  if [[ "$KEEP_MEDIA" == "1" ]]; then
+    msg_warn "KEEP_MEDIA=1 - the CDs stay attached and ${BL}${UNATTEND_ISO_PATH}${CL}"
+    msg_warn "stays on disk. It holds the account password in clear text; delete it yourself."
+    return 0
+  fi
+
+  msg_info "Taking the media away - the build is done and nothing needs it now"
+  run qm set "$VMID" --ide0 none --ide2 none --sata0 none --boot order=scsi0
+  run rm -f "$UNATTEND_ISO_PATH"
+  msg_ok "CDs detached, booting from disk, unattend ISO deleted with its password"
+}
+
 # Everything above told the operator what is about to happen. Now stay and watch
 # it happen, rather than exiting on a promise - see follow_build.
 if [[ "$UNATTEND" == "yes" && "$START_VM" == "yes" && "$DRY_RUN" != "1" ]]; then
   printf "\n"
   follow_build || exit 1
+  cleanup_media
 fi

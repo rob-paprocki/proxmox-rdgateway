@@ -377,10 +377,48 @@ function Invoke-DefenderRemoval {
 function Invoke-GuestToolsInstall {
     Write-Step "VirtIO guest tools"
 
+    # Two installs, and the order is the whole point. The bundle lays down the
+    # balloon, serial, input and SPICE components and takes a couple of
+    # minutes; the agent it also carries is the one piece anybody is waiting
+    # for, because until qemu-ga answers the builder on the Proxmox host cannot
+    # read a single line of this log and just prints a byte counter. The CD
+    # ships that agent on its own as guest-agent\qemu-ga-x86_64.msi, which is a
+    # few seconds. So put it in first, let the host start streaming, and then
+    # spend the minutes on everything else.
+    $agentMsi = $null
     $guestTools = $null
     foreach ($d in [char[]]'DEFGHIJKLMNOPQRSTUVWXYZ') {
-        $candidate = "${d}:\virtio-win-guest-tools.exe"
-        if (Test-Path -LiteralPath $candidate) { $guestTools = $candidate; break }
+        if (-not $agentMsi) {
+            $c = "${d}:\guest-agent\qemu-ga-x86_64.msi"
+            if (Test-Path -LiteralPath $c) { $agentMsi = $c }
+        }
+        if (-not $guestTools) {
+            $c = "${d}:\virtio-win-guest-tools.exe"
+            if (Test-Path -LiteralPath $c) { $guestTools = $c }
+        }
+        if ($agentMsi -and $guestTools) { break }
+    }
+
+    if (-not $agentMsi) {
+        Write-Skip "No guest-agent\qemu-ga-x86_64.msi on any drive - the agent arrives with the bundle below instead, a couple of minutes later"
+    } else {
+        try {
+            # Start-Process joins ArgumentList with plain spaces and quotes
+            # nothing, so the path is quoted here. See Invoke-Child.
+            $p = Start-Process -FilePath 'msiexec.exe' `
+                -ArgumentList '/i', "`"$agentMsi`"", '/qn', '/norestart' `
+                -Wait -PassThru -ErrorAction Stop
+            $null = $p.Handle
+            if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) {
+                Write-Good "QEMU guest agent in from $agentMsi (exit $($p.ExitCode)) - the host can read this log from here on"
+            } else {
+                # Not a failure: the bundle installs the agent too. It only
+                # means the host stays blind for another minute or two.
+                Write-Skip "$agentMsi exited $($p.ExitCode) - falling back to the bundle for the agent"
+            }
+        } catch {
+            Write-Skip "Could not run msiexec on ${agentMsi}: $($_.Exception.Message)"
+        }
     }
 
     if (-not $guestTools) {
@@ -570,6 +608,37 @@ if ($cfg.DisableCoreIsolation) {
     Write-Good "VBS and HVCI disabled - chosen at build time"
 } else {
     Write-Skip "Left at the Windows default"
+}
+
+# ------------------------------------------------------------------------------
+# 5b. IPv6
+#
+#     DisabledComponents is the documented switch, and 0xFF is the documented
+#     value for "disable IPv6 on all interfaces and tunnels" while leaving the
+#     protocol installed. Do not go looking for a way to remove it outright:
+#     Microsoft does not support that and Windows components assume v6 is
+#     present. Unbinding ms_tcpip6 as well covers anything that reads the
+#     adapter binding rather than the policy value.
+#
+#     Only touched when the operator asked for it at build time. Windows ships
+#     with IPv6 on, Microsoft recommends leaving it on, and for this project
+#     there is a second reason in CLAUDE.md: a routable v6 prefix is the free
+#     way around CGNAT, needing only an AAAA record and a firewall rule.
+# ------------------------------------------------------------------------------
+Write-Step "IPv6"
+if ($cfg.DisableIPv6) {
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' 'DisabledComponents' 0xFF
+    try {
+        Disable-NetAdapterBinding -Name '*' -ComponentID 'ms_tcpip6' -ErrorAction Stop
+        Write-Good "IPv6 unbound from every adapter"
+    } catch {
+        # Specialize may run before the adapters are enumerated. The policy
+        # value above is the one that actually decides, so this is a note.
+        Write-Skip "Could not unbind IPv6 from the adapters: $($_.Exception.Message)"
+    }
+    Write-Good "IPv6 disabled - chosen at build time. Takes effect at the next reboot."
+} else {
+    Write-Skip "Left enabled - the Windows default, and a routable v6 prefix is the free way past CGNAT"
 }
 
 # ------------------------------------------------------------------------------

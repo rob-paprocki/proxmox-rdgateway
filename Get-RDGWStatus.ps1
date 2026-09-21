@@ -206,6 +206,9 @@ Compare-Setting 'DisableCoreIsolation' $(if ($cfg) { $cfg.DisableCoreIsolation }
                 $(if ($null -eq $vbs) { $null } else { -not $vbs }) `
                 "HVCI running=$vbs"
 
+Compare-Setting 'DisableIPv6' $(if ($cfg) { $cfg.DisableIPv6 } else { $null }) `
+                $((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' 'DisabledComponents') -eq 0xFF)
+
 Compare-Setting 'BlankPassword' $(if ($cfg) { $cfg.BlankPassword } else { $null }) `
                 $((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LimitBlankPasswordUse') -eq 0)
 
