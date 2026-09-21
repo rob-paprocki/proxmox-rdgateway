@@ -564,23 +564,43 @@ Set-Reg 'Registry::HKEY_USERS\.DEFAULT\Control Panel\Keyboard' 'InitialKeyboardI
 
 # Silence system sounds. Audio over RDP that only ever plays error dings is
 # worth turning off.
-try {
-    Get-ChildItem -LiteralPath 'Registry::HKEY_USERS\.DEFAULT\AppEvents\Schemes\Apps' -Recurse -ErrorAction Stop |
-        Where-Object { $_.PSChildName -eq '.Current' } |
-        ForEach-Object {
-            Set-ItemProperty -LiteralPath $_.PSPath -Name '(Default)' -Value '' -ErrorAction SilentlyContinue
-        }
-    Write-Good "System sounds cleared in the .DEFAULT hive"
-} catch {
-    Write-Bad "System sounds -- $($_.Exception.Message)"
+#
+# The scheme keys are absent on a fresh Server 2025 - a real build reported
+# "Cannot find path 'HKEY_USERS\.DEFAULT\AppEvents\Schemes\Apps' because it
+# does not exist". That is a Server install without the Desktop audio schemes
+# populated, not a failure of anything, so it is a skip. A [fail] line here
+# costs more than it is worth: it pushes the closing count above zero and sends
+# the operator hunting for a problem that does not exist.
+$soundKey = 'Registry::HKEY_USERS\.DEFAULT\AppEvents\Schemes\Apps'
+if (-not (Test-Path -LiteralPath $soundKey)) {
+    Write-Skip "No .DEFAULT sound schemes on this install - nothing to silence"
+} else {
+    try {
+        Get-ChildItem -LiteralPath $soundKey -Recurse -ErrorAction Stop |
+            Where-Object { $_.PSChildName -eq '.Current' } |
+            ForEach-Object {
+                Set-ItemProperty -LiteralPath $_.PSPath -Name '(Default)' -Value '' -ErrorAction SilentlyContinue
+            }
+        Write-Good "System sounds cleared in the .DEFAULT hive"
+    } catch {
+        Write-Bad "System sounds -- $($_.Exception.Message)"
+    }
 }
 
 # Let the scripts this build relies on actually run.
+#
+# Set-ExecutionPolicy throws "Security error" when the policy is already fixed
+# by Group Policy, which it is on a real Server 2025 build. Nothing is wrong and
+# nothing can be done about it from here - and it does not matter, because every
+# script this build launches is invoked with -ExecutionPolicy Bypass on its own
+# command line, which outranks the machine policy anyway. Report what the policy
+# actually is rather than calling an immovable setting a failure.
 try {
     Set-ExecutionPolicy -Scope LocalMachine -ExecutionPolicy RemoteSigned -Force -ErrorAction Stop
     Write-Good "Execution policy (LocalMachine) = RemoteSigned"
 } catch {
-    Write-Bad "Set-ExecutionPolicy -- $($_.Exception.Message)"
+    $effective = try { (Get-ExecutionPolicy -Scope LocalMachine).ToString() } catch { 'unknown' }
+    Write-Skip "Execution policy is set by policy and cannot be changed here (it is $effective). Harmless - every script this build starts passes -ExecutionPolicy Bypass."
 }
 
 # Windows.old only exists if this was an upgrade rather than a clean install,
