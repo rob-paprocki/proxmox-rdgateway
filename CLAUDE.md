@@ -929,6 +929,16 @@ bug will surface.
 - The RD authorization policies go through the documented `Win32_TSGateway*` WMI classes
   rather than the `RDS:` provider, because the WMI method signatures are explicit about what
   each flag means. Certificate binding is the one exception.
+- **This repo is public, so the operator's real hostname and WAN address do not go in it,
+  and that includes this file.** CLAUDE.md is a working document and it is also a file
+  anyone can read on GitHub. The gateway's FQDN next to "Windows Server 2025 RD Gateway on
+  443, account `rdgadmin`, these exact authorization policies" is a much better starting
+  point for someone scanning than either half is alone. Write `rdg.example.com`,
+  `<the external FQDN>` or `<the WAN address>` instead and keep the real values in the
+  operator's own notes. A measurement loses nothing: what mattered about the CGNAT check
+  was that both answers agreed and neither was in `100.64.0.0/10`, which the redacted
+  version still says. Redacting here does not remove anything from the commit history, so
+  run `git log -S'<the value>' --all` before believing it is gone.
 - Prose over bullet lists in docs. Be direct about what isn't known.
 
 ## Licensing note
