@@ -45,7 +45,15 @@ param(
     # so it fires at the first interactive logon - including the AutoLogon
     # account, which is the one account the Default User hive cannot reach.
     # See Set-ShellSetting.
-    [switch] $ShellForCurrentUser
+    [switch] $ShellForCurrentUser,
+
+    # Do only the Default User hive work and exit. Called from the specialize
+    # pass by Invoke-GatewaySetup.ps1 -Register, which is the correct moment for
+    # it: Windows has not created a single profile yet, so what lands in the
+    # hive is genuinely inherited by the first account. Doing it from the
+    # first-boot task instead loses a race against AutoLogon, which is how a
+    # real build ended up with a centred taskbar and the light theme.
+    [switch] $DefaultUserOnly
 )
 
 $ErrorActionPreference = 'Continue'
@@ -196,6 +204,112 @@ function Restart-ExplorerHere {
     }
 }
 
+# ------------------------------------------------------------------------------
+# 7. Shell settings for every account created from here on
+#
+#    These live in HKCU, so they are written into the Default User hive and new
+#    profiles inherit them. That covers every account made later and is worth
+#    doing - but it does NOT cover the AutoLogon account, whose profile is
+#    copied out of this hive at about the moment this script is writing it. On
+#    a real build that race was lost. The same settings are therefore applied a
+#    second time, per user, by -ShellForCurrentUser at first logon. Neither
+#    half is redundant: this one reaches future profiles, that one reaches the
+#    account the operator is actually looking at.
+# ------------------------------------------------------------------------------
+function Invoke-DefaultUserHive {
+    # Everything that has to happen BEFORE any profile exists. Called twice by
+    # two different callers, and only one of them normally does the work:
+    #
+    #   specialize, via Invoke-GatewaySetup.ps1 -Register ->
+    #       Configure-Guest.ps1 -DefaultUserOnly. This is the correct moment.
+    #       Windows has not created a single profile yet, so what goes into the
+    #       hive is genuinely inherited by the first account.
+    #
+    #   the first-boot task, as a fallback, if the specialize call did not run
+    #       or did not finish.
+    #
+    # It used to run only from the first-boot task, and that loses a race it
+    # cannot win: AutoLogon creates the first profile from this hive at about
+    # the moment this code is writing it. On a real build the profile won and
+    # the operator got a centred taskbar and the light theme having asked for
+    # neither. cschneegans/unattend-generator does the hive in specialize for
+    # this reason - reg load, script, reg unload as three separate commands.
+    #
+    # The marker file is what stops the DefaultUser custom scripts running
+    # twice. The shell settings are idempotent registry writes and would not
+    # care, but someone else's script is not required to be.
+    Write-Step "Shell settings (Default User hive)"
+
+    $defaultHive = 'C:\Users\Default\NTUSER.DAT'
+    $mountPoint = 'HKU\rdgwDefault'
+    $loaded = $false
+
+    if (Test-Path -LiteralPath $defaultHive) {
+        & reg.exe load $mountPoint $defaultHive 2>&1 | Out-Null
+        $loaded = ($LASTEXITCODE -eq 0)
+    }
+
+    if (-not $loaded) {
+        Write-Skip "Could not load the Default User hive - shell settings skipped, everything above still applied"
+    } else {
+        $u = 'Registry::HKEY_USERS\rdgwDefault'
+
+        # The shell defaults below are cosmetic and belong to the housekeeping
+        # answer. Everything after them does not: your DefaultUser scripts and the
+        # UserOnce registration have nothing to do with taskbar layout, so they run
+        # either way.
+        # Everything between here and the unload is wrapped, because an unmounted
+        # hive is not optional. reg.exe keeps NTUSER.DAT open for as long as it is
+        # loaded, so a script that throws half way through used to leave the Default
+        # User profile locked for the rest of setup - and every profile created
+        # afterwards inherits from a file nothing can write to. cschneegans'
+        # generator sidesteps this by making load, run and unload three separate
+        # answer-file commands, so a failing script cannot skip the unload. We run
+        # inside one script, so try/finally is how we get the same guarantee.
+        try {
+            if ($cfg.ApplyTweaks) {
+                Set-ShellSetting -Root $u
+            } else {
+                Write-Skip "Shell defaults skipped - housekeeping was not requested"
+            }
+
+            # Anything you supplied for the DefaultUser category runs here, while the
+            # hive is still mounted, so what it writes is inherited by every profile
+            # created afterwards. The UserOnce registration goes in for the same
+            # reason: a RunOnce value in this hive is inherited by each new profile and
+            # fires at that user's first logon, then deletes itself.
+            $runner = Join-Path $script:Root 'Invoke-CustomScripts.ps1'
+            if (Test-Path -LiteralPath $runner) {
+                try {
+                    & $runner -Category DefaultUser -HiveRoot $mountPoint
+                } catch {
+                    Write-Bad "Custom DefaultUser scripts failed: $($_.Exception.Message)"
+                }
+
+                $userOnceDir = Join-Path $script:Root 'custom\UserOnce'
+                $userOnceCount = 0
+                if (Test-Path -LiteralPath $userOnceDir) {
+                    $userOnceCount = @(Get-ChildItem -LiteralPath $userOnceDir -File -ErrorAction SilentlyContinue).Count
+                }
+                if ($userOnceCount -gt 0) {
+                    $cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Category UserOnce' -f $runner
+                    Set-Reg "$u\Software\Microsoft\Windows\CurrentVersion\RunOnce" 'RDGWUserOnce' $cmd 'String'
+                    Write-Good "UserOnce scripts ($userOnceCount) registered for every new profile"
+                }
+            }
+        }
+        finally {
+            [gc]::Collect()
+            & reg.exe unload $mountPoint 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Good "Default User hive written and unloaded"
+            } else {
+                Write-Bad "Default User hive written but would not unload - a reboot clears this"
+            }
+        }
+    }
+}
+
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
     Write-Bad "No config file at $ConfigPath. Nothing to do."
     exit 1
@@ -209,6 +323,18 @@ $cfg = Import-PowerShellDataFile -LiteralPath $ConfigPath
 #    value the answer file writes. Everything here is cosmetic, so it touches
 #    nothing else and never fails the build.
 # ------------------------------------------------------------------------------
+if ($DefaultUserOnly) {
+    Invoke-DefaultUserHive
+    try {
+        Set-Content -LiteralPath (Join-Path $script:Root 'rdgw-defaultuser.done') `
+            -Value ((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')) -Encoding ASCII -ErrorAction Stop
+    } catch {
+        Write-Bad "Could not write the marker file, so the first-boot task will redo this: $($_.Exception.Message)"
+    }
+    Write-Step "Done"
+    exit 0
+}
+
 if ($ShellForCurrentUser) {
     Write-Step "Shell settings (current user: $env:USERNAME)"
 
@@ -369,89 +495,13 @@ if ($cfg.DisableCad) {
     Write-Good "Ctrl+Alt+Del required to log on (Proxmox console: the toolbar sends it)"
 }
 
-# ------------------------------------------------------------------------------
-# 7. Shell settings for every account created from here on
-#
-#    These live in HKCU, so they are written into the Default User hive and new
-#    profiles inherit them. That covers every account made later and is worth
-#    doing - but it does NOT cover the AutoLogon account, whose profile is
-#    copied out of this hive at about the moment this script is writing it. On
-#    a real build that race was lost. The same settings are therefore applied a
-#    second time, per user, by -ShellForCurrentUser at first logon. Neither
-#    half is redundant: this one reaches future profiles, that one reaches the
-#    account the operator is actually looking at.
-# ------------------------------------------------------------------------------
-Write-Step "Shell settings (Default User hive)"
-
-$defaultHive = 'C:\Users\Default\NTUSER.DAT'
-$mountPoint = 'HKU\rdgwDefault'
-$loaded = $false
-
-if (Test-Path -LiteralPath $defaultHive) {
-    & reg.exe load $mountPoint $defaultHive 2>&1 | Out-Null
-    $loaded = ($LASTEXITCODE -eq 0)
-}
-
-if (-not $loaded) {
-    Write-Skip "Could not load the Default User hive - shell settings skipped, everything above still applied"
+$dvMarker = Join-Path $script:Root "rdgw-defaultuser.done"
+if (Test-Path -LiteralPath $dvMarker) {
+    Write-Step "Shell settings (Default User hive)"
+    Write-Skip "Already done during specialize, before any profile existed - which is the point"
 } else {
-    $u = 'Registry::HKEY_USERS\rdgwDefault'
-
-    # The shell defaults below are cosmetic and belong to the housekeeping
-    # answer. Everything after them does not: your DefaultUser scripts and the
-    # UserOnce registration have nothing to do with taskbar layout, so they run
-    # either way.
-    # Everything between here and the unload is wrapped, because an unmounted
-    # hive is not optional. reg.exe keeps NTUSER.DAT open for as long as it is
-    # loaded, so a script that throws half way through used to leave the Default
-    # User profile locked for the rest of setup - and every profile created
-    # afterwards inherits from a file nothing can write to. cschneegans'
-    # generator sidesteps this by making load, run and unload three separate
-    # answer-file commands, so a failing script cannot skip the unload. We run
-    # inside one script, so try/finally is how we get the same guarantee.
-    try {
-        if ($cfg.ApplyTweaks) {
-            Set-ShellSetting -Root $u
-        } else {
-            Write-Skip "Shell defaults skipped - housekeeping was not requested"
-        }
-
-        # Anything you supplied for the DefaultUser category runs here, while the
-        # hive is still mounted, so what it writes is inherited by every profile
-        # created afterwards. The UserOnce registration goes in for the same
-        # reason: a RunOnce value in this hive is inherited by each new profile and
-        # fires at that user's first logon, then deletes itself.
-        $runner = Join-Path $script:Root 'Invoke-CustomScripts.ps1'
-        if (Test-Path -LiteralPath $runner) {
-            try {
-                & $runner -Category DefaultUser -HiveRoot $mountPoint
-            } catch {
-                Write-Bad "Custom DefaultUser scripts failed: $($_.Exception.Message)"
-            }
-
-            $userOnceDir = Join-Path $script:Root 'custom\UserOnce'
-            $userOnceCount = 0
-            if (Test-Path -LiteralPath $userOnceDir) {
-                $userOnceCount = @(Get-ChildItem -LiteralPath $userOnceDir -File -ErrorAction SilentlyContinue).Count
-            }
-            if ($userOnceCount -gt 0) {
-                $cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Category UserOnce' -f $runner
-                Set-Reg "$u\Software\Microsoft\Windows\CurrentVersion\RunOnce" 'RDGWUserOnce' $cmd 'String'
-                Write-Good "UserOnce scripts ($userOnceCount) registered for every new profile"
-            }
-        }
-    }
-    finally {
-        [gc]::Collect()
-        & reg.exe unload $mountPoint 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Good "Default User hive written and unloaded"
-        } else {
-            Write-Bad "Default User hive written but would not unload - a reboot clears this"
-        }
-    }
+    Invoke-DefaultUserHive
 }
-
 # ------------------------------------------------------------------------------
 # 7b. VirtIO guest tools
 #

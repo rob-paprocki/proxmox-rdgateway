@@ -430,6 +430,24 @@ bug will surface.
   profile `AutoLogon` creates and need no per-user second pass. Same three keys
   cschneegans/unattend-generator writes in its specialize phase. Do not "consolidate" them
   into the Default User hive.
+- **The builder follows the build to the end and does not claim success before it.** It
+  used to print "VM is built and will install itself" and exit, with thirty to forty
+  minutes of install and configuration still ahead and nobody watching. Every failure this
+  project has had happened *after* that cheerful summary - a boot prompt nobody answered,
+  an answer file Windows refused, a gateway policy that returned ERROR_NONE_MAPPED - and in
+  each case the script had already reported success. `follow_build` waits on the disk
+  counters until the guest agent answers, then reads `rdgw-setup.log` through
+  `qm guest exec` and prints each new line as it appears, exiting non-zero on an `[error]`
+  line. `NO_WAIT=1` restores the old behaviour, `FOLLOW_SECONDS` caps the wait. Do not make
+  this opt-in: a script that reports success it has not verified is worse than one that
+  says nothing.
+- **The Default User hive is written during specialize, not by the first-boot task.** That
+  is the only moment when it is unambiguously correct - no profile exists yet, so what goes
+  in is genuinely inherited by the first account. `Invoke-GatewaySetup.ps1 -Register` calls
+  `Configure-Guest.ps1 -DefaultUserOnly`, which drops a `rdgw-defaultuser.done` marker so
+  the first-boot task skips it rather than running the operator's DefaultUser scripts a
+  second time. The task keeps the code as a fallback for a specialize call that did not
+  happen.
 - **The Default User hive cannot reach the auto-logon account, so the shell settings go in
   twice.** Everything under `ApplyTweaks` - taskbar left, dark theme, Explorer defaults,
   desktop icons - is written into `C:\Users\Default\NTUSER.DAT` so new profiles inherit it.

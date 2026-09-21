@@ -153,6 +153,33 @@ if ($Register) {
         }
     }
 
+    # The Default User hive, done here in specialize and not later.
+    #
+    # This is the only moment when it is unambiguously correct: Windows has not
+    # created a single profile yet, so whatever goes into the hive really is
+    # inherited by the first account. The first-boot task cannot claim that -
+    # AutoLogon creates that profile at about the moment the task is writing the
+    # hive, and on a real build the profile won, leaving the operator with a
+    # centred taskbar and the light theme having asked for neither.
+    # cschneegans/unattend-generator does the same work in specialize, for the
+    # same reason.
+    #
+    # Configure-Guest.ps1 writes a marker when this succeeds, so the first-boot
+    # task knows to skip it rather than run the operator's DefaultUser scripts
+    # a second time.
+    $guest = Join-Path $ScriptRoot 'Configure-Guest.ps1'
+    if (Test-Path -LiteralPath $guest) {
+        Add-LogLine "Writing the Default User hive now, before any profile exists"
+        try {
+            & $guest -DefaultUserOnly -ScriptRoot $ScriptRoot -LogPath $LogPath
+            Add-LogLine "Default User hive done in specialize"
+        } catch {
+            Add-LogLine "Default User hive failed in specialize, the first-boot task will retry: $($_.Exception.Message)" 'warn'
+        }
+    } else {
+        Add-LogLine "Configure-Guest.ps1 is not next to this script - the first-boot task will do the hive instead" 'warn'
+    }
+
     if ($exists) {
         Add-LogLine "'$TaskName' registered and read back - first boot will run it"
         exit 0

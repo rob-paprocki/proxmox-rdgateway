@@ -34,6 +34,9 @@
 #      BOOT_KEY_STREAM_MB how far the DVD counter must climb above where it
 #                         settled before Setup counts as streaming (default 64)
 #      BOOT_KEY_MAX       hard cap on keypresses (default 10)
+#      NO_WAIT            1 to exit as soon as the VM starts instead of
+#                         following the build to the end (default 0)
+#      FOLLOW_SECONDS     how long to follow before giving up (default 3600)
 #
 #  What it touches on the network:
 #
@@ -107,6 +110,13 @@ BOOT_KEY_STREAM_MB="${BOOT_KEY_STREAM_MB:-64}"
 # that we are pressing into a menu, and a bounded number of keys cannot walk
 # through one.
 BOOT_KEY_MAX="${BOOT_KEY_MAX:-10}"
+
+# Stay and watch the build instead of exiting the moment the VM starts. On by
+# default because the alternative is what this script used to do: print a
+# success summary and leave, while everything that could actually go wrong was
+# still ahead of it. NO_WAIT=1 restores the old behaviour.
+NO_WAIT="${NO_WAIT:-0}"
+FOLLOW_SECONDS="${FOLLOW_SECONDS:-3600}"
 
 # Scripts of your own, in the four categories the schneegans.de generator uses.
 # CUSTOM_STAGE is a mktemp tree laid out as <category>/<filename>, created only
@@ -1616,12 +1626,23 @@ EOF
 # The timeout is belt and braces. Nothing in this loop may be allowed to block
 # forever again.
 qm_bytes_read() {
-  local dev="$1"
-  timeout 10 qm status "$VMID" --verbose 2>/dev/null | awk -v d="$dev" '
+  qm_blockstat "$1" 'rd_bytes:'
+}
+
+# The same counter for writes, which is what says "Windows is being laid down
+# on the disk" while the DVD counter has gone quiet. Only used for the progress
+# line while waiting; nothing decides anything on it.
+qm_bytes_written() {
+  qm_blockstat "$1" 'wr_bytes:'
+}
+
+qm_blockstat() {
+  local dev="$1" field="$2"
+  timeout 10 qm status "$VMID" --verbose 2>/dev/null | awk -v d="$dev" -v f="$field" '
     /^blockstat:/            { inb = 1; next }
     inb && /^[^[:space:]]/   { inb = 0 }
     inb && NF == 1 && $1 ~ /:$/ { cur = substr($1, 1, length($1) - 1); next }
-    inb && $1 == "rd_bytes:" {
+    inb && $1 == f {
       any = 1
       total += $2
       if (cur == d) { named = $2; found = 1 }
@@ -1753,6 +1774,109 @@ press_a_key() {
 
   msg_warn "Watched ${BOOT_KEY_SECONDS}s, sent ${sent} keypress(es), never saw Setup stream the DVD"
   msg_warn "Open the console. If the VM is at the UEFI shell, type ${BL}exit${CL} and boot the DVD by hand."
+  return 0
+}
+
+# Read the guest's rdgw-setup.log through the QEMU guest agent.
+#
+# qm guest exec returns JSON, so something has to pull "out-data" back out.
+# Proxmox ships python3 and perl; there is no jq. Prints nothing at all if the
+# agent is not up yet, which is the normal case for the first fifteen minutes.
+guest_log() {
+  local raw
+  raw="$(timeout 40 qm guest exec "$VMID" --timeout 30 -- \
+        cmd.exe /c "type C:\\Windows\\Setup\\Scripts\\rdgw-setup.log" 2>/dev/null)" || return 1
+  [[ -n "$raw" ]] || return 1
+
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$raw" | python3 -c \
+      'import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+sys.stdout.write(d.get("out-data", ""))' 2>/dev/null
+  elif command -v perl >/dev/null 2>&1; then
+    printf '%s' "$raw" | perl -MJSON::PP -0777 -ne \
+      'my $d = eval { decode_json($_) }; print $d->{"out-data"} // q{} if $d' 2>/dev/null
+  else
+    return 1
+  fi
+}
+
+# Stay until the machine has actually finished building itself.
+#
+# This exists because the script used to print "VM is built and will install
+# itself" and exit, while thirty to forty minutes of install and configuration
+# still lay ahead with nobody watching. Every failure this project has had
+# happened after that cheerful summary: a boot prompt that was never answered,
+# an answer file Windows refused, a gateway policy that came back
+# ERROR_NONE_MAPPED. In each case the script had already claimed success and
+# the operator had no way to know otherwise. That is not a missing feature, it
+# is the script being wrong about the only thing it is asked to report.
+#
+# Two phases, because the guest can only be asked questions once it can answer
+# them. Before the guest agent is installed - which Configure-Guest.ps1 does
+# partway through the first boot - all that is available is the disk counters,
+# so it reports progress from those. After that it reads the real log and
+# prints each new line as it appears, exactly what a person watching the
+# console would see.
+#
+# Set NO_WAIT=1 to get the old behaviour back.
+follow_build() {
+  local deadline agent=no printed=0 log line new finished=no failed=no
+  local last_note=0 rd wr
+
+  if [[ "$NO_WAIT" == "1" ]]; then
+    msg_warn "NO_WAIT=1 - not waiting. The build continues without supervision;"
+    msg_warn "read ${BL}C:\\Windows\\Setup\\Scripts\\rdgw-setup.log${CL} in the guest to see how it went."
+    return 0
+  fi
+
+  msg_info "Following the build. This takes 20-40 minutes; Ctrl-C leaves it running."
+  deadline=$((SECONDS + FOLLOW_SECONDS))
+
+  while (( SECONDS < deadline )); do
+    if [[ "$agent" == "no" ]]; then
+      if timeout 20 qm agent "$VMID" ping >/dev/null 2>&1; then
+        agent=yes
+        msg_ok "Guest agent answered - the VirtIO tools are in and the log is readable"
+      elif (( SECONDS - last_note >= 30 )); then
+        last_note=$SECONDS
+        rd="$(qm_bytes_read ide0)"; rd="${rd:-0}"
+        wr="$(qm_bytes_written scsi0)"; wr="${wr:-0}"
+        printf "   ${DIM}%4ds  installing - read %s MiB from the DVD, written %s MiB to disk${CL}\n" \
+          "$SECONDS" "$(( rd / 1048576 ))" "$(( wr / 1048576 ))"
+      fi
+    fi
+
+    if [[ "$agent" == "yes" ]]; then
+      if log="$(guest_log)"; then
+        new=0
+        while IFS= read -r line; do
+          new=$((new + 1))
+          if (( new > printed )); then
+            printf "   %s\n" "$line"
+            case "$line" in
+              *"First-boot setup finished."*) finished=yes ;;
+              *"[error]"*)                    failed=yes   ;;
+            esac
+          fi
+        done <<<"$log"
+        (( new > printed )) && printed=$new
+      fi
+      [[ "$finished" == "yes" ]] && { msg_ok "The gateway finished building itself."; return 0; }
+      if [[ "$failed" == "yes" ]]; then
+        msg_error "The build stopped on an error - the lines above are from the guest's own log."
+        msg_error "The task stays registered, so rebooting the VM makes it try again."
+        return 1
+      fi
+    fi
+    sleep 10
+  done
+
+  msg_warn "Gave up following after ${FOLLOW_SECONDS}s. The build may still be going."
+  msg_warn "Read ${BL}C:\\Windows\\Setup\\Scripts\\rdgw-setup.log${CL} in the guest."
   return 0
 }
 
@@ -2061,4 +2185,11 @@ ${BOLD}6. Configure the gateway${CL}
    port-forwarding work that has to happen around it.
 
 EOF
+fi
+
+# Everything above told the operator what is about to happen. Now stay and watch
+# it happen, rather than exiting on a promise - see follow_build.
+if [[ "$UNATTEND" == "yes" && "$START_VM" == "yes" && "$DRY_RUN" != "1" ]]; then
+  printf "\n"
+  follow_build || exit 1
 fi
