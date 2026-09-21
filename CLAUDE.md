@@ -402,10 +402,37 @@ bug will surface.
   `Get-RDGWStatus.ps1` then ran through the guest agent and returned `[ ok ]` on every
   line with no `[ NO ]`: Defender absent (`WinDefend=absent`, `AMRunningMode=n/a`), UAC,
   Ctrl+Alt+Del, Core Isolation (`HVCI running=False`), blank password, lockout 10, tweaks,
-  the `rdgadmin` account, the role, the service, and both policies. `RAP 'RDG_RAP_Default'
-  type=ALL group=` is the empty-`ResourceGroupName` convention working, which was a guess
-  until this run. `follow_build` streamed the whole thing, including across the reboot, and
-  exited 0.
+  the `rdgadmin` account, the role, the service, and both policies. `follow_build` streamed
+  the whole thing, including across the reboot, and exited 0.
+
+  **One line of that readback was over-read here, and the correction is the useful part.**
+  `RAP 'RDG_RAP_Default' type=ALL group=` was written up as the empty-`ResourceGroupName`
+  convention confirmed working, which had been a guess until that run. It confirmed no such
+  thing. A readback proves the provider stored what it was given; it says nothing about
+  whether the policy engine honours it. The first real client to reach this gateway was
+  refused with error 23002 and event 301, which is a RAP denial, so the readback had been
+  green over a policy that does not admit anyone. The convention may still be correct -
+  recreating the policy with the argument omitted rather than empty stores identically, so
+  from outside the two are indistinguishable - but nothing had tested it. The general
+  version, which is why this is worth a paragraph: `Get-RDGWStatus.ps1` reads
+  configuration, and only a connection tests policy. Do not let a green status line stand
+  in for a client that has actually connected, and do not record a value as working
+  because it read back.
+- **`Win32_TSGatewayServerSettings.IsConfigured` reads `False` on a gateway this script
+  finished, and that is a defect here rather than a curiosity.** Found 2026-09-21 while
+  chasing the 23002 above. `Setup-RDGateway.ps1` calls the parameterless `Configure()`
+  method, which Microsoft documents as configuring "the IIS and RPC settings required by the
+  Remote Desktop Gateway (RD Gateway) service", from exactly one place: inside the WMI
+  certificate-binding fallback. That fallback runs only when
+  `Set-Item RDS:\GatewayServer\SSLCertificate\Thumbprint` fails, and it has succeeded on
+  every build, so `Configure()` has never run on a machine this repo produced. Invoked by
+  hand it returned rc=0 and flipped `IsConfigured` to `True`. The shape fits the symptom:
+  the CAP is evaluated at the HTTP and authentication layer, where event 200 passes, and
+  the RAP when the RPC channel opens the connection to the target, which is the leg that
+  fails. **Whether it is the cause of the 23002 is still unknown.** It is a measured anomaly
+  that fits, not a demonstrated fix, and only a client connecting settles it. The defect
+  stands either way: setup work placed on a failure-only path is wrong, because if
+  `Configure()` is needed at all it is needed when the binding succeeds too.
 - **A known cosmetic wart in the log, not yet fixed.** The specialize entries are stamped
   `08:43` and everything from first boot on is stamped `11:46`, because specialize runs
   before the timezone is applied. The build is continuous; the log just looks like it
