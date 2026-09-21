@@ -30,9 +30,28 @@
                  trust it, and mobile RD clients make that awkward.
 
 .PARAMETER AllowedGroups
-    Groups permitted through the gateway, in the RD Gateway "name@domain" form.
-    Built-in local groups use @BUILTIN. Groups you create yourself use
-    @<COMPUTERNAME>. Defaults to the local Administrators and Remote Desktop Users.
+    Groups permitted through the gateway, written "DOMAIN\Group" - which is the
+    form Microsoft documents for UserGroupNames, and the only one that works.
+    Built-in local groups are BUILTIN\Administrators and
+    BUILTIN\Remote Desktop Users; domain groups are YOURDOMAIN\Group.
+
+    This used to default to the "Group@BUILTIN" form taken from a published
+    workgroup example, and on a real build the gateway refused it:
+
+        Win32_TSGatewayConnectionAuthorizationPolicy.Create returned 2147943732
+
+    2147943732 is 0x80070534, ERROR_NONE_MAPPED - "no mapping between account
+    names and security IDs". The provider resolves these through
+    LookupAccountName, which understands "DOMAIN\Name" and a bare "Name" but not
+    the UPN-style "Name@Domain" unless it is a real domain principal. Measured:
+
+        Administrators@BUILTIN         fails to translate
+        BUILTIN\Administrators         -> S-1-5-32-544
+        Remote Desktop Users@BUILTIN   fails to translate
+        BUILTIN\Remote Desktop Users   -> S-1-5-32-555
+
+    Every name is now translated to a SID before the policy is created, so a
+    name that cannot resolve is reported by name instead of as a WMI error code.
 
 .PARAMETER TargetMachines
     Other machines on your LAN you want to reach THROUGH this gateway. Give the
@@ -94,7 +113,7 @@ param(
 
     [System.Security.SecureString] $PfxPassword,
 
-    [string[]] $AllowedGroups = @('Administrators@BUILTIN', 'Remote Desktop Users@BUILTIN'),
+    [string[]] $AllowedGroups = @('BUILTIN\Administrators', 'BUILTIN\Remote Desktop Users'),
 
     [string[]] $TargetMachines = @(),
 
@@ -242,9 +261,9 @@ if ($PSVersionTable.PSEdition -ne 'Desktop') {
 
 $computerSystem = Get-CimInstance Win32_ComputerSystem
 if ($computerSystem.PartOfDomain) {
-    Write-Good "Domain-joined ($($computerSystem.Domain)). Domain groups are written as GroupName@DOMAIN."
+    Write-Good "Domain-joined ($($computerSystem.Domain)). Domain groups are written as DOMAIN\GroupName."
 } else {
-    Write-Good "Workgroup member. Local groups are written as GroupName@BUILTIN."
+    Write-Good "Workgroup member. Local groups are written as BUILTIN\GroupName."
 }
 
 # Warn early about anything already holding 443.
@@ -428,7 +447,32 @@ if ($bound) {
 # ------------------------------------------------------------------------------
 Write-Step "Creating the connection authorization policy (RD CAP)"
 
-$userGroupString = ($AllowedGroups -join ';')
+# Resolve every group before handing it to the provider.
+#
+# The WMI provider resolves these through LookupAccountName and, when that
+# fails, returns 2147943732 (0x80070534, ERROR_NONE_MAPPED) from Create - a
+# number that says nothing about which name was wrong. On a real build that is
+# exactly what happened, and the whole gateway configuration stopped on it.
+# Translating here turns an opaque WMI code into "this group does not exist".
+$resolved = @()
+foreach ($g in $AllowedGroups) {
+    try {
+        $sid = ([System.Security.Principal.NTAccount] $g).Translate(
+            [System.Security.Principal.SecurityIdentifier]).Value
+        Write-Good "$g resolves to $sid"
+        $resolved += $g
+    } catch {
+        Write-Warn "$g does not resolve on this machine and would fail the policy with ERROR_NONE_MAPPED."
+        Write-Note "Built-in groups are written BUILTIN\Administrators, not Administrators@BUILTIN."
+    }
+}
+if ($resolved.Count -eq 0) {
+    Write-Warn "None of the requested groups resolved: $($AllowedGroups -join ', ')"
+    Write-Note "Re-run with -AllowedGroups 'BUILTIN\Administrators','BUILTIN\Remote Desktop Users'"
+    exit 1
+}
+
+$userGroupString = ($resolved -join ';')
 Write-Note "Allowed groups: $userGroupString"
 
 $existingCap = Get-TSGatewayInstance -ClassName 'Win32_TSGatewayConnectionAuthorizationPolicy' `
