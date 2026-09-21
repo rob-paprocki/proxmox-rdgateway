@@ -65,6 +65,32 @@ $StatePath = Join-Path $ScriptRoot 'rdgw-state.json'
 $ConfigPath = Join-Path $ScriptRoot 'rdgw-config.psd1'
 $MaxBoots = 5
 
+# Append one line to the shared log, in ASCII.
+#
+# The encoding is the point. This file used to write with
+# "$line | Tee-Object -FilePath $LogPath -Append", and Tee-Object on Windows
+# PowerShell 5.1 writes UTF-16. Configure-Guest.ps1 and Invoke-CustomScripts.ps1
+# both append with -Encoding ASCII, so the one log ended up half UTF-16 and half
+# ASCII - and on a real build findstr refused to read it:
+#
+#     FINDSTR: Warning - input file rdgw-setup.log is in Unicode format.
+#
+# A log the operator cannot grep is most of the way to no log at all, which is
+# the failure this whole file exists to avoid. Everything writes ASCII now.
+# Defined above the -Register block on purpose: PowerShell resolves functions at
+# run time in script order, so a helper defined further down would not exist yet
+# when that block runs.
+function Add-LogLine {
+    param([string] $Message, [string] $Level = 'info')
+    $line = "{0}  [{1}] {2}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $Level, $Message
+    Write-Host $line
+    try {
+        Add-Content -LiteralPath $LogPath -Value $line -Encoding ASCII -ErrorAction Stop
+    } catch {
+        Write-Host "    (log not writable: $($_.Exception.Message))"
+    }
+}
+
 # ------------------------------------------------------------------------------
 # Registration. Kept here so the schtasks arguments live next to the script they
 # launch rather than buried in the answer file.
@@ -79,10 +105,8 @@ $MaxBoots = 5
 if ($Register) {
     $self = Join-Path $ScriptRoot 'Invoke-GatewaySetup.ps1'
     $action = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$self`" -ScriptRoot `"$ScriptRoot`""
-    $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 
-    "$stamp  [info] Registering '$TaskName' from $ScriptRoot" |
-        Tee-Object -FilePath $LogPath -Append | Write-Host
+    Add-LogLine "Registering '$TaskName' from $ScriptRoot"
 
     & schtasks.exe /Create /TN $TaskName /SC ONSTART /RU SYSTEM /RL HIGHEST /F /TR $action
     $createRc = $LASTEXITCODE
@@ -117,30 +141,24 @@ if ($Register) {
     }
 
     foreach ($name in $wanted.Keys) {
-        $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         try {
             if (-not (Test-Path -LiteralPath $runOnce)) {
                 New-Item -Path $runOnce -Force -ErrorAction Stop | Out-Null
             }
             New-ItemProperty -LiteralPath $runOnce -Name $name -Value $wanted[$name] `
                 -PropertyType String -Force -ErrorAction Stop | Out-Null
-            "$stamp  [info] RunOnce '$name' registered for the first interactive logon" |
-                Tee-Object -FilePath $LogPath -Append | Write-Host
+            Add-LogLine "RunOnce '$name' registered for the first interactive logon"
         } catch {
-            "$stamp  [warn] RunOnce '$name' could not be registered: $($_.Exception.Message)" |
-                Tee-Object -FilePath $LogPath -Append | Write-Host
+            Add-LogLine "RunOnce '$name' could not be registered: $($_.Exception.Message)" 'warn'
         }
     }
 
-    $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     if ($exists) {
-        "$stamp  [info] '$TaskName' registered and read back - first boot will run it" |
-            Tee-Object -FilePath $LogPath -Append | Write-Host
+        Add-LogLine "'$TaskName' registered and read back - first boot will run it"
         exit 0
     }
 
-    "$stamp  [error] '$TaskName' was NOT created (schtasks exit $createRc). Nothing will configure this machine. Run this by hand, elevated: powershell -NoProfile -ExecutionPolicy Bypass -File $self -Register" |
-        Tee-Object -FilePath $LogPath -Append | Write-Host
+    Add-LogLine "'$TaskName' was NOT created (schtasks exit $createRc). Nothing will configure this machine. Run this by hand, elevated: powershell -NoProfile -ExecutionPolicy Bypass -File $self -Register" 'error'
     exit 1
 }
 
@@ -149,8 +167,7 @@ if ($Register) {
 # ------------------------------------------------------------------------------
 function Write-Line {
     param([string] $Message, [string] $Level = 'info')
-    $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-    "$stamp  [$Level] $Message" | Tee-Object -FilePath $LogPath -Append | Write-Host
+    Add-LogLine $Message $Level
 }
 
 function Get-State {
@@ -390,7 +407,12 @@ switch ($scope) {
 }
 
 try {
-    & $setup @arguments 2>&1 | Tee-Object -FilePath $LogPath -Append | Write-Host
+    # *>&1, not 2>&1. Setup-RDGateway.ps1 prints with Write-Host, which goes to
+    # the information stream, and 2>&1 merges only the error stream - the exact
+    # mistake that kept Configure-Guest.ps1's output out of this log for the
+    # whole life of that file. And Add-LogLine rather than Tee-Object, so what
+    # lands here is ASCII like everything else rather than UTF-16.
+    & $setup @arguments *>&1 | ForEach-Object { Add-LogLine "  $_" }
 } catch {
     Stop-Here "Setup-RDGateway.ps1 failed: $($_.Exception.Message)"
 }
