@@ -445,6 +445,105 @@ function Invoke-GuestToolsInstall {
 }
 
 
+# ------------------------------------------------------------------------------
+# Static IPv4 address (first-boot / All only)
+#
+#   New-NetIPAddress is not an installer, but it needs the NIC up, which it
+#   reliably is by first boot and is not during specialize. A wrong or
+#   conflicting address leaves the box on DHCP rather than unreachable, and the
+#   build keeps going either way because the agent talks over the serial
+#   channel, not the network.
+# ------------------------------------------------------------------------------
+function Invoke-StaticNetwork {
+    if ($cfg.NetMode -ne 'static') {
+        Write-Step "Network addressing"
+        Write-Skip "Left on DHCP (NetMode is not 'static')"
+        return
+    }
+    Write-Step "Static IP $($cfg.StaticIP)/$($cfg.StaticPrefix)"
+    try {
+        $nic = @(Get-NetAdapter -Physical -ErrorAction Stop |
+                 Where-Object { $_.Status -eq 'Up' }) | Select-Object -First 1
+        if (-not $nic) {
+            $nic = @(Get-NetAdapter -Physical -ErrorAction Stop) | Select-Object -First 1
+        }
+        if (-not $nic) { Write-Bad "No physical NIC found; leaving DHCP"; return }
+
+        # Idempotent: clear any existing static v4 address and default route.
+        Get-NetIPAddress -InterfaceIndex $nic.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.PrefixOrigin -ne 'WellKnown' } |
+            Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+        Get-NetRoute -InterfaceIndex $nic.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+            Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+        Set-NetIPInterface -InterfaceIndex $nic.ifIndex -Dhcp Disabled -ErrorAction SilentlyContinue
+
+        New-NetIPAddress -InterfaceIndex $nic.ifIndex -AddressFamily IPv4 `
+            -IPAddress $cfg.StaticIP -PrefixLength ([int]$cfg.StaticPrefix) `
+            -DefaultGateway $cfg.StaticGateway -ErrorAction Stop | Out-Null
+
+        $dns = @($cfg.StaticDns -split '[,\s]+' | Where-Object { $_ })
+        if ($dns.Count -gt 0) {
+            Set-DnsClientServerAddress -InterfaceIndex $nic.ifIndex -ServerAddresses $dns -ErrorAction Stop
+        }
+        Write-Good "Set $($cfg.StaticIP)/$($cfg.StaticPrefix) gw $($cfg.StaticGateway) dns '$($dns -join ',')' on '$($nic.Name)'"
+    }
+    catch {
+        Write-Bad "Static IP failed; the box stays on DHCP: $($_.Exception.Message)"
+    }
+}
+
+# ------------------------------------------------------------------------------
+# OpenSSH server (first-boot / All only)
+#
+#   Add-WindowsCapability is a servicing operation, so it belongs with the
+#   Defender step in first boot, not in specialize. Sets PowerShell as the
+#   default shell so a plain 'ssh host' lands in a usable prompt.
+# ------------------------------------------------------------------------------
+function Invoke-SshServer {
+    if (-not $cfg.EnableSsh) {
+        Write-Step "OpenSSH server"
+        Write-Skip "Not requested at build time"
+        return
+    }
+    Write-Step "OpenSSH server"
+    try {
+        $cap = @(Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop) |
+               Select-Object -First 1
+        if (-not $cap) { Write-Bad "OpenSSH.Server capability is not available on this image"; return }
+        if ($cap.State -ne 'Installed') {
+            Add-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop | Out-Null
+            Write-Good "Installed $($cap.Name)"
+        }
+        else {
+            Write-Good "$($cap.Name) already installed"
+        }
+        Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
+        Start-Service -Name sshd -ErrorAction Stop
+
+        # PowerShell as the default SSH shell.
+        $ps = (Get-Command powershell.exe -ErrorAction Stop).Source
+        if (-not (Test-Path -LiteralPath 'HKLM:\SOFTWARE\OpenSSH')) {
+            New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force -ErrorAction Stop | Out-Null
+        }
+        Set-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -Value $ps -Type String -ErrorAction Stop
+
+        # The capability adds the firewall rule; make sure it exists and is on.
+        if (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue) {
+            Enable-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
+        }
+        else {
+            New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH SSH Server (sshd)' `
+                -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -Profile Any `
+                -ErrorAction SilentlyContinue | Out-Null
+        }
+        Write-Good "sshd running, default shell PowerShell, TCP 22 open"
+    }
+    catch {
+        Write-Bad "OpenSSH server setup failed: $($_.Exception.Message)"
+    }
+}
+
+
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
     Write-Bad "No config file at $ConfigPath. Nothing to do."
     exit 1
@@ -464,6 +563,8 @@ if ($Phase -eq 'FirstBoot') {
     # take about a minute and bring up the agent the builder needs to read this
     # log, while Defender takes ten and produces nothing anyone can watch.
     Invoke-GuestToolsInstall
+    Invoke-StaticNetwork
+    Invoke-SshServer
     Invoke-DefenderRemoval
     Write-Step "Done"
     if ($script:Failures -gt 0) {
@@ -532,6 +633,17 @@ if ($Phase -eq 'All') {
 } else {
     Write-Step "VirtIO guest tools"
     Write-Skip "Not in specialize - an installer bundle exits 1603 there. The first-boot pass does it first."
+}
+
+# Static IP and OpenSSH also belong to first boot: the NIC is reliably up by
+# then, and a capability install is a servicing operation. -Phase All does them
+# here for a by-hand run; -Phase FirstBoot did them above; specialize skips.
+if ($Phase -eq 'All') {
+    Invoke-StaticNetwork
+    Invoke-SshServer
+} else {
+    Write-Step "Static IP and OpenSSH"
+    Write-Skip "Not in specialize - done in the first-boot pass"
 }
 
 # ------------------------------------------------------------------------------

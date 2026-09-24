@@ -441,6 +441,17 @@ pick_edition() {
               ask "Product key (blank for none, e.g. evaluation media)" ""
               GVLK="$ASK_RESULT" ;;
   esac
+
+  # A real retail or MAK key activates outright, where the generic volume key
+  # above only selects the edition and expects a KMS host. Offer it for the
+  # licensable editions; blank keeps the generic key. Evaluation media cannot
+  # take a key this way, so it is not offered there. The key rides the answer
+  # file's specialize ProductKey, same clear-text-on-ISO handling as the
+  # password, and cleanup_media deletes that ISO on success.
+  if [[ "$choice" == "std" || "$choice" == "dc" ]]; then
+    ask "Product key to activate with (blank uses the generic volume key)" ""
+    if [[ -n "$ASK_RESULT" ]]; then GVLK="$ASK_RESULT"; fi
+  fi
 }
 
 # Ask twice, compare, allow empty. An empty password is a supported answer:
@@ -1091,6 +1102,13 @@ unattend_settings() {
   whiptail --backtitle "$APP" --title "Server housekeeping" \
     --yesno "Apply the housekeeping settings?\n\n8.3 names off, fast startup off, long paths on, WPBT off, no Windows Update auto-reboot, system sounds off, NumLock on, and Explorer/taskbar/theme defaults suited to RDP.\n\nNone of these are security relevant." 15 72 || APPLY_TWEAKS="false"
 
+  # Management access. OpenSSH server plus PowerShell as the default shell lets
+  # you administer this box over SSH instead of the Proxmox console. It opens
+  # TCP 22 on the LAN, so it defaults off like the other access toggles.
+  ENABLE_SSH="false"
+  whiptail --backtitle "$APP" --title "OpenSSH server" \
+    --yesno "Enable the OpenSSH server in the guest?\n\nYou can then administer this box with 'ssh ${ADMIN_USER}@<ip> powershell' rather than the Proxmox console. It opens TCP 22 on your LAN.\n\nDefault is off." 14 72 --defaultno && ENABLE_SSH="true"
+
   pick_custom_scripts
 }
 
@@ -1478,6 +1496,13 @@ generate_config_psd1() {
     DisableCoreIsolation = \$${DISABLE_CORE_ISOLATION}
     DisableCad           = \$${DISABLE_CAD}
     DisableIPv6          = \$${DISABLE_IPV6}
+
+    NetMode              = '${NET_MODE:-dhcp}'
+    StaticIP             = $(psd1_quote "${STATIC_IP:-}")
+    StaticPrefix         = ${STATIC_PREFIX:-24}
+    StaticGateway        = $(psd1_quote "${STATIC_GW:-}")
+    StaticDns            = $(psd1_quote "${STATIC_DNS:-}")
+    EnableSsh            = \$${ENABLE_SSH:-false}
 
     ApplyTweaks          = \$${APPLY_TWEAKS}
 }
@@ -2100,6 +2125,21 @@ advanced_settings() {
   ask "MTU (blank for default)" ""
   if [[ -n "$ASK_RESULT" ]]; then MTU=",mtu=$ASK_RESULT"; else MTU=""; fi
 
+  # A gateway sitting behind a port-forward wants a fixed address. Default is
+  # DHCP (reserve a lease on the router instead); choosing static collects the
+  # address here and Configure-Guest.ps1 applies it in the first-boot pass,
+  # once the NIC is up, falling back to DHCP if anything about it is wrong.
+  NET_MODE="dhcp"; STATIC_IP=""; STATIC_PREFIX=""; STATIC_GW=""; STATIC_DNS=""
+  if whiptail --backtitle "$APP" --title "IP addressing" \
+      --yesno "Give this gateway a static IPv4 address?\n\nA server behind a port-forward wants a fixed address. Choosing no leaves it on DHCP.\n\nDefault is DHCP." 12 72 --defaultno; then
+    NET_MODE="static"
+    ask "Static IPv4 address" "192.168.1.10";                 STATIC_IP="$ASK_RESULT"
+    ask "Prefix length (24 = 255.255.255.0)" "24";            STATIC_PREFIX="$ASK_RESULT"
+    [[ "$STATIC_PREFIX" =~ ^[0-9]+$ ]] || STATIC_PREFIX="24"
+    ask "Default gateway" "192.168.1.1";                      STATIC_GW="$ASK_RESULT"
+    ask "DNS servers (space or comma separated)" "192.168.1.1"; STATIC_DNS="$ASK_RESULT"
+  fi
+
   if whiptail --backtitle "$APP" --title "Start VM" --yesno "Start the VM when the script finishes?" 8 60; then
     START_VM="yes"
   else
@@ -2178,6 +2218,11 @@ fi
 
 # --- Build -------------------------------------------------------------------
 printf "\n"
+# Memory ballooning: a floor below the max lets the host reclaim the RAM a
+# mostly-idle gateway is not using. Overridable, and kept safely below the max.
+BALLOON_MIN="${BALLOON_MIN:-2048}"
+if [[ "$BALLOON_MIN" -ge "$RAM_SIZE" ]]; then BALLOON_MIN=$(( RAM_SIZE / 2 )); fi
+
 msg_info "Creating the VM shell"
 run qm create "$VMID" \
   --name "$HN" \
@@ -2188,7 +2233,7 @@ run qm create "$VMID" \
   --sockets 1 \
   --cores "$CORE_COUNT" \
   --memory "$RAM_SIZE" \
-  --balloon 0 \
+  --balloon "$BALLOON_MIN" \
   --scsihw virtio-scsi-single \
   --net0 "virtio,bridge=${BRG},macaddr=${MAC}${VLAN}${MTU}" \
   --agent "enabled=1,fstrim_cloned_disks=1" \
@@ -2397,9 +2442,16 @@ cleanup_media() {
   fi
 
   msg_info "Taking the media away - the build is done and nothing needs it now"
-  run qm set "$VMID" --ide0 none --ide2 none --sata0 none --boot order=scsi0
+  # Remove the CD/DVD drives outright, not just their discs. Nothing boots or
+  # installs from them again, and an empty drive is clutter on a finished
+  # appliance. Boot order goes to the disk first so deleting the DVD it used to
+  # boot from cannot leave a dangling reference. Safe here because this runs
+  # only after a successful build; a failed build exits before this and keeps
+  # its drives so the retry can install the guest tools off the VirtIO CD.
+  run qm set "$VMID" --boot order=scsi0
+  run qm set "$VMID" --delete ide0,ide2,sata0
   run rm -f "$UNATTEND_ISO_PATH"
-  msg_ok "CDs detached, booting from disk, unattend ISO deleted with its password"
+  msg_ok "CD/DVD drives removed, booting from disk, unattend ISO deleted with its password"
 }
 
 # Everything above told the operator what is about to happen. Now stay and watch
