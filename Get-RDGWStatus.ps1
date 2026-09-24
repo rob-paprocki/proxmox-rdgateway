@@ -249,6 +249,27 @@ try {
     foreach ($r in $rap) { Write-Info "RAP '$($r.Name)' type=$($r.ResourceGroupType) group=$($r.ResourceGroupName)" }
 } catch { Write-Info "no RAP readable: $($_.Exception.Message)" }
 
+# The connecting account must be in Remote Desktop Users, not only Administrators.
+# A local account's network logon token has Administrators filtered out by UAC
+# (EnableLUA=1 with LocalAccountTokenFilterPolicy unset, the defaults), and the
+# RAP is evaluated against that token, so it refuses the account with error 23002
+# unless the account is in a non-filtered group the RAP lists. Every policy above
+# can read correct while this is the reason nothing connects. This check is the
+# one line that would have caught that. See CLAUDE.md, "Why the RAP denied every
+# connection".
+if ($cfg -and $cfg.AccountName) {
+    $inRdu = @(Get-LocalGroupMember -Group 'Remote Desktop Users' -ErrorAction SilentlyContinue |
+               Where-Object { $_.Name -like "*\$($cfg.AccountName)" -or $_.Name -eq $cfg.AccountName })
+    if ($inRdu.Count -gt 0) {
+        Write-Ok "'$($cfg.AccountName)' is in Remote Desktop Users - the RAP can admit it over the network"
+    } else {
+        Write-No "'$($cfg.AccountName)' is NOT in Remote Desktop Users"
+        Write-Info "Connections will fail with error 23002 even though the policies above read correct,"
+        Write-Info "because UAC filters Administrators out of a local account's network logon token."
+        Write-Info "Fix: Add-LocalGroupMember -Group 'Remote Desktop Users' -Member '$($cfg.AccountName)'"
+    }
+}
+
 # The certificate is the one thing a working gateway can still get wrong in a
 # way nobody notices until a client refuses to connect, so report the issuer
 # rather than just "a certificate is bound". Self-signed shows up as issuer
