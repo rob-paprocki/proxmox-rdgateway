@@ -647,9 +647,29 @@ bug will surface.
   disk`, and the operator watched it say that for twenty-five minutes while Windows sat at
   a finished desktop running the first-boot task - because the guest tools had failed and
   the agent was never coming. The counters are the only thing that phase knows, so it now
-  says `waiting for the guest agent` and nothing more, and past twenty-five minutes it says
-  once that the agent is not coming, where to read the log by hand, and not to type in that
-  console. Do not restore a word like "installing" to a branch that cannot tell.
+  says `waiting for the guest agent` and nothing more. Do not restore a word like
+  "installing" to a branch that cannot tell.
+
+  **Its concern message is tied to a stall, not a clock - fixed 2026-09-24.** It used to
+  say "No guest agent after 25 minutes... if they failed there is nothing left to ask" once
+  `$SECONDS` passed 1500. Two things were wrong with that, both seen on a real build. The
+  message fired while the disk was still being actively written (14871 to 19094 MiB in the
+  lines right after it), so it called a slow-but-healthy install a failure. And `$SECONDS`
+  counts from when the *script* started, interview included: with a 16-minute interview
+  it fired nine minutes into the install, and the first heartbeat read `1004s`. Now every
+  time is relative to when following began (`start`), the heartbeat reads `0m00s`, a calm
+  note up front says the agent only comes at first boot and not to type in the console, and
+  the concern message fires only after 15 minutes with nothing read or written. Replaying
+  that build's transcribed counters: the old code prints the 7-line warning, the new code
+  prints none. Do not put a wall-clock threshold back on this phase.
+
+  **Timing out is not success.** `follow_build` used to return 0 on hitting
+  `FOLLOW_SECONDS`, and the caller treats 0 as finished, so `cleanup_media` deleted the CDs
+  while the build "may still be going" - and if the guest tools had failed, took away the
+  VirtIO CD the retry needs. It now sets `FOLLOW_TIMED_OUT=1` and returns 1; the caller
+  leaves the media and prints the commands to remove it once the log says finished. The
+  default cap went from 3600 to 5400: a Defender-removal build follows for about 45
+  minutes on the operator's hardware, which left an hour too little room for slower disks.
 
   The same phase now also notices the install **restarting**. Setup reads the image off
   the DVD and the counter then goes flat for the rest of the build, so a counter that wakes

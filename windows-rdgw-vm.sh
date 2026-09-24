@@ -36,7 +36,7 @@
 #      BOOT_KEY_MAX       hard cap on keypresses (default 10)
 #      NO_WAIT            1 to exit as soon as the VM starts instead of
 #                         following the build to the end (default 0)
-#      FOLLOW_SECONDS     how long to follow before giving up (default 3600)
+#      FOLLOW_SECONDS     how long to follow before giving up (default 5400)
 #      KEEP_MEDIA         1 to leave the CDs attached and keep the unattend
 #                         ISO after a successful build (default 0 - they are
 #                         detached and the ISO is deleted, because it holds
@@ -122,7 +122,11 @@ BOOT_KEY_MAX="${BOOT_KEY_MAX:-10}"
 # everything that can actually go wrong still ahead of it. NO_WAIT=1 exits at
 # qm start and prints the summary without following anything.
 NO_WAIT="${NO_WAIT:-0}"
-FOLLOW_SECONDS="${FOLLOW_SECONDS:-3600}"
+# 90 minutes. A build that removes Defender runs about 45 minutes of following
+# on the operator's hardware, measured, and the blind install phase alone took
+# 17 of them; an hour left too little room for slower storage. Timing out is not
+# success - it leaves the media attached and says how to take it away.
+FOLLOW_SECONDS="${FOLLOW_SECONDS:-5400}"
 
 # Take the CDs away once the build has finished, and delete the unattend ISO
 # with them. On by default, and the ISO is the reason: it carries the account
@@ -1979,7 +1983,8 @@ sys.stdout.write(d.get("out-data", ""))' 2>/dev/null
 follow_build() {
   local deadline agent=no printed=0 log line new finished=no failed=no
   local last_note=0 rd wr nagged=no primed=no
-  local rd_last=0 rd_quiet_since=0 restarted=no wr_last=0 move_last=0
+  local rd_last=0 rd_quiet_since=0 restarted=no wr_last=0 move_last=0 start
+  FOLLOW_TIMED_OUT=0
 
   if [[ "$NO_WAIT" == "1" ]]; then
     msg_warn "NO_WAIT=1 - not waiting. The build continues without supervision;"
@@ -1987,8 +1992,14 @@ follow_build() {
     return 0
   fi
 
-  msg_info "Following the build. This takes 20-40 minutes; Ctrl-C leaves it running."
-  deadline=$((SECONDS + FOLLOW_SECONDS))
+  msg_info "Following the build. It usually takes 30-45 minutes; Ctrl-C leaves it running."
+  # Every time shown or compared below is relative to this moment, not to raw
+  # $SECONDS: bash counts that from when the script started, which includes
+  # however long the interview took. The old "no guest agent after 25 minutes"
+  # warning compared raw $SECONDS against 1500, and on a real build with a
+  # 16-minute interview it fired nine minutes into a perfectly healthy install.
+  start=$SECONDS
+  deadline=$((start + FOLLOW_SECONDS))
 
   while (( SECONDS < deadline )); do
     if [[ "$agent" == "no" ]]; then
@@ -2011,8 +2022,9 @@ follow_build() {
         # the first-boot task, because the guest agent had failed to install
         # and this branch is all there was. The counters are the only thing
         # this phase actually knows, so say only that.
-        printf "   ${DIM}%4ds  waiting for the guest agent - read %s MiB from the DVD, written %s MiB to disk${CL}\n" \
-          "$SECONDS" "$(( rd / 1048576 ))" "$(( wr / 1048576 ))"
+        printf "   ${DIM}%3dm%02ds  waiting for the guest agent - read %s MiB from the DVD, written %s MiB to disk${CL}\n" \
+          "$(( (SECONDS - start) / 60 ))" "$(( (SECONDS - start) % 60 ))" \
+          "$(( rd / 1048576 ))" "$(( wr / 1048576 ))"
         # One calm word up front so a long, quiet install does not read as
         # broken. The agent cannot answer before first boot - no OS runs until
         # then - so only the counters move here, sometimes for half an hour on
@@ -2091,9 +2103,16 @@ follow_build() {
     sleep 10
   done
 
-  msg_warn "Gave up following after ${FOLLOW_SECONDS}s. The build may still be going."
-  msg_warn "Read ${BL}C:\\Windows\\Setup\\Scripts\\rdgw-setup.log${CL} in the guest."
-  return 0
+  # Not a success: nothing said the build finished. This used to return 0,
+  # which sent the caller straight into cleanup_media - deleting the CDs while
+  # the build "may still be going", and if the guest tools had failed, taking
+  # away the VirtIO CD the retry needs to install them. Flag it and return
+  # non-zero so the media stays until someone has seen the log end.
+  FOLLOW_TIMED_OUT=1
+  msg_warn "Stopped following after $(( FOLLOW_SECONDS / 60 )) minutes without the guest log saying it"
+  msg_warn "finished. The build may well still be running; read"
+  msg_warn "${BL}C:\\Windows\\Setup\\Scripts\\rdgw-setup.log${CL} in the guest to see where it is."
+  return 1
 }
 
 ask() {  # ask <title> <default> -> ASK_RESULT
@@ -2364,7 +2383,7 @@ ${BOLD}What runs, in order${CL}
       Gateway role, reboots if Windows asks, then runs
       ${BL}Setup-RDGateway.ps1${CL} and verifies the TSGateway service.
 
-   Expect ${BL}two or three reboots${CL} and roughly 20-40 minutes depending on
+   Expect ${BL}two or three reboots${CL} and roughly 30-45 minutes depending on
    the disk underneath.
 
 ${BOLD}Where to look${CL}
@@ -2480,8 +2499,13 @@ if [[ "$UNATTEND" == "yes" && "$START_VM" == "yes" && "$DRY_RUN" != "1" ]]; then
     # The media stays on purpose so a retry has the VirtIO CD to install the
     # guest tools from. Say what that leaves behind when it is more than a
     # local password.
+    if [[ "${FOLLOW_TIMED_OUT:-0}" == "1" ]]; then
+      msg_warn "The CDs stay attached until you have seen it finish. Once the log ends with"
+      msg_warn "'First-boot setup finished.', take them away with:"
+      msg_warn "  qm set ${VMID} --boot order=scsi0 && qm set ${VMID} --delete ide0,ide2,sata0 && rm -f ${UNATTEND_ISO_PATH}"
+    fi
     if [[ -n "${CLOUDFLARE_TOKEN:-}" ]]; then
-      msg_warn "The build did not finish, so the CDs stay attached for the retry."
+      msg_warn "The CDs stay attached, and so does the unattend ISO."
       msg_warn "${BL}${UNATTEND_ISO_PATH}${CL} holds your Cloudflare API token in clear"
       msg_warn "text. Delete it or revoke the token if you are not retrying now."
     fi
