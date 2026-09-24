@@ -1978,8 +1978,8 @@ sys.stdout.write(d.get("out-data", ""))' 2>/dev/null
 # Set NO_WAIT=1 to skip all of this and return as soon as the VM starts.
 follow_build() {
   local deadline agent=no printed=0 log line new finished=no failed=no
-  local last_note=0 rd wr nagged=no
-  local rd_last=0 rd_quiet_since=0 restarted=no
+  local last_note=0 rd wr nagged=no primed=no
+  local rd_last=0 rd_quiet_since=0 restarted=no wr_last=0 move_last=0
 
   if [[ "$NO_WAIT" == "1" ]]; then
     msg_warn "NO_WAIT=1 - not waiting. The build continues without supervision;"
@@ -1999,13 +1999,32 @@ follow_build() {
         last_note=$SECONDS
         rd="$(qm_bytes_read ide0)"; rd="${rd:-0}"
         wr="$(qm_bytes_written scsi0)"; wr="${wr:-0}"
-        # This used to say "installing". It was watched saying it for
+        # Track whether anything is moving. rd_last is last tick's DVD read
+        # (the restart detector below updates it); wr_last is last tick's disk
+        # write. Either changing means the install is still doing something, so
+        # the stall check further down never fires during a healthy install.
+        (( move_last == 0 )) && move_last=$SECONDS
+        (( rd != rd_last || wr != wr_last )) && move_last=$SECONDS
+        wr_last=$wr
+        # This used to say "installing". It was watched saying that for
         # twenty-five minutes while Windows sat at a finished desktop running
         # the first-boot task, because the guest agent had failed to install
         # and this branch is all there was. The counters are the only thing
         # this phase actually knows, so say only that.
         printf "   ${DIM}%4ds  waiting for the guest agent - read %s MiB from the DVD, written %s MiB to disk${CL}\n" \
           "$SECONDS" "$(( rd / 1048576 ))" "$(( wr / 1048576 ))"
+        # One calm word up front so a long, quiet install does not read as
+        # broken. The agent cannot answer before first boot - no OS runs until
+        # then - so only the counters move here, sometimes for half an hour on
+        # slower storage. This is where the alarming "agent not coming" warning
+        # used to be; it fired on a timer while the disk was still being written.
+        if [[ "$primed" == "no" ]]; then
+          primed=yes
+          msg_info "No guest agent yet, which is normal: it comes up at first boot, once Windows"
+          msg_info "has installed. Until then only the disk counters move, sometimes for half an"
+          msg_info "hour. Do NOT type in the VM console - the build reboots and a stray key answers"
+          msg_info "the DVD prompt and restarts the install over itself."
+        fi
 
         # Did the install start over? Setup reads the whole image off the DVD
         # and then the counter goes flat for the rest of the build. If it wakes
@@ -2032,18 +2051,17 @@ follow_build() {
           rd_quiet_since=0
         fi
         rd_last=$rd
-        # A Windows install plus a first boot reaches the agent inside about
-        # twenty minutes. Past that, something is wrong and the counters will
-        # never say what, so stop implying patience is the answer.
-        if [[ "$nagged" == "no" ]] && (( SECONDS > 1500 )); then
+        # A flat install for a few minutes is normal - the image is applied and
+        # the machine is rebooting into first boot. Only a long TOTAL stall,
+        # nothing read or written and still no agent, is worth a word, and even
+        # then it is "go look", not "it failed". 15 minutes because specialize
+        # itself writes to disk, so real work keeps move_last fresh.
+        if [[ "$nagged" == "no" ]] && (( SECONDS - move_last >= 900 )); then
           nagged=yes
-          msg_warn "No guest agent after $((SECONDS / 60)) minutes. The build may be running fine and"
-          msg_warn "unreadable from here - the VirtIO guest tools carry the agent, and if they"
-          msg_warn "failed there is nothing left to ask. Open the VM console and read"
-          msg_warn "${BL}C:\\Windows\\Setup\\Scripts\\rdgw-setup.log${CL} directly."
-          msg_warn "Do not send keystrokes to that console: the build reboots several times,"
-          msg_warn "the DVD is still first in the boot order, and a stray Return answers the"
-          msg_warn "boot prompt and restarts the whole install over the top of it."
+          msg_warn "Nothing has read or written for $(( (SECONDS - move_last) / 60 )) minutes and the guest"
+          msg_warn "agent still has not answered. It may just be between phases; if you want to be"
+          msg_warn "sure, open the VM console (read only) and check"
+          msg_warn "${BL}C:\\Windows\\Setup\\Scripts\\rdgw-setup.log${CL}. Do not type in that console."
         fi
       fi
     fi
