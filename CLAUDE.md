@@ -13,7 +13,7 @@ behind one public hostname, using stock RD clients.
 | File | Runs on | Status |
 |---|---|---|
 | `windows-rdgw-vm.sh` | Proxmox host, root | **Run for real repeatedly.** Boots and installs, see below |
-| `Setup-RDGateway.ps1` | The Windows guest, elevated | **Run for real.** Installed the role and wrote the policies; the CAP readback was correct |
+| `Setup-RDGateway.ps1` | The Windows guest, elevated | **Run for real, connections proven end to end 2026-09-23.** Installs the role, writes the policies, and adds the connecting account to Remote Desktop Users - the fix for the 23002 RAP denial |
 | `Configure-Guest.ps1` | The Windows guest, SYSTEM | **Run for real** in both phases. The guest-tools step is the one that has failed |
 | `Invoke-GatewaySetup.ps1` | The Windows guest, SYSTEM | **Run for real.** Registers in specialize, drives the first boot to the end |
 | `Invoke-CustomScripts.ps1` | The Windows guest | **Executed for real** on Windows PowerShell 5.1, see below |
@@ -411,13 +411,36 @@ bug will surface.
   thing. A readback proves the provider stored what it was given; it says nothing about
   whether the policy engine honours it. The first real client to reach this gateway was
   refused with error 23002 and event 301, which is a RAP denial, so the readback had been
-  green over a policy that does not admit anyone. The convention may still be correct -
-  recreating the policy with the argument omitted rather than empty stores identically, so
-  from outside the two are indistinguishable - but nothing had tested it. The general
-  version, which is why this is worth a paragraph: `Get-RDGWStatus.ps1` reads
-  configuration, and only a connection tests policy. Do not let a green status line stand
-  in for a client that has actually connected, and do not record a value as working
+  green over a policy that does not admit anyone. Settled 2026-09-23: the convention is
+  fine and the RAP content was never the problem - see "Why the RAP denied every
+  connection" just below. The general lesson is what earns the paragraph: `Get-RDGWStatus.ps1`
+  reads configuration, and only a connection tests policy. Do not let a green status line
+  stand in for a client that has actually connected, and do not record a value as working
   because it read back.
+
+- **Why the RAP denied every connection, settled 2026-09-23.** For days every connection
+  failed with error 23002, an event 301 RAP denial, while the CAP passed with event 200.
+  Everything readable about the RAP was correct: enabled, `ResourceGroupType=ALL`, the same
+  user groups the CAP uses, protocol RDP, port 3389. Recreating it with an explicit resource
+  group that named the target by name changed nothing, and that is what finally pointed away
+  from the RAP's content. The cause is UAC remote token filtering. The gateway account is a
+  LOCAL account on a workgroup box, and with `EnableLUA=1` and `LocalAccountTokenFilterPolicy`
+  unset (both defaults), Windows strips `BUILTIN\Administrators` out of a local account's
+  network logon token, leaving it deny-only. The CAP is evaluated by NPS against the account
+  database, which still sees the account in Administrators, so it passes. The RAP is
+  evaluated by the gateway service against the connection's ACCESS TOKEN, where Administrators
+  is now deny-only, so it counts the account as a member of nothing the policy lists and
+  refuses every resource. Two different membership mechanisms, one filtered and one not, is
+  why the gates disagreed. The fix: put the connecting account in Remote Desktop Users
+  (`S-1-5-32-555`), which is not an administrative group and so is not filtered; the default
+  `AllowedGroups` already lists it. `Setup-RDGateway.ps1` now does this when given
+  `-AccountName`, and `Invoke-GatewaySetup.ps1` passes the name from the config. Confirmed on
+  hardware: a remote, external client connected through the gateway to the gateway itself,
+  and then to a second LAN machine - a different box, with its own local account and no
+  knowledge of the gateway account - once the gateway account was in Remote Desktop Users.
+  Two earlier claims in this file were wrong and are corrected by this: the "ALL / empty
+  `ResourceGroupName`" convention was never broken, and `Configure()` / `IsConfigured` was a
+  red herring (see the entry below).
 - **`Win32_TSGatewayServerSettings.IsConfigured` reads `False` on a gateway this script
   finished, and that is a defect here rather than a curiosity.** Found 2026-09-21 while
   chasing the 23002 above. `Setup-RDGateway.ps1` calls the parameterless `Configure()`
@@ -429,10 +452,12 @@ bug will surface.
   hand it returned rc=0 and flipped `IsConfigured` to `True`. The shape fits the symptom:
   the CAP is evaluated at the HTTP and authentication layer, where event 200 passes, and
   the RAP when the RPC channel opens the connection to the target, which is the leg that
-  fails. **Whether it is the cause of the 23002 is still unknown.** It is a measured anomaly
-  that fits, not a demonstrated fix, and only a client connecting settles it. The defect
-  stands either way: setup work placed on a failure-only path is wrong, because if
-  `Configure()` is needed at all it is needed when the binding succeeds too.
+  fails. **Ruled out as the cause of the 23002, 2026-09-23.** The 23002 persisted after
+  `Configure()` returned rc=0 and flipped `IsConfigured` to True; the real cause was UAC
+  token filtering (see "Why the RAP denied every connection" above). It was not added to the
+  success path: nothing shows it is required, since the gateway bound its certificate,
+  listened on 443 and passed the CAP with `IsConfigured=False` the whole time. Left here as a
+  worked example of a measured anomaly that fit the symptom and still was not the cause.
 - **A known cosmetic wart in the log, not yet fixed.** The specialize entries are stamped
   `08:43` and everything from first boot on is stamped `11:46`, because specialize runs
   before the timezone is applied. The build is continuous; the log just looks like it

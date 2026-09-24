@@ -115,6 +115,13 @@ param(
 
     [string[]] $AllowedGroups = @('BUILTIN\Administrators', 'BUILTIN\Remote Desktop Users'),
 
+    # The account that will connect THROUGH the gateway. It is added to the local
+    # Remote Desktop Users group - see the "Remote Desktop Users" step below for
+    # why that membership, not its membership in Administrators, is what lets the
+    # RAP admit it. Empty leaves group membership untouched, which is the right
+    # default for an interactive admin running this by hand who is already in it.
+    [string] $AccountName = '',
+
     [string[]] $TargetMachines = @(),
 
     [ValidateSet('ThisServerOnly', 'Listed', 'AnyResource')]
@@ -533,9 +540,13 @@ $resourceGroup     = ''
 if ($ResourceScope -in @('ThisServerOnly', 'Listed')) {
 
     # The gateway box itself is always reachable - you will want a way in even
-    # when the machine you were actually after is off.
+    # when the machine you were actually after is off. Its own hostname and IPs
+    # come from Get-ResourceIdentity below. The external FQDN is deliberately NOT
+    # added here: it is this gateway's PUBLIC name, never an internal tunnel
+    # target, and on a real build it resolves to the WAN address, which the
+    # resource-group Create rejects with 0x80075A42 (measured 2026-09-23) - which
+    # took the whole Listed/ThisServerOnly path down with it.
     $names = New-Object System.Collections.Generic.List[string]
-    $names.Add($ExternalFqdn)
     Get-ResourceIdentity -Machine $env:COMPUTERNAME | ForEach-Object { $names.Add($_) }
 
     if ($computerSystem.PartOfDomain -and $computerSystem.Domain) {
@@ -627,6 +638,56 @@ Invoke-TSGatewayMethod -ClassName 'Win32_TSGatewayResourceAuthorizationPolicy' `
                        -Arguments $rapArgs `
                        -ArgumentOrder @($rapArgs.Keys)
 Write-Good "RAP '$RapName' created - scope: $ResourceScope"
+
+# ------------------------------------------------------------------------------
+# 6b. Put the connecting account in Remote Desktop Users
+# ------------------------------------------------------------------------------
+# This is the step whose absence made every connection fail with error 23002 -
+# an event 301 RAP denial - while the CAP passed with event 200, for days.
+#
+# The two gates read group membership by different mechanisms:
+#
+#   CAP  NPS evaluates it against the account database, so it sees the account
+#        in BUILTIN\Administrators and passes.
+#   RAP  the gateway service evaluates it against the ACCESS TOKEN of the
+#        incoming connection.
+#
+# On a workgroup gateway the connecting account is local, and UAC remote token
+# filtering - EnableLUA=1 with LocalAccountTokenFilterPolicy unset, the default -
+# strips BUILTIN\Administrators out of a local account's network logon token,
+# leaving it deny-only. So the RAP, checking the token, does not count the
+# account as an administrator and refuses every resource, even one named
+# explicitly in a resource group. Remote Desktop Users (S-1-5-32-555) is not an
+# administrative group, so UAC does not filter it, and the RAP admits it. The
+# default AllowedGroups already lists Remote Desktop Users; this makes the
+# account a member of it. See CLAUDE.md, "Why the RAP denied every connection".
+#
+# Confirmed 2026-09-23: a remote, external client connected through the gateway
+# to the gateway itself and to a second LAN machine only after this was added.
+if ($AccountName) {
+    Write-Step "Adding '$AccountName' to Remote Desktop Users"
+    $already = @(Get-LocalGroupMember -Group 'Remote Desktop Users' -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -like "*\$AccountName" -or $_.Name -eq $AccountName })
+    if ($already.Count -gt 0) {
+        Write-Good "'$AccountName' is already in Remote Desktop Users"
+    }
+    else {
+        try {
+            Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $AccountName -ErrorAction Stop
+            Write-Good "'$AccountName' added to Remote Desktop Users"
+        }
+        catch {
+            Write-Warn "Could not add '$AccountName' to Remote Desktop Users: $($_.Exception.Message)"
+            Write-Note "Without this, connections fail with error 23002 (a RAP denial). Add it by hand:"
+            Write-Note "  Add-LocalGroupMember -Group 'Remote Desktop Users' -Member '$AccountName'"
+        }
+    }
+}
+else {
+    Write-Note "No -AccountName was given, so Remote Desktop Users membership is unchanged."
+    Write-Note "The account you CONNECT WITH must be in this gateway's Remote Desktop Users"
+    Write-Note "group, or every connection fails with error 23002. See the runbook."
+}
 
 # ------------------------------------------------------------------------------
 # 7. Firewall

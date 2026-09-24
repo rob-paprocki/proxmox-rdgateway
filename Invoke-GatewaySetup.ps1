@@ -444,6 +444,12 @@ $arguments = @{
 if ($cfg.TargetMachines -and $cfg.TargetMachines.Count -gt 0) {
     $arguments['TargetMachines'] = $cfg.TargetMachines
 }
+# The account that will connect through the gateway must land in Remote Desktop
+# Users, or the RAP refuses it with error 23002. Setup-RDGateway.ps1 does the
+# add; it only needs the name, which the builder wrote into the config.
+if ($cfg.AccountName) {
+    $arguments['AccountName'] = $cfg.AccountName
+}
 
 Write-Line "Running Setup-RDGateway.ps1 -ExternalFqdn $($cfg.ExternalFqdn) -ResourceScope $scope -SkipRoleInstall"
 switch ($scope) {

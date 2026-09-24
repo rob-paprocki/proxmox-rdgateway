@@ -577,6 +577,34 @@ authentication level:i:2
 
 `gatewayusagemethod:i:1` means always use the gateway; `gatewayprofileusagemethod:i:1` means use these explicit settings rather than any admin-pushed profile; `promptcredentialonce:i:1` reuses the gateway credentials for the target so you only type them once.
 
+### Reaching your other machines
+
+The gateway's whole point is the machines *behind* it, and connecting to one is the file above with two changes plus one idea that trips everyone up the first time.
+
+A gateway connection has two separate logins, and they do not have to be the same account:
+
+- **To the gateway**, with an account the gateway knows and that passes its policies. That is the account you set up on the gateway itself.
+- **To the target machine**, with an account *that machine* knows. The gateway neither has nor needs this account; the target checks it at the far end.
+
+So to reach `win11-dev-777` as its local user `robp`, when the gateway account is `RDGW01\rdgadmin`:
+
+```
+full address:s:win11-dev-777
+gatewayhostname:s:rdg.yourdomain.tld
+gatewayusagemethod:i:1
+gatewaycredentialssource:i:0
+gatewayprofileusagemethod:i:1
+promptcredentialonce:i:0
+username:s:win11-dev-777\robp
+authentication level:i:2
+```
+
+The two changes are `full address` (the target) and `username` (an account on the target). The one that matters is `promptcredentialonce:i:0`: it tells the client the gateway and the target use *different* credentials, so it asks for each. You get two prompts and that is correct, the target first (`win11-dev-777\robp`) then the gateway (`RDGW01\rdgadmin`). Use `1` only when one account works for both, as when you connect to the gateway box itself.
+
+The target needs what the RAP section above lists: Remote Desktop on, your account in *its* Remote Desktop Users group, its firewall allowing 3389 from the gateway, and a name the gateway can resolve (a plain LAN hostname usually does; if not, put the target's IP in `full address`). One extra trap on workgroup machines: **the target account must have a real password.** Windows refuses a network logon for a blank-password account, and a gateway connection is a network logon, so a passwordless account that logs in fine at the keyboard fails here.
+
+The quick check: if you can RDP straight to the target from another machine on the LAN, without the gateway, the gateway path will work too. The gateway only adds the `rdgadmin` hop in front.
+
 **On Android**, the Windows App is the current client, and it inherits the Gateways screen from the old Remote Desktop app. Add the gateway there first, then attach it to the PC connection. Note that the Windows App **cannot import `.rdp` files**; that capability was dropped, so connections have to be recreated by hand on each device. Microsoft documents the Windows App's gateway settings for macOS and iOS/iPadOS explicitly; Android isn't covered in that article, so if the Gateways screen isn't where you expect it, that's the thing to go looking for.
 
 ### Watching it work
@@ -588,7 +616,7 @@ Get-WinEvent -LogName Microsoft-Windows-TerminalServices-Gateway/Operational -Ma
     Format-Table TimeCreated, Id, Message -AutoSize
 ```
 
-Event **200** means the client reached the gateway. **300** means the RAP authorized the target. **302** means traffic is flowing through to it. If you see 200 but never 300, your RAP doesn't list the name the client asked for; check what name you put in "Computer" against the resource group the script built.
+Event **200** means the client reached the gateway. **300** means the RAP authorized the target. **302** means traffic is flowing through to it. **301** with error **23002** means the RAP refused the target, and the usual cause is not the resource list at all: the connecting account is a local account whose network token has had `Administrators` filtered out by UAC, so the RAP does not count it as a member. The script fixes this by adding the account to the gateway's own Remote Desktop Users group; if you built by hand, make sure it is there. A genuine name mismatch shows the same 23002, so if the account is in Remote Desktop Users and it still fails, check the name you put in "Computer" against the resource group the script built.
 
 ## Things worth knowing
 
