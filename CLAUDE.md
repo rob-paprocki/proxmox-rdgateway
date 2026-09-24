@@ -976,6 +976,31 @@ bug will surface.
   passwords, Ctrl+Alt+Del) all default to leaving Windows as it ships. They exist because the
   operator explicitly asked to be able to loosen them. State the consequence once in the
   prompt, then do what was picked. Do not re-litigate it in the docs or the scripts.
+- **Five settings standardized 2026-09-24, after the operator configured VM 200 by hand:
+  ballooning, drive removal, static IP, OpenSSH and a first-class product key.** Each is in
+  the scripts so a rebuild reproduces the box rather than losing the manual tweaks. The
+  design choices worth keeping:
+  - **Ballooning** is `qm create --balloon <floor>` (default 2048, `BALLOON_MIN` overrides),
+    not `--balloon 0`. A floor below the max is what lets the host reclaim RAM; 0 disables it.
+  - **`cleanup_media` deletes the CD/DVD drives** (`qm set --delete ide0,ide2,sata0`), boot
+    order to the disk first so the deleted DVD is out of the boot list. It runs only after a
+    successful build, so a failed build keeps its drives for the retry - the same invariant
+    the `follow_build || exit 1` ordering already protects, and `test-cleanup.sh` checks the
+    boot-before-delete order.
+  - **Static IP and OpenSSH run in the first-boot pass, not specialize.** `New-NetIPAddress`
+    needs the NIC up, which it reliably is by first boot; `Add-WindowsCapability` is a
+    servicing operation, the same reason Defender removal is not in specialize. A static IP
+    that fails falls back to DHCP rather than leaving the box unreachable, and the build
+    survives it because the agent talks over the serial channel, not the network. Both log a
+    `[skip]` in specialize saying where they run.
+  - **The product key is the existing GVLK path, surfaced.** `GVLK` already flowed to the
+    answer file's specialize `ProductKey`; the only change is offering a real retail/MAK key
+    for Standard/Datacenter, not only in the custom-image branch. No new answer-file code.
+  - New psd1 fields (`NetMode`, `StaticIP`, `StaticPrefix`, `StaticGateway`, `StaticDns`,
+    `EnableSsh`) round-trip with the right types, and an old config missing them reads as
+    DHCP with SSH off - the `$null`-is-falsy convention, same as `DisableIPv6`.
+  Verified statically (bash -n, shellcheck, PSScriptAnalyzer, the harnesses, a psd1
+  round-trip) but **not yet built on hardware** - the next rebuild closes that.
 - `Setup-RDGateway.ps1` must stay **pure ASCII** and must run under **Windows PowerShell 5.1**
   (`powershell.exe`, not `pwsh`, because the WMI fallback uses `[wmiclass]`, removed in PS 7).
 - The RD authorization policies go through the documented `Win32_TSGateway*` WMI classes

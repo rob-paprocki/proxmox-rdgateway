@@ -133,6 +133,7 @@ Say yes to "unattended install" and it asks the following. Nothing here has a sa
 | Windows time zone ID | `Eastern Standard Time` | The Windows name, not the IANA one. `tzutil /l` lists them. |
 | What clients may reach | Any machine the gateway can reach | Three options. "Only machines I name" then asks for a space separated list. See [what the two policies mean](#what-the-two-policies-mean). |
 | Edition | Standard (Desktop Experience) | Picks the image name and the matching GVLK together so they can't drift apart. There are Evaluation entries, which correctly send no key at all. |
+| Product key | the edition's generic key | Standard and Datacenter also offer a real retail or MAK key here. The generic volume key only selects the edition and expects a KMS host; a real key activates outright. It rides the answer file in clear text like the password, and the ISO is deleted on success. |
 | Lockout threshold | `10` | `0` disables lockout entirely. |
 | Lockout window | `15` minutes | Used for both the window and the duration. |
 | Disable UAC | no | |
@@ -141,6 +142,8 @@ Say yes to "unattended install" and it asks the following. Nothing here has a sa
 | Disable IPv6 | no | See below. |
 | Require Ctrl+Alt+Del | no | The one that defaults to the *less* strict answer, because sending Ctrl+Alt+Del to a Proxmox console is a menu trip rather than a keystroke. |
 | Housekeeping settings | yes | 8.3 names off, fast startup off, long paths on, WPBT off, no Windows Update auto-reboot, system sounds off, NumLock on, and Explorer/taskbar/theme defaults suited to RDP. |
+| IP addressing | DHCP | A gateway behind a port-forward wants a fixed address. Choose static to set the address, prefix, gateway and DNS; it is applied in the first-boot pass and falls back to DHCP if anything about it is wrong. Reserving a DHCP lease on your router is the alternative. |
+| OpenSSH server | no | Installs the OpenSSH server and makes PowerShell the default shell, so you can administer the box with `ssh rdgadmin@<ip>` instead of the Proxmox console. Opens TCP 22 on the LAN. |
 | Custom scripts | no | Opens a menu: write scripts of your own here, or import files you already have. |
 
 The four security toggles all default to leaving Windows exactly as it ships. They are there so you can loosen them deliberately; each prompt states what it costs, and then does what you picked without arguing further.
