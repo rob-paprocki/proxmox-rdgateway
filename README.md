@@ -33,7 +33,7 @@ of questions to you (account name, password, lockout policy, external FQDN, whic
 to reach), then writes a third CD holding an answer file, the VirtIO drivers and the setup
 scripts. Windows installs itself, a startup task installs the RD Gateway role and runs
 `Setup-RDGateway.ps1`, and you come back to a working gateway after two or three reboots and
-twenty to forty minutes.
+thirty to forty-five minutes.
 
 Say no and you get a correctly configured VM shell with both ISOs attached, and you drive
 Setup yourself. That path is documented below in full, and it is the one to fall back on
@@ -46,7 +46,7 @@ when something in the automated build misbehaves.
                       -TargetMachines 'DESKTOP-01','NAS01','192.168.1.60'
 ```
 
-One public hostname, many machines behind it. That is what `-TargetMachines` is for. The
+That is what `-TargetMachines` is for: one public hostname, many machines behind it. The
 targets install nothing: they need Remote Desktop on, your account in their Remote Desktop
 Users group, and a name the gateway can resolve. Windows Pro is fine as a target; only the
 gateway itself has to be Server.
@@ -254,7 +254,7 @@ Nothing to do. It is here so you know what is happening and where to look if it 
 6. That task installs the VirtIO guest tools, removes the Defender feature if you asked for that and takes the reboot it needs, installs the RD Gateway role, then runs `Setup-RDGateway.ps1` and checks that the `TSGateway` service came up.
 7. Last, it does whatever you chose for the certificate. That step is last because it needs the role to exist, and because the self-signed certificate is bound by then, so nothing it does can leave you without a working gateway.
 
-Expect two or three reboots and roughly twenty to forty minutes. Everything is timestamped in:
+Expect two or three reboots and roughly thirty to forty-five minutes. Everything is timestamped in:
 
 ```
 C:\Windows\Setup\Scripts\rdgw-setup.log

@@ -28,7 +28,7 @@ behind one public hostname, using stock RD clients.
 `windows-rdgw-vm.sh` has been run for real on the operator's Proxmox VE 9.2.20
 host repeatedly, and the DVD boot prompt defeated the first two attempts. On 2026-09-19
 nobody was there to answer it. On 2026-09-20 the script was there and still
-failed, twice, for two different reasons - a twenty-second window that closed
+failed, twice, for two different reasons: a twenty-second window that closed
 before OVMF reached the DVD, and then a `qm monitor` call that hung forever on
 piped input and froze the script mid-loop. Both are in "Ruled out" and in the
 `press_a_key` convention below, because each one looked correct right up until
@@ -170,7 +170,7 @@ It does not merely fail to answer. It never exits, and it prints its own `qm>` p
 into the caller's terminal. `press_a_key` called it in a command substitution, so
 `qm_bytes_read` never returned, the loop hung forever, and the VM sat on an unanswered
 boot prompt until OVMF gave up with "No bootable option or device was found". That is
-the true cause of the second and third failed builds - not the timing, which had already
+the true cause of the second and third failed builds, not the timing, which had already
 been fixed. `qm monitor` wants a terminal and a pipe does not satisfy it. Use
 `qm status <vmid> --verbose`, which needs no terminal, exits by itself, and carries the
 same counters under `blockstat:` as one indented stanza per device (`ide0:`, `ide2:`,
@@ -191,22 +191,22 @@ CSI  80220005 [Error,Facility=FACILITY_STATE_MANAGEMENT,Code=5] from CWcmScalarI
 ```
 
 "Value is invalid" on a scalar means **too long**. Measured: our two `reg.exe` RunOnce
-commands were 273 and 266 characters. Corroboration - every one of the 49 `<Path>` values
+commands were 273 and 266 characters. Corroboration: every one of the 49 `<Path>` values
 in the operator's known-good schneegans file is **at or under 255**, and that generator
 builds `X:\pe.cmd` by appending 44 separate tiny `cmd.exe /c >>X:\pe.cmd (...)` fragments
 rather than writing one long command. That is not a style choice, it is this limit.
 `build_unattend_iso` now refuses to ship any `<Path>` over 255, regression-tested against
 the exact file that failed (273 -> refused) and the one that replaced it (157 -> accepted).
 **Do not add long commands to the answer file.** If the guest needs to do something, teach
-`Invoke-GatewaySetup.ps1 -Register` to register it - that already runs in specialize, is a
+`Invoke-GatewaySetup.ps1 -Register` to register it: that already runs in specialize, is a
 PowerShell script with no length limit, and logs what it did.
 
 **XML comments below `<component>`: suspected, then disproved.** Worth recording because
 a whole build was spent on it. A comment between `<Description>` and `<Path>` was the first
 suspect for the `0x80220005` above; removing it changed nothing, and the next build failed
 identically. The cause was the `<Path>` length, every time. Comments below `<component>`
-may well be harmless. The generator still emits none - prose about the answer file belongs
-in `windows-rdgw-vm.sh`, where it costs nothing - and the guard stays as cheap insurance,
+may well be harmless. The generator still emits none (prose about the answer file belongs
+in `windows-rdgw-vm.sh`, where it costs nothing), and the guard stays as cheap insurance,
 but do not repeat the claim that Windows rejects them, because that was never demonstrated.
 The genuine lesson is the diagnostic one: **`hrDeserialized` versus `hrValidated` in
 `setupact.log` tells you whether it is an XML problem or a schema problem, and reading that
@@ -217,7 +217,7 @@ first would have skipped the wrong fix entirely.**
 `CApplyDrivers::CopyToDriverStore ... 0x80070002` appear right before the real failure and
 look far more alarming than it does. Both are innocent: the ESP was mounted afterwards and
 is fully populated with `bootmgfw.efi`, `bootmgr.efi` and `bootx64.efi`, and the
-`$WinPEDriver$` payload on the ISO is complete - all 17 files across vioscsi, viostor and
+`$WinPEDriver$` payload on the ISO is complete: all 17 files across vioscsi, viostor and
 NetKVM, including `netkvmco.exe`. Go straight to `UnattendDumpSetting` and the
 `SMI data results dump` lines instead.
 
@@ -226,7 +226,7 @@ unenforceable. The answer-file validation had always been written as
 `command -v xmllint || skip`, so on the operator's host it silently did nothing, and had
 never once run where it mattered. Proxmox does guarantee `perl` with `XML::LibXML`
 (pve-manager depends on it) and ships `python3`, so the check now tries xmllint, then
-perl, then python3, and **says which one ran** - or warns loudly that none did. Verified
+perl, then python3, and **says which one ran**, or warns loudly that none did. Verified
 on the host across all three cases: a nested comment returns 1, a comment directly under
 `<component>` returns 0, malformed XML is caught. Do not write
 another `command -v X || silently skip` check in this repo; a check nobody can see fail is
@@ -249,12 +249,12 @@ MSI logs and **three rollback logs**, so the MSIs ran and were backed out. On th
 machine, `sc.exe query qemu-ga` and `sc.exe query vioserial` both return "The specified
 service does not exist as an installed service", and `qm agent 200 ping` on the host
 answers "QEMU guest agent is not running" with the VM config reading
-`agent: enabled=1` - so the Proxmox side was never the problem. `follow_build` spent that
+`agent: enabled=1`, so the Proxmox side was never the problem. `follow_build` spent that
 entire build blind. Note that `return value 3` does **not** appear in the main MSI log, so
 this is not a custom action failing; the install is refused earlier than that.
 **The fix was then confirmed on the same hardware the same day.** Moved to the top of the
-first-boot pass and run again - same installer, same media, same `/passive /norestart`
-command line - it reports `[ ok ] Installed F:\virtio-win-guest-tools.exe (exit 0)`, the
+first-boot pass and run again (same installer, same media, same `/passive /norestart`
+command line), it reports `[ ok ] Installed F:\virtio-win-guest-tools.exe (exit 0)`, the
 agent answers about a minute later, and `follow_build` streams the log for the rest of the
 build including across the post-Defender reboot. The phase is the whole difference.
 Microsoft's [Audit mode overview](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/audit-mode-overview)
@@ -288,7 +288,7 @@ What follows from it: **Option A is the path** and the relay is unnecessary. `RE
 `vps-relay-setup.sh` and `proxmox-relay-peer.sh` stay in the repo because the constraint
 they solve is common and the scripts are written, but they are not this deployment's
 problem. It also means disabling IPv6 on the gateway, which he chose at build time, costs
-nothing here - the v6 route existed as the CGNAT workaround.
+nothing here: the v6 route existed as the CGNAT workaround.
 
 The original framing, kept because it is what the two branches mean:
 
@@ -337,12 +337,12 @@ bug will surface.
   the import were both real rather than mocked. It found one real bug: `Start-Process
   -PassThru` hands back an object whose `ExitCode` reads back empty once the child is
   gone, so every script looked like it had failed. Reading `$proc.Handle` right after
-  starting keeps the handle open and fixes it - do not remove that line.
+  starting keeps the handle open and fixes it. Do not remove that line.
 - The RAP scope is wired end to end and all three values were dry-run to a config file
   that round-trips: `AnyResource`, `Listed` with a machine list, `ThisServerOnly`.
   `ResourceGroupType = 'ALL'` is confirmed against Microsoft's `Create` reference for
-  `Win32_TSGatewayResourceAuthorizationPolicy`, which documents exactly three values -
-  `RG`, `CG`, `ALL` - and gives `ALL` as "All resources". What `ResourceGroupName`
+  `Win32_TSGatewayResourceAuthorizationPolicy`, which documents exactly three values
+  (`RG`, `CG`, `ALL`) and gives `ALL` as "All resources". What `ResourceGroupName`
   should be alongside `ALL` is *not* documented; the empty string is convention.
 - `qm sendkey <vmid> <key>` is confirmed **on the real host**, not just against the
   manual page: a VM parked on "Press any key to enter the Boot Manager Menu" was sent
@@ -351,7 +351,7 @@ bug will surface.
   confirmed on the real host: `blockstat:` followed by one tab-indented stanza per
   device, `ide0:` being the Windows DVD. Observed mid-boot with the prompt on screen:
   `ide0: rd_bytes: 3405824, rd_operations: 1663`, which is the firmware having read a
-  loader and stopped - exactly the state `press_a_key` presses in. The parser is unit
+  loader and stopped: exactly the state `press_a_key` presses in. The parser is unit
   tested against a transcription of that output, including a device legitimately
   reading `0` (must return `"0"`, not empty) and a stopped VM (must return empty).
 - **An adversarial review pass ran over this branch** (six independent finders, one
@@ -359,7 +359,7 @@ bug will surface.
   findings, 20 unique, all 20 read back against the source and confirmed. Every one is
   fixed. The three worth remembering, because they were all invisible to the dry-run
   suite: the missing XML escaping, the six bare msgboxes, and `Start-Process` dropping
-  everything after a space. The suite passed throughout, which is the point - it stubs
+  everything after a space. The suite passed throughout, which is the point: it stubs
   whiptail, so it never pressed Esc, and it never typed an ampersand.
 - Fixes verified empirically rather than by argument: `Start-Process` quoting and the
   numeric sort were reproduced and then re-run green with spaces in both the directory
@@ -378,7 +378,7 @@ bug will surface.
   Reference on Microsoft Learn: component names, valid configuration passes, child elements.
   The load-bearing one is `Microsoft-Windows-Deployment\RunSynchronous\RunSynchronousCommand`
   (`Order`, `Description`, `Path`) in `specialize`, which the docs confirm runs in the
-  system context - that is what copies the scripts off the CD and registers the task. Also
+  system context: that is what copies the scripts off the CD and registers the task. Also
   confirmed: `Primary` / `EFI` / `MSR` are valid `CreatePartition` types and an MSR partition
   correctly takes no `Format`; `WillWipeDisk` is what Microsoft recommends to avoid ending up
   with two ESPs; `HideLocalAccountScreen` is Server-only and is what stops OOBE asking for an
@@ -412,7 +412,7 @@ bug will surface.
   whether the policy engine honours it. The first real client to reach this gateway was
   refused with error 23002 and event 301, which is a RAP denial, so the readback had been
   green over a policy that does not admit anyone. Settled 2026-09-23: the convention is
-  fine and the RAP content was never the problem - see "Why the RAP denied every
+  fine and the RAP content was never the problem. See "Why the RAP denied every
   connection" just below. The general lesson is what earns the paragraph: `Get-RDGWStatus.ps1`
   reads configuration, and only a connection tests policy. Do not let a green status line
   stand in for a client that has actually connected, and do not record a value as working
@@ -436,8 +436,8 @@ bug will surface.
   `AllowedGroups` already lists it. `Setup-RDGateway.ps1` now does this when given
   `-AccountName`, and `Invoke-GatewaySetup.ps1` passes the name from the config. Confirmed on
   hardware: a remote, external client connected through the gateway to the gateway itself,
-  and then to a second LAN machine - a different box, with its own local account and no
-  knowledge of the gateway account - once the gateway account was in Remote Desktop Users.
+  and then to a second LAN machine (a different box, with its own local account and no
+  knowledge of the gateway account) once the gateway account was in Remote Desktop Users.
   Two earlier claims in this file were wrong and are corrected by this: the "ALL / empty
   `ResourceGroupName`" convention was never broken, and `Configure()` / `IsConfigured` was a
   red herring (see the entry below).
@@ -463,10 +463,10 @@ bug will surface.
   before the timezone is applied. The build is continuous; the log just looks like it
   jumped three hours. Worth normalising to UTC or stamping the offset.
 
-**Checked and deliberately NOT added to the answer file** - don't re-derive these:
+**Checked and deliberately NOT added to the answer file**, don't re-derive these:
 
-- `OOBE\NetworkLocation` - deprecated in Windows 10, documented for reference only.
-- `OOBE\VMModeOptimizations` - requires `sysprep /mode:vm`, which this flow never runs, so
+- `OOBE\NetworkLocation`: deprecated in Windows 10, documented for reference only.
+- `OOBE\VMModeOptimizations`: requires `sysprep /mode:vm`, which this flow never runs, so
   the settings would be inert.
 - Anything enabling Remote Desktop. `Setup-RDGateway.ps1` already sets `fDenyTSConnections=0`
   and `UserAuthentication=1` (NLA) and opens the firewall group at lines 259-267.
@@ -485,8 +485,8 @@ bug will surface.
   docs and forum usage rather than a run here, and have since built a VM that boots UEFI
   with a TPM several times. They work; nothing about them is still assumed.
 - The WMI calls **have** now run against a real RD Gateway, and the one that was wrong is
-  the `BUILTIN\` entry below. The rest - the 18-parameter CAP `Create`, the 8-parameter RAP,
-  the resource group - went in and read back. Certificate binding
+  the `BUILTIN\` entry below. The rest (the 18-parameter CAP `Create`, the 8-parameter RAP,
+  the resource group) went in and read back. Certificate binding
   (`Set-Item RDS:\GatewayServer\SSLCertificate\Thumbprint`) has now bound a self-signed
   certificate (2026-09-21) and a real Let's Encrypt certificate (2026-09-24). Both are
   confirmed on hardware; nothing about the binding is still assumed.
@@ -498,7 +498,7 @@ bug will surface.
   `Name@Domain` unless it is a real domain principal. Measured: `Administrators@BUILTIN`
   fails to translate, `BUILTIN\Administrators` gives `S-1-5-32-544`,
   `BUILTIN\Remote Desktop Users` gives `S-1-5-32-555`. Microsoft's class reference
-  documented `Domain\UserGroupName` the whole time - an example someone got working is not
+  documented `Domain\UserGroupName` the whole time: an example someone got working is not
   a specification. The default is now the `BUILTIN\` form, and `Setup-RDGateway.ps1`
   translates every group to a SID **before** calling `Create`, so a name that cannot
   resolve is reported by name instead of as a bare WMI number. The readback below is still
@@ -507,7 +507,7 @@ bug will surface.
   Get-CimInstance -Namespace root/cimv2/TerminalServices `
     -ClassName Win32_TSGatewayConnectionAuthorizationPolicy | Select-Object UserGroupNames
   ```
-- `Set-Item RDS:\GatewayServer\SSLCertificate\Thumbprint` - **verified 2026-09-21.** It
+- `Set-Item RDS:\GatewayServer\SSLCertificate\Thumbprint`: **verified 2026-09-21.** It
   bound the self-signed certificate on the first attempt and the log printed the thumbprint
   back plus `[ ok ] Listening on TCP 443`, so the WMI fallback (`SetCertificate` then
   `Configure`) and the `tsgateway.msc` advice have still never been needed. Binding a
@@ -517,7 +517,7 @@ bug will surface.
 - **`System` is confirmed; the other three custom-script categories are not.** On the
   2026-09-21 build the log reads `08:43:17 custom/System: running 1 script(s)`,
   `08:44:41 custom/System: 010-script.ps1 ok`, both **in specialize**, before any desktop
-  existed - which is exactly the claim that used to be false, and the reason the phase
+  existed, which is exactly the claim that used to be false, and the reason the phase
   moved. The first-boot pass then correctly logged `custom/System already ran in
   specialize, before any desktop existed` instead of running it twice. What still has not
   been watched is `DefaultUser`, `FirstLogon` and `UserOnce`: the `FirstLogon` `RunOnce`
@@ -536,8 +536,8 @@ bug will surface.
   load `vioscsi` (or Setup would have stopped with no disks to install to), and the
   `CreatePartition` layout **did** apply to a real disk. Do not re-list these as unverified.
   What happens after the last Setup reboot has now been watched too. It failed the first
-  time - the `RDGW-FirstBoot` task was never registered, because of the `$PSScriptRoot` bug
-  above - and then, with that fixed, **a complete build ran end to end**: the log finished
+  time (the `RDGW-FirstBoot` task was never registered, because of the `$PSScriptRoot` bug
+  above), and then, with that fixed, **a complete build ran end to end**: the log finished
   on `First-boot setup finished.`, the CAP read back
   `BUILTIN\Administrators;BUILTIN\Remote Desktop Users`, the TSGateway service was running
   and the task unregistered itself. The measured budget after first boot was 21m27s:
@@ -560,14 +560,14 @@ bug will surface.
      text, so parameter binding cannot fail. Ours died *during* parameter binding.
   3. **Hive load, run, unload as three separate answer-file commands**, so a script that
      throws cannot skip the unload. We run inside one script, so `try/finally` buys the same
-     guarantee - and it is not optional: `reg.exe` holds `NTUSER.DAT` open while loaded, and
+     guarantee, and it is not optional: `reg.exe` holds `NTUSER.DAT` open while loaded, and
      a locked Default User profile poisons every profile created afterwards.
   4. **Per-user settings go in twice, and Explorer gets restarted.** See the Default User
      hive entry below. His `RestartExplorer.ps1` kills only the current session's Explorer,
      which is what `Restart-ExplorerHere` does here.
 
   Not adopted: the generator itself. It is a C#/.NET application, so using it on a Proxmox
-  host means installing .NET or calling the hosted form at schneegans.de - and the answer
+  host means installing .NET or calling the hosted form at schneegans.de, and the answer
   file carries the Administrator password in clear text, so the hosted route would hand
   that to a third party. It also only produces `autounattend.xml`; it does not build the VM,
   assemble the ISO with the VirtIO drivers, or know anything about RD Gateway. A
@@ -580,7 +580,7 @@ bug will surface.
   Proxmox cannot read the VM's IP, cannot shut it down gracefully and cannot quiesce the
   filesystem for a backup, so a gateway built with housekeeping declined would quietly be
   the worse machine. It scans D: to Z: for `virtio-win-guest-tools.exe` and runs it
-  `/passive /norestart`, which works because the VirtIO CD is still on ide2 at first boot -
+  `/passive /norestart`, which works because the VirtIO CD is still on ide2 at first boot,
   before the runbook tells the operator to detach the CDs. Exit code 3010 counts as
   success; it means "restart required", and a restart is coming anyway. Missing tools are a
   `[skip]`, not a failure: the drivers themselves came from `$WinPEDriver$`, so the box
@@ -588,24 +588,24 @@ bug will surface.
   to run it by hand, correctly, because `Configure-Guest.ps1` never runs there.
   It runs **first** within `-Phase FirstBoot`, ahead of the Defender removal, because it
   takes about a minute and brings up the agent that `follow_build` needs, while Defender
-  takes ten and produces nothing anyone can watch. It does **not** run in specialize -
-  see the 1603 entry under "Ruled out".
+  takes ten and produces nothing anyone can watch. It does **not** run in specialize.
+  See the 1603 entry under "Ruled out".
 - **The agent MSI goes in before the bundle, and that ordering is the feature.**
   `virtio-win-guest-tools.exe` installs the balloon, serial, input and SPICE components and
   takes a couple of minutes. The only part anybody is waiting on is `qemu-ga`, because until
   it answers, `follow_build` cannot read a line of the guest log and prints a byte counter
   instead. The VirtIO CD ships the agent separately as
-  `<drive>\guest-agent\qemu-ga-x86_64.msi` - confirmed present on the operator's
-  virtio-win-0.1.302 media alongside `qemu-ga-i386.msi` - and it installs in seconds. So
+  `<drive>\guest-agent\qemu-ga-x86_64.msi` (confirmed present on the operator's
+  virtio-win-0.1.302 media alongside `qemu-ga-i386.msi`), and it installs in seconds. So
   `Invoke-GuestToolsInstall` runs that first with `msiexec /i "<path>" /qn /norestart`, then
   the full bundle. A failure on the agent MSI is a `[skip]`, not a `[fail]`: the bundle
   installs the agent too, so the only cost is the host staying blind a minute or two longer.
-  The path is quoted inside the `ArgumentList` for the `Invoke-Child` reason - `Start-Process`
+  The path is quoted inside the `ArgumentList` for the `Invoke-Child` reason: `Start-Process`
   joins with plain spaces and quotes nothing.
 - **The builder takes the media away itself once the build succeeds, and the unattend ISO
   is why.** That CD carries the account password in clear text and `qm destroy` does not
-  remove it, so the old advice - two commands in the closing summary for the operator to run
-  "when it is finished" - left a password on disk for however long it took someone to
+  remove it, so the old advice (two commands in the closing summary for the operator to run
+  "when it is finished") left a password on disk for however long it took someone to
   remember. `cleanup_media` detaches `ide0`, `ide2` and `sata0`, sets `--boot order=scsi0`
   and deletes the ISO. It runs **only** after `follow_build` returned 0, and the ordering in
   the source is load-bearing: `follow_build || exit 1` comes first, so a failed build never
@@ -616,7 +616,7 @@ bug will surface.
 - **IPv6 is a prompt, and the consequence stated in it is this project's, not Windows'.**
   The other toggles are security ones; this is not. `DisabledComponents = 0xFF` is the
   documented switch for "disable IPv6 on all interfaces and tunnels" while leaving the
-  protocol installed - do not go looking for a way to remove it outright, Microsoft does not
+  protocol installed. Do not go looking for a way to remove it outright, Microsoft does not
   support that and Windows components assume v6 is there. `Disable-NetAdapterBinding` on
   `ms_tcpip6` goes in alongside it for anything that reads the binding rather than the
   policy, and a failure there is a `[skip]` because the policy value is what decides.
@@ -636,8 +636,8 @@ bug will surface.
 - **The builder follows the build to the end and does not claim success before it.** It
   used to print "VM is built and will install itself" and exit, with thirty to forty
   minutes of install and configuration still ahead and nobody watching. Every failure this
-  project has had happened *after* that cheerful summary - a boot prompt nobody answered,
-  an answer file Windows refused, a gateway policy that returned ERROR_NONE_MAPPED - and in
+  project has had happened *after* that cheerful summary (a boot prompt nobody answered,
+  an answer file Windows refused, a gateway policy that returned ERROR_NONE_MAPPED), and in
   each case the script had already reported success. `follow_build` waits on the disk
   counters until the guest agent answers, then reads `rdgw-setup.log` through
   `qm guest exec` and prints each new line as it appears, exiting non-zero on an `[error]`
@@ -647,12 +647,12 @@ bug will surface.
 
   Its first phase used to print `installing - read N MiB from the DVD, written N MiB to
   disk`, and the operator watched it say that for twenty-five minutes while Windows sat at
-  a finished desktop running the first-boot task - because the guest tools had failed and
+  a finished desktop running the first-boot task, because the guest tools had failed and
   the agent was never coming. The counters are the only thing that phase knows, so it now
   says `waiting for the guest agent` and nothing more. Do not restore a word like
   "installing" to a branch that cannot tell.
 
-  **Its concern message is tied to a stall, not a clock - fixed 2026-09-24.** It used to
+  **Its concern message is tied to a stall, not a clock (fixed 2026-09-24).** It used to
   say "No guest agent after 25 minutes... if they failed there is nothing left to ask" once
   `$SECONDS` passed 1500. Two things were wrong with that, both seen on a real build. The
   message fired while the disk was still being actively written (14871 to 19094 MiB in the
@@ -667,7 +667,7 @@ bug will surface.
 
   **Timing out is not success.** `follow_build` used to return 0 on hitting
   `FOLLOW_SECONDS`, and the caller treats 0 as finished, so `cleanup_media` deleted the CDs
-  while the build "may still be going" - and if the guest tools had failed, took away the
+  while the build "may still be going", and if the guest tools had failed, took away the
   VirtIO CD the retry needs. It now sets `FOLLOW_TIMED_OUT=1` and returns 1; the caller
   leaves the media and prints the commands to remove it once the log says finished. The
   default cap went from 3600 to 5400: a Defender-removal build follows for about 45
@@ -678,20 +678,20 @@ bug will surface.
   up after five quiet minutes and reads another 256 MiB means the machine booted the media
   again and the new Setup has already wiped the disk. That is not hypothetical: the trace
   from 2026-09-21 is flat at 8053 MiB for eighteen minutes, then 8691, 9673, and on to
-  16104 - the disc read exactly twice - while the heartbeat said "installing" throughout
+  16104 (the disc read exactly twice), while the heartbeat said "installing" throughout
   and the operator had no way to know the build they were waiting on no longer existed.
   The detector is regression-tested against that transcribed trace, with a normal
   single-pass install as the control so it cannot fire on one.
 - **Do not send keystrokes to the guest console while a build is running.** Learned by
-  destroying one. The build reboots several times - after the Defender feature removal,
-  among others - the DVD is still first in the boot order at every one of them, and the
+  destroying one. The build reboots several times (after the Defender feature removal,
+  among others), the DVD is still first in the boot order at every one of them, and the
   only thing that stops the machine reinstalling itself is the "Press any key to boot from
   CD or DVD" prompt timing out unanswered. A single `Return`, sent to complete a filename
   while reading a log on that console, landed on that prompt during the post-Defender
   reboot; Windows Setup booted from the media, `WillWipeDisk` did what it says, and a build
   that was eleven minutes from finishing became "Installing Windows Server, 16% complete".
   This is the same fact `press_a_key` is built around, seen from the other end. The boot
-  order cannot simply be changed to disk-first either - see the `efisys_noprompt.bin` entry
+  order cannot simply be changed to disk-first either. See the `efisys_noprompt.bin` entry
   under "Ruled out" for why those mid-install reboots need the DVD to stay bootable. Read
   the guest's log through `qm guest exec` from the host; use the console read-only, and if
   something must be typed there, do it when the build is finished.
@@ -704,17 +704,17 @@ bug will surface.
   *after* the desktop was up. The phase name was a lie. cschneegans/unattend-generator
   runs its System phase in specialize, which is what makes the name honest.
   `Configure-Guest.ps1` now takes `-Phase`:
-  - **Specialize** - Default User hive, every machine setting and the operator's System
+  - **Specialize**: Default User hive, every machine setting and the operator's System
     scripts. Driven from `Invoke-GatewaySetup.ps1 -Register`, which already runs in that
     pass, so no new answer-file command and no new `<Path>` to bust the 259-character
     limit.
-  - **FirstBoot** - the VirtIO guest tools, then removing the Defender feature. Both are
+  - **FirstBoot**: the VirtIO guest tools, then removing the Defender feature. Both are
     here because they cannot be anywhere else. Defender is a CBS servicing operation that
     needs a reboot and must not run beside Setup's own servicing, and it is the single
     slowest step in the build at 10m33s measured. The guest tools are an installer bundle,
-    and an installer bundle exits 1603 in specialize - the whole story is under "Ruled
+    and an installer bundle exits 1603 in specialize. The whole story is under "Ruled
     out". They go first of the two so the agent arrives while Defender is still grinding.
-  - **All** - both, for running the script by hand.
+  - **All**: both, for running the script by hand.
 
   Do not move work back to the first-boot task for convenience. The measured budget after
   first boot was 21m27s, of which Defender was 10m33s and the RDS-Gateway role install
@@ -722,19 +722,19 @@ bug will surface.
   specialize. The line is **registry writes, file copies, hive loading and task
   registration go in specialize; anything that runs an installer does not.**
 - **The Default User hive is written during specialize, not by the first-boot task.** That
-  is the only moment when it is unambiguously correct - no profile exists yet, so what goes
+  is the only moment when it is unambiguously correct: no profile exists yet, so what goes
   in is genuinely inherited by the first account. `Invoke-GatewaySetup.ps1 -Register` calls
   `Configure-Guest.ps1 -DefaultUserOnly`, which drops a `rdgw-defaultuser.done` marker so
   the first-boot task skips it rather than running the operator's DefaultUser scripts a
   second time. The task keeps the code as a fallback for a specialize call that did not
   happen.
 - **The Default User hive cannot reach the auto-logon account, so the shell settings go in
-  twice.** Everything under `ApplyTweaks` - taskbar left, dark theme, Explorer defaults,
-  desktop icons - is written into `C:\Users\Default\NTUSER.DAT` so new profiles inherit it.
+  twice.** Everything under `ApplyTweaks` (taskbar left, dark theme, Explorer defaults,
+  desktop icons) is written into `C:\Users\Default\NTUSER.DAT` so new profiles inherit it.
   `AutoLogon` creates the first profile from that hive at roughly the same moment, and on
   the observed build the profile won: `rdgadmin` came up with a centred taskbar and the
   light theme, having been asked for neither. `Set-ShellSetting` therefore takes a registry
-  root and is called twice - once against the mounted hive, once against `HKCU:` by
+  root and is called twice: once against the mounted hive, once against `HKCU:` by
   `Configure-Guest.ps1 -ShellForCurrentUser`, which the answer file registers in **HKLM**
   `RunOnce` (Order 3) so it fires at the first interactive logon whoever that is. Neither
   call is redundant: the hive reaches future profiles, the HKCU pass reaches the account
@@ -752,11 +752,11 @@ bug will surface.
   The operator asked whether win-acme should be part of the script, having just hit the
   self-signed dialog from a real client. It should, and `Invoke-WinAcme.ps1` does it, but
   full unattended issuance is deliberately not the default:
-  1. **selfsigned** - what the build always did. Offline, no dependencies.
-  2. **staged** (default) - first boot downloads win-acme and writes
+  1. **selfsigned**: what the build always did. Offline, no dependencies.
+  2. **staged** (default): first boot downloads win-acme and writes
      `C:\win-acme\request-certificate.cmd` with the hostname, the email and the RD Gateway
      install script already filled in. The operator runs it with the token as argument 1.
-  3. **auto** - the same file, executed during the build with the token from the answer CD.
+  3. **auto**: the same file, executed during the build with the token from the answer CD.
 
   Both tiers write and run the *same* `request-certificate.cmd`, so the path taken by hand
   is the path the automatic tier exercises. The token is argument 1 rather than baked into
@@ -768,7 +768,7 @@ bug will surface.
   default build path would start failing on a rate limit that looks nothing like its cause.
   And the Cloudflare token would have to live in `rdgw-config.psd1` on the unattend CD.
   That is a smaller problem than it first appears, because win-acme keeps its own copy on
-  the gateway to renew with - the token is on that box either way. The sharp edge is
+  the gateway to renew with: the token is on that box either way. The sharp edge is
   narrower and worse: **a failed build deliberately keeps its CD** so the retry can use it,
   which leaves a zone-edit token in ISO storage indefinitely. So `cleanup_media` and the
   `follow_build` failure branch both name the token specifically when one is present, the
@@ -782,14 +782,14 @@ bug will surface.
   message. Two downloads, both pinned to one version so they match:
   `win-acme.v<ver>.x64.pluggable.zip` and `plugin.validation.dns.cloudflare.v<ver>.zip`.
   `WINACME_VERSION` overrides it. `ImportRDGateway.ps1` does ship in the release zip and
-  takes the thumbprint **positionally** - its own header explains that dashes in a cmd
-  wrapper are why - which is what `--scriptparameters "{CertThumbprint}"` produces.
+  takes the thumbprint **positionally** (its own header explains that dashes in a cmd
+  wrapper are why), which is what `--scriptparameters "{CertThumbprint}"` produces.
 
 - **The certificate step runs last, after the verify, and a failure there is a warning.**
   `ImportRDGateway.ps1` writes `RDS:\GatewayServer\SSLCertificate\Thumbprint`, which does
   not exist until the RDS-Gateway role does. More importantly the self-signed certificate
-  is already bound by then, so an ACME run that fails for any reason - no propagation, a
-  bad token, a rate limit - leaves a gateway clients distrust rather than a gateway that is
+  is already bound by then, so an ACME run that fails for any reason (no propagation, a
+  bad token, a rate limit) leaves a gateway clients distrust rather than a gateway that is
   down. Do not "improve" this by skipping the self-signed step when win-acme is coming.
   `Invoke-WinAcme.ps1` is also called **without** a pipe into `Add-LogLine`, because it
   writes to `rdgw-setup.log` itself the way `Configure-Guest.ps1` does; piping it as well
@@ -797,7 +797,7 @@ bug will surface.
 
 - **The certificate prompt defaults to a wildcard, and the guard is the point.**
   `rdg.example.com` proposes `*.example.com`, which keeps the gateway's name
-  out of the Certificate Transparency logs - the same reasoning as the CT note in the
+  out of the Certificate Transparency logs, the same reasoning as the CT note in the
   README's hardening section, applied at the moment it is actually decidable. The guard:
   a two-label FQDN has no subdomain to drop, and naively stripping one would turn
   `example.com` into `*.com`, which is a request to a public CA for an entire TLD. Covered
@@ -826,7 +826,7 @@ bug will surface.
    is expected), then run `Setup-RDGateway.ps1` with `-TargetMachines` listing every machine
    he wants to reach and check the same readback.
 5. The unattended path deletes the unattend ISO and detaches the CDs itself once the build
-   succeeds, so there is nothing to remember here any more - see `cleanup_media`. It still
+   succeeds, so there is nothing to remember here any more. See `cleanup_media`. It still
    matters on the **shell-only** path, and whenever `KEEP_MEDIA=1` was set: that ISO holds
    the account password in clear text and `qm destroy` does not remove it.
    With `CertMode = 'auto'` that ISO also holds a Cloudflare token, and a build that FAILED
@@ -841,7 +841,7 @@ bug will surface.
    parentheses inside a parenthesised block. Exit 0 in 4.9 seconds. The 2026-09-24 rebuild
    then ran `-Mode Run` for real and closed the ACME conversation itself: a real Let's
    Encrypt wildcard certificate was issued through the Cloudflare DNS-01 plugin and bound by
-   `ImportRDGateway.ps1` - subject `O=Let's Encrypt`, not self-signed - the token was
+   `ImportRDGateway.ps1` (subject `O=Let's Encrypt`, not self-signed); the token was
    scrubbed from the psd1 afterward, and clients then connected without the
    bad-certificate dialog. That settles the three things this step was written to prove:
    DNS-01 propagation, the pluggable-build plugin load, and real-certificate binding, which
@@ -879,8 +879,8 @@ bug will surface.
   to something tidier.
 - Custom scripts can be written in the TUI or imported from disk, and both routes feed
   one staging tree (`CUSTOM_STAGE`, a `mktemp -d` the exit trap removes) laid out as
-  `<category>/<filename>`. Everything downstream - the count in the menu title, the
-  decision to register `FirstLogon`, the ISO staging, the closing summary - reads that
+  `<category>/<filename>`. Everything downstream (the count in the menu title, the
+  decision to register `FirstLogon`, the ISO staging, the closing summary) reads that
   tree rather than asking where a file came from. Keep it that way; it is what let the
   editor route be added without touching any of them.
 - **Every guest-side script writes to `rdgw-setup.log` itself. Do not go back to
@@ -888,7 +888,7 @@ bug will surface.
   which goes to the information stream, and the caller captured it with
   `& Configure-Guest.ps1 2>&1 | Tee-Object`. `2>&1` merges the *error* stream into
   success; it does not carry stream 6. So for the whole life of that file, not one of
-  its `[ ok ]` / `[fail]` lines ever reached the log - the operator got "Applying guest
+  its `[ ok ]` / `[fail]` lines ever reached the log: the operator got "Applying guest
   configuration", "Guest configuration applied", and no record of whether a single
   setting took. That is what "I'm not really sure the customizations are being applied"
   looked like from their side. Verified empirically: with `2>&1` only the `Write-Output`
@@ -897,8 +897,8 @@ bug will surface.
   Server 2025 build it came back **empty**, and that one empty string is what actually
   broke three builds. `Join-Path` throws on an empty `-Path`, so
   `Invoke-GatewaySetup.ps1 -Register` died on its next line: no scheduled task, no
-  `Configure-Guest.ps1`, no custom scripts, no RD Gateway role, and - because it died
-  before the log existed - not one word written down. From the console it looked
+  `Configure-Guest.ps1`, no custom scripts, no RD Gateway role, and (because it died
+  before the log existed) not one word written down. From the console it looked
   identical to "the customizations silently didn't apply", which is why it survived two
   rounds of fixing the wrong thing. Observed directly: `schtasks /query /tn
   rdgw-firstboot` returned "cannot find the path specified", `C:\Windows\Setup\Scripts`
@@ -910,10 +910,10 @@ bug will surface.
   processed, so the answer file was never at fault. **Why** the variable is empty there is
   still unexplained: it is populated on Windows 11 PowerShell 5.1 for absolute and
   relative `-File`, with LF and CRLF endings, all tested. Do not spend a session trying to
-  reproduce it - just never depend on it. Every guest script now falls back to
+  reproduce it. Just never depend on it. Every guest script now falls back to
   `Split-Path -Parent $MyInvocation.MyCommand.Definition` and then to a literal
   `C:\Windows\Setup\Scripts`, the answer file passes `-ScriptRoot` explicitly, and
-  **no param default may call `Join-Path`** - a default that throws kills the script
+  **no param default may call `Join-Path`**: a default that throws kills the script
   during parameter binding, before its first statement, where no catch can help.
 - **Registration must read the task back.** `-Register` used to create the task, trust
   `schtasks`, and exit silently. It now logs before and after and re-queries the task,
@@ -933,7 +933,7 @@ bug will surface.
   site. There is an `xmllint --noout` check after generation as a backstop.
 - **The backslashes in `xml_escape` are load-bearing.** bash 5.2 turned on
   `patsub_replacement`, which makes an unquoted `&` in a `${var//pat/repl}` replacement
-  mean "the text that matched" - so `${s//</&lt;}` produces `<lt;` on a Proxmox VE 8
+  mean "the text that matched", so `${s//</&lt;}` produces `<lt;` on a Proxmox VE 8
   host, and the escaping silently does nothing useful. `\&` is correct on 5.1 too,
   where quote removal just drops the backslash. This was caught by a smoke test, not
   by reading, and it would have made the fix above worthless.
@@ -955,7 +955,7 @@ bug will surface.
   pass spawns two Perl programs, so the window bought
   seven or eight presses. OVMF with a TPM to measure does not reach the DVD that fast.
   The operator watched the window expire and answered the prompt by hand. Both halves are
-  the same question - is the prompt on screen now - so the counter answers both: zero
+  the same question (is the prompt on screen now), so the counter answers both: zero
   means the firmware has not opened the disc and there is nothing to answer, a number
   that has stopped moving is the prompt waiting, and a number still climbing means
   something is streaming and no key is wanted. Keys go out only in that middle state,
@@ -990,7 +990,7 @@ bug will surface.
   `stage="$(custom_stage_dir)"` runs the assignment in a subshell and the global comes
   back empty on the other side. And `custom_have_tty` probes `/dev/tty` by opening it,
   because `[[ -r /dev/tty ]]` passes on a node that then fails with "No such device or
-  address" when there is no controlling terminal - which is exactly what happens under
+  address" when there is no controlling terminal, which is exactly what happens under
   a test runner, and would silently skip the editor.
 - The security toggles in the unattended path (UAC, Defender, Core Isolation, lockout, blank
   passwords, Ctrl+Alt+Del) all default to leaving Windows as it ships. They exist because the
@@ -1004,7 +1004,7 @@ bug will surface.
     not `--balloon 0`. A floor below the max is what lets the host reclaim RAM; 0 disables it.
   - **`cleanup_media` deletes the CD/DVD drives** (`qm set --delete ide0,ide2,sata0`), boot
     order to the disk first so the deleted DVD is out of the boot list. It runs only after a
-    successful build, so a failed build keeps its drives for the retry - the same invariant
+    successful build, so a failed build keeps its drives for the retry: the same invariant
     the `follow_build || exit 1` ordering already protects, and `test-cleanup.sh` checks the
     boot-before-delete order.
   - **Static IP and OpenSSH run in the first-boot pass, not specialize.** `New-NetIPAddress`
@@ -1018,7 +1018,7 @@ bug will surface.
     for Standard/Datacenter, not only in the custom-image branch. No new answer-file code.
   - New psd1 fields (`NetMode`, `StaticIP`, `StaticPrefix`, `StaticGateway`, `StaticDns`,
     `EnableSsh`) round-trip with the right types, and an old config missing them reads as
-    DHCP with SSH off - the `$null`-is-falsy convention, same as `DisableIPv6`.
+    DHCP with SSH off: the `$null`-is-falsy convention, same as `DisableIPv6`.
   Verified statically (bash -n, shellcheck, PSScriptAnalyzer, the harnesses, a psd1
   round-trip) and then **built on hardware on 2026-09-24**: the rebuild came up with
   ballooning at its floor, the CD/DVD drives deleted, the static IP applied on the primary

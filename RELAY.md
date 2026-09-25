@@ -2,7 +2,7 @@
 
 An optional front door for the RD Gateway. Use it if you don't want TCP 443 open on your home WAN, or if your ISP has you behind CGNAT and you couldn't forward it anyway.
 
-**Your client devices install nothing.** No WARP, no WireGuard, no cloudflared, no browser client. They type a hostname into the native RD client exactly as they would with a port-forward. The tunnel described here runs between two machines you own, a small VPS and your Proxmox host, and is invisible to everything else.
+**Your client devices install nothing:** no WARP, no WireGuard, no cloudflared, no browser client. They type a hostname into the native RD client exactly as they would with a port-forward. The tunnel described here runs between two machines you own, a small VPS and your Proxmox host, and is invisible to everything else.
 
 ## Why not Cloudflare Tunnel
 
