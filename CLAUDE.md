@@ -18,7 +18,7 @@ behind one public hostname, using stock RD clients.
 | `Invoke-GatewaySetup.ps1` | The Windows guest, SYSTEM | **Run for real.** Registers in specialize, drives the first boot to the end |
 | `Invoke-CustomScripts.ps1` | The Windows guest | **Executed for real** on Windows PowerShell 5.1, see below |
 | `Get-RDGWStatus.ps1` | The Windows guest, elevated | Read-only. **Run for real** through `qm guest exec` on the 2026-09-21 build; reported every check `[ ok ]` |
-| `Invoke-WinAcme.ps1` | The Windows guest, SYSTEM | **-Mode Stage run for real** on the 2026-09-21 gateway, exit 0 in 4.9s. `-Mode Run` still untried |
+| `Invoke-WinAcme.ps1` | The Windows guest, SYSTEM | **Run for real, both modes.** `-Mode Stage` on 2026-09-21 (exit 0, 4.9s); `-Mode Run` on 2026-09-24 issued and bound a real Let's Encrypt wildcard certificate through the Cloudflare DNS-01 plugin |
 | `sample-autounattend.xml` | n/a | Committed sample of generated output. Not read by anything |
 | `vps-relay-setup.sh` | A public VPS | Optional path. Written, dry-run verified, **never run for real** |
 | `proxmox-relay-peer.sh` | Proxmox host, root | Optional path. Written, dry-run verified, **never run for real** |
@@ -487,8 +487,9 @@ bug will surface.
 - The WMI calls **have** now run against a real RD Gateway, and the one that was wrong is
   the `BUILTIN\` entry below. The rest - the 18-parameter CAP `Create`, the 8-parameter RAP,
   the resource group - went in and read back. Certificate binding
-  (`Set-Item RDS:\GatewayServer\SSLCertificate\Thumbprint`) is still untested, because no
-  real certificate has been installed yet.
+  (`Set-Item RDS:\GatewayServer\SSLCertificate\Thumbprint`) has now bound a self-signed
+  certificate (2026-09-21) and a real Let's Encrypt certificate (2026-09-24). Both are
+  confirmed on hardware; nothing about the binding is still assumed.
 - **Settled on real hardware, and the guess was wrong.** `Administrators@BUILTIN` /
   `Remote Desktop Users@BUILTIN` came from a published workgroup example, and the gateway
   refuses it: `Win32_TSGatewayConnectionAuthorizationPolicy.Create returned 2147943732`,
@@ -509,9 +510,10 @@ bug will surface.
 - `Set-Item RDS:\GatewayServer\SSLCertificate\Thumbprint` - **verified 2026-09-21.** It
   bound the self-signed certificate on the first attempt and the log printed the thumbprint
   back plus `[ ok ] Listening on TCP 443`, so the WMI fallback (`SetCertificate` then
-  `Configure`) and the `tsgateway.msc` advice have still never been needed. What remains
-  untested is binding a **real** certificate, which is a different code path only in that
-  the thumbprint comes from somewhere else.
+  `Configure`) and the `tsgateway.msc` advice have still never been needed. Binding a
+  **real** certificate is the same code path with the thumbprint sourced from win-acme
+  rather than a self-signed request, and it was confirmed on 2026-09-24 when a Let's
+  Encrypt wildcard certificate was issued and bound on the gateway.
 - **`System` is confirmed; the other three custom-script categories are not.** On the
   2026-09-21 build the log reads `08:43:17 custom/System: running 1 script(s)`,
   `08:44:41 custom/System: 010-script.ps1 ok`, both **in specialize**, before any desktop
@@ -829,23 +831,21 @@ bug will surface.
    the account password in clear text and `qm destroy` does not remove it.
    With `CertMode = 'auto'` that ISO also holds a Cloudflare token, and a build that FAILED
    keeps its media on purpose. The script says so on that path; act on it.
-7. **`-Mode Stage` is confirmed on hardware; nothing has yet talked to a real ACME server.**
-   Pushed to the running gateway through `qm guest exec` on 2026-09-21 and run against the
-   live box: both downloads succeeded, `[ ok ] ImportRDGateway.ps1 present` closed the
-   assumption that it ships in the release zip, `FluentCloudflare.dll` and
+7. **The full ACME path is confirmed on hardware, 2026-09-24.** `-Mode Stage` ran first,
+   on 2026-09-21, pushed to the live gateway through `qm guest exec`: both downloads
+   succeeded, `[ ok ] ImportRDGateway.ps1 present` closed the assumption that it ships in
+   the release zip, `FluentCloudflare.dll` and
    `PKISharp.WACS.Plugins.ValidationPlugins.Cloudflare.dll` landed in the win-acme root
    beside `wacs.exe` where the pluggable build loads them from, and the generated
    `request-certificate.cmd` came out correct including the caret escaping cmd needs for
-   parentheses inside a parenthesised block. Exit 0 in 4.9 seconds.
-   What remains untested is the ACME conversation itself. The build
-   that proved the rest of this repo out on 2026-09-21 predates it and ended on a
-   self-signed certificate, which is the dialog that prompted the feature. What is verified
-   is the shape: three modes round-trip through the psd1 with the right types, the wildcard
-   guard holds, an empty token degrades to `staged`, and every file parses and lints. What
-   is not verified is a real issuance: DNS-01 propagation timing, whether the Cloudflare
-   plugin loads from the pluggable build as documented, and whether `ImportRDGateway.ps1`
-   binds a real certificate - that last one being the only remaining item in "Assumed,
-   never executed" that a real run would close.
+   parentheses inside a parenthesised block. Exit 0 in 4.9 seconds. The 2026-09-24 rebuild
+   then ran `-Mode Run` for real and closed the ACME conversation itself: a real Let's
+   Encrypt wildcard certificate was issued through the Cloudflare DNS-01 plugin and bound by
+   `ImportRDGateway.ps1` - subject `O=Let's Encrypt`, not self-signed - the token was
+   scrubbed from the psd1 afterward, and clients then connected without the
+   bad-certificate dialog. That settles the three things this step was written to prove:
+   DNS-01 propagation, the pluggable-build plugin load, and real-certificate binding, which
+   was the last open item in "Assumed, never executed."
 6. Each target machine needs only: RDP enabled, his account in its local Remote Desktop Users
    group, firewall allowing 3389 from the gateway, and a name the gateway can resolve.
    Windows Pro is fine as a target; only the gateway has to be Server.
@@ -1020,7 +1020,9 @@ bug will surface.
     `EnableSsh`) round-trip with the right types, and an old config missing them reads as
     DHCP with SSH off - the `$null`-is-falsy convention, same as `DisableIPv6`.
   Verified statically (bash -n, shellcheck, PSScriptAnalyzer, the harnesses, a psd1
-  round-trip) but **not yet built on hardware** - the next rebuild closes that.
+  round-trip) and then **built on hardware on 2026-09-24**: the rebuild came up with
+  ballooning at its floor, the CD/DVD drives deleted, the static IP applied on the primary
+  NIC, and `sshd` running, all from the scripts rather than by hand.
 - `Setup-RDGateway.ps1` must stay **pure ASCII** and must run under **Windows PowerShell 5.1**
   (`powershell.exe`, not `pwsh`, because the WMI fallback uses `[wmiclass]`, removed in PS 7).
 - The RD authorization policies go through the documented `Win32_TSGateway*` WMI classes
